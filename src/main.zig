@@ -51,6 +51,8 @@ pub const ArcConfig = struct {
     zmq_topic: []const u8,
 };
 
+const reload_mod = securemilter.reload;
+
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
@@ -61,6 +63,9 @@ var g_seal_key: ?crypto.SigningKey = null;
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "arc";
+var g_allocator: Allocator = undefined;
+var g_config_path: []const u8 = "/usr/local/etc/securearc/securearc.conf";
+var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
@@ -146,10 +151,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    g_allocator = allocator;
 
     var args = std.process.args();
     _ = args.next();
     const config_path = args.next() orelse "/usr/local/etc/securearc/securearc.conf";
+    g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
         std.log.err("failed to load config {s}: {}", .{ config_path, err });
@@ -221,6 +228,7 @@ pub fn main() !void {
         .on_eoh = onEoh,
         .on_body = onBody,
         .on_eom = onEom,
+        .on_reload = onWorkerReload,
         .required_actions = required_actions,
     };
 
@@ -229,16 +237,17 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.blockForKqueue();
 
-    var threads = try worker_mod.spawnPool(
+    var threads = try worker_mod.spawnPoolWithReload(
         allocator,
         arc_cfg.worker_threads,
         arc_cfg.listen_addresses,
         callbacks,
         shutdown_pipe[0],
+        &g_config_gen,
     );
     defer threads.deinit(allocator);
 
-    daemon_mod.ManagedSignals.waitForShutdown(shutdown_pipe[1]);
+    daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
 }
 
@@ -584,6 +593,43 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn toLower(c: u8) u8 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
+}
+
+// =============================================================================
+// Reload
+// =============================================================================
+
+/// Main-thread reload callback: re-reads seal key on SIGHUP.
+fn reloadConfig() void {
+    // Re-read seal key file
+    var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
+        std.log.warn("reload: failed to re-read config file, keeping previous", .{});
+        g_config_gen.increment();
+        return;
+    };
+    defer cfg.deinit();
+
+    const arc_cfg = parseArcConfig(g_allocator, &cfg) catch {
+        std.log.warn("reload: failed to parse config, keeping previous", .{});
+        g_config_gen.increment();
+        return;
+    };
+
+    if (arc_cfg.seal_key_file) |key_path| {
+        if (crypto.loadRsaKeyFile(key_path)) |new_key| {
+            g_seal_key = new_key;
+            std.log.info("seal key reloaded from {s}", .{key_path});
+        } else |_| {
+            std.log.warn("reload: failed to reload seal key {s}", .{key_path});
+        }
+    }
+
+    g_config_gen.increment();
+    std.log.info("config generation advanced to {d}", .{g_config_gen.load()});
+}
+
+fn onWorkerReload() void {
+    std.log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
