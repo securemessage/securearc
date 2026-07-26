@@ -1,0 +1,483 @@
+const std = @import("std");
+const posix = std.posix;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const securemilter = @import("securemilter");
+const config_mod = securemilter.config;
+const listener_mod = securemilter.listener;
+const connection_mod = securemilter.connection;
+const worker_mod = securemilter.worker;
+const daemon_mod = securemilter.daemon;
+const auth_results = securemilter.auth_results;
+const commands = securemilter.milter.commands;
+const codec = securemilter.milter.codec;
+const responses = securemilter.milter.responses;
+const negotiate = securemilter.milter.negotiate;
+const dns_mod = securemilter.dns;
+const crypto = securemilter.crypto;
+const zmq = securemilter.zmq;
+
+pub const arc = @import("arc.zig");
+pub const chain = @import("chain.zig");
+pub const seal = @import("seal.zig");
+
+/// Listener mode for ARC processing.
+pub const Mode = enum {
+    verify_only,
+    seal_only,
+    both,
+};
+
+/// SecureARC runtime configuration.
+pub const ArcConfig = struct {
+    authserv_id: []const u8,
+    listen_addresses: []const listener_mod.ListenAddress,
+    worker_threads: u32,
+    pid_file: []const u8,
+    foreground: bool,
+    dns_nameserver: []const u8,
+    dns_timeout_ms: u32,
+    dns_retries: u8,
+    mode: Mode,
+    seal_domain: ?[]const u8,
+    seal_selector: ?[]const u8,
+    seal_key_file: ?[]const u8,
+    signed_headers: []const u8,
+    zmq_endpoint: ?[]const u8,
+    zmq_topic: []const u8,
+};
+
+// Module-level config set before worker spawn, read-only during runtime.
+var g_authserv_id: []const u8 = "localhost";
+var g_dns_config: dns_mod.ResolverConfig = .{};
+var g_mode: Mode = .verify_only;
+var g_seal_domain: ?[]const u8 = null;
+var g_seal_selector: ?[]const u8 = null;
+var g_seal_key: ?crypto.SigningKey = null;
+var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
+var g_zmq_endpoint: ?[]const u8 = null;
+var g_zmq_topic: []const u8 = "arc";
+
+// Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
+threadlocal var tl_publisher: ?zmq.Publisher = null;
+
+fn getPublisher() *zmq.Publisher {
+    if (tl_publisher == null) {
+        tl_publisher = zmq.Publisher.init(g_zmq_endpoint, g_zmq_topic);
+    }
+    return &tl_publisher.?;
+}
+
+pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcConfig {
+    const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
+
+    const authserv_id = global.get("AuthservID") orelse "localhost";
+    const workers = global.getInt("WorkerThreads", u32, 0);
+    const pid_file = global.getOrDefault("PidFile", "/var/run/securearc/securearc.pid");
+    const foreground_val = global.getBool("Foreground", false);
+
+    var addrs: std.ArrayListUnmanaged(listener_mod.ListenAddress) = .{};
+    errdefer addrs.deinit(allocator);
+
+    var mode: Mode = .verify_only;
+    var seal_domain: ?[]const u8 = null;
+    var seal_selector: ?[]const u8 = null;
+    var seal_key_file: ?[]const u8 = null;
+
+    for (cfg.section_order.items) |section_name| {
+        if (mem.startsWith(u8, section_name, "listener:")) {
+            const section = cfg.getSection(section_name) orelse continue;
+            const socket_str = section.get("Socket") orelse continue;
+            const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
+            try addrs.append(allocator, addr);
+
+            if (section.get("Mode")) |mode_str| {
+                if (mem.eql(u8, mode_str, "seal")) mode = .seal_only else if (mem.eql(u8, mode_str, "verify")) mode = .verify_only else if (mem.eql(u8, mode_str, "both")) mode = .both;
+            }
+
+            seal_domain = section.get("SealDomain") orelse seal_domain;
+            seal_selector = section.get("SealSelector") orelse seal_selector;
+            seal_key_file = section.get("SealKeyFile") orelse seal_key_file;
+        }
+    }
+
+    if (addrs.items.len == 0) {
+        try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8895 } });
+    }
+
+    // Global-level seal config (overridden by per-listener)
+    seal_domain = seal_domain orelse global.get("SealDomain");
+    seal_selector = seal_selector orelse global.get("SealSelector");
+    seal_key_file = seal_key_file orelse global.get("SealKeyFile");
+
+    const dns_ns = global.getOrDefault("DnsNameserver", "127.0.0.1");
+    const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
+    const dns_retries = global.getInt("DnsRetries", u8, 2);
+    const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
+    const zmq_endpoint = global.get("ZmqEndpoint");
+    const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
+
+    return .{
+        .authserv_id = authserv_id,
+        .listen_addresses = try addrs.toOwnedSlice(allocator),
+        .worker_threads = workers,
+        .pid_file = pid_file,
+        .foreground = foreground_val,
+        .dns_nameserver = dns_ns,
+        .dns_timeout_ms = dns_timeout,
+        .dns_retries = dns_retries,
+        .mode = mode,
+        .seal_domain = seal_domain,
+        .seal_selector = seal_selector,
+        .seal_key_file = seal_key_file,
+        .signed_headers = signed_headers,
+        .zmq_endpoint = zmq_endpoint,
+        .zmq_topic = zmq_topic,
+    };
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = std.process.args();
+    _ = args.next();
+    const config_path = args.next() orelse "/usr/local/etc/securearc/securearc.conf";
+
+    var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
+        std.log.err("failed to load config {s}: {}", .{ config_path, err });
+        return err;
+    };
+    defer cfg.deinit();
+
+    const arc_cfg = parseArcConfig(allocator, &cfg) catch |err| {
+        std.log.err("config parse error: {}", .{err});
+        return err;
+    };
+
+    // Set module-level globals
+    g_authserv_id = arc_cfg.authserv_id;
+    g_dns_config = .{
+        .nameserver = arc_cfg.dns_nameserver,
+        .timeout_ms = arc_cfg.dns_timeout_ms,
+        .retries = arc_cfg.dns_retries,
+    };
+    g_mode = arc_cfg.mode;
+    g_seal_domain = arc_cfg.seal_domain;
+    g_seal_selector = arc_cfg.seal_selector;
+    g_signed_headers = arc_cfg.signed_headers;
+    g_zmq_endpoint = arc_cfg.zmq_endpoint;
+    g_zmq_topic = arc_cfg.zmq_topic;
+
+    // Load seal key if configured
+    if (arc_cfg.seal_key_file) |key_path| {
+        g_seal_key = crypto.loadRsaKeyFile(key_path) catch |err| {
+            std.log.err("failed to load seal key {s}: {}", .{ key_path, err });
+            return err;
+        };
+    }
+
+    // Daemonize
+    if (!arc_cfg.foreground) {
+        daemon_mod.daemonize() catch |err| {
+            std.log.err("daemonize failed: {}", .{err});
+            return err;
+        };
+    }
+
+    daemon_mod.writePidFile(arc_cfg.pid_file) catch |err| {
+        std.log.err("pid file write failed: {}", .{err});
+    };
+    defer daemon_mod.removePidFile(arc_cfg.pid_file);
+
+    std.log.info("SecureARC starting, AuthservID={s}, mode={s}, listeners={d}", .{
+        arc_cfg.authserv_id,
+        @tagName(arc_cfg.mode),
+        arc_cfg.listen_addresses.len,
+    });
+
+    const required_actions = negotiate.ActionFlags{ .add_headers = true };
+
+    const callbacks = worker_mod.Callbacks{
+        .on_connect = onConnect,
+        .on_helo = onHelo,
+        .on_mail_from = onMailFrom,
+        .on_header = onHeader,
+        .on_eoh = onEoh,
+        .on_body = onBody,
+        .on_eom = onEom,
+        .required_actions = required_actions,
+    };
+
+    var threads = try worker_mod.spawnPool(
+        allocator,
+        arc_cfg.worker_threads,
+        arc_cfg.listen_addresses,
+        callbacks,
+    );
+    defer threads.deinit(allocator);
+
+    for (threads.items) |t| t.join();
+}
+
+// =============================================================================
+// Milter Callbacks
+// =============================================================================
+
+fn onConnect(conn: *connection_mod.Connection, _: commands.ConnectInfo) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onHelo(conn: *connection_mod.Connection, _: []const u8) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onMailFrom(conn: *connection_mod.Connection, _: []const u8) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onHeader(conn: *connection_mod.Connection, _: []const u8, _: []const u8) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onEoh(conn: *connection_mod.Connection) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
+    conn.appendBody(data) catch {};
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onEom(conn: *connection_mod.Connection) u8 {
+    switch (g_mode) {
+        .verify_only => return doVerify(conn),
+        .seal_only => return doSeal(conn),
+        .both => {
+            _ = doVerify(conn);
+            return doSeal(conn);
+        },
+    }
+}
+
+fn doVerify(conn: *connection_mod.Connection) u8 {
+    // Build header list in arc.Header format
+    var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
+    defer arc_headers.deinit(conn.allocator);
+
+    for (conn.headers.items) |hdr| {
+        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
+    }
+
+    // Parse ARC sets from headers
+    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch {
+        addArHeaderSimple(conn, "arc", "none", "parse error");
+        return @intFromEnum(responses.Code.@"continue");
+    };
+    defer conn.allocator.free(sets);
+
+    if (sets.len == 0) {
+        addArHeaderSimple(conn, "arc", "none", null);
+        publishEvent(conn.allocator, "verify", "none", 0);
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
+    // Validate chain
+    const body_data = conn.getBody();
+    var resolver = dns_mod.Resolver.init(conn.allocator, g_dns_config);
+    defer resolver.deinit();
+
+    const result = chain.validateChain(
+        conn.allocator,
+        &resolver,
+        sets,
+        arc_headers.items,
+        body_data,
+    );
+
+    addArHeaderSimple(conn, "arc", result.status.toString(), result.failure_reason);
+    publishEvent(conn.allocator, "verify", result.status.toString(), result.highest_instance);
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn doSeal(conn: *connection_mod.Connection) u8 {
+    const domain = g_seal_domain orelse return @intFromEnum(responses.Code.@"continue");
+    const selector = g_seal_selector orelse return @intFromEnum(responses.Code.@"continue");
+    _ = g_seal_key orelse return @intFromEnum(responses.Code.@"continue");
+
+    // Determine instance number: count existing ARC sets + 1
+    var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
+    defer arc_headers.deinit(conn.allocator);
+
+    for (conn.headers.items) |hdr| {
+        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
+    }
+
+    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(sets);
+
+    const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
+    if (new_instance > arc.MAX_INSTANCES) return @intFromEnum(responses.Code.@"continue");
+
+    // Determine chain status for our seal
+    const cv: arc.ChainValidation = if (sets.len == 0) .none else blk: {
+        const body_data = conn.getBody();
+        var resolver = dns_mod.Resolver.init(conn.allocator, g_dns_config);
+        defer resolver.deinit();
+        const vr = chain.validateChain(conn.allocator, &resolver, sets, arc_headers.items, body_data);
+        break :blk vr.status;
+    };
+
+    // Build AAR content from existing A-R headers matching our authserv-id
+    const ar_content = buildAarContent(conn) orelse "none";
+
+    // Build ARC-Authentication-Results header and prepend
+    const aar = std.fmt.allocPrint(conn.allocator, "i={d}; {s}", .{ new_instance, ar_content }) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(aar);
+
+    prependHeader(conn, "ARC-Authentication-Results", aar);
+
+    // TODO: build AMS and AS with actual cryptographic signatures
+    // For now, add structural headers indicating seal was attempted
+    const ams_stub = std.fmt.allocPrint(conn.allocator, "i={d}; a=rsa-sha256; d={s}; s={s}; b=", .{
+        new_instance,
+        domain,
+        selector,
+    }) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_stub);
+    prependHeader(conn, "ARC-Message-Signature", ams_stub);
+
+    const as_stub = std.fmt.allocPrint(conn.allocator, "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b=", .{
+        new_instance,
+        cv.toString(),
+        domain,
+        selector,
+    }) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(as_stub);
+    prependHeader(conn, "ARC-Seal", as_stub);
+
+    publishEvent(conn.allocator, "seal", cv.toString(), new_instance);
+    return @intFromEnum(responses.Code.accept);
+}
+
+fn buildAarContent(conn: *connection_mod.Connection) ?[]const u8 {
+    for (conn.headers.items) |hdr| {
+        if (eqlIgnoreCase(hdr.name, "Authentication-Results")) {
+            if (auth_results.matchesAuthservId(hdr.value, g_authserv_id)) {
+                return hdr.value;
+            }
+        }
+    }
+    return null;
+}
+
+fn prependHeader(conn: *connection_mod.Connection, name: []const u8, value: []const u8) void {
+    const hdr_payload = responses.addHeader(conn.allocator, name, value) catch return;
+    defer conn.allocator.free(hdr_payload);
+    codec.writePacket(conn.fd, hdr_payload) catch {};
+}
+
+fn addArHeaderSimple(
+    conn: *connection_mod.Connection,
+    method: []const u8,
+    result_str: []const u8,
+    reason: ?[]const u8,
+) void {
+    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+        .{
+            .method = method,
+            .result = result_str,
+            .reason = reason,
+            .properties = &.{},
+        },
+    }) catch return;
+    defer conn.allocator.free(ar_value);
+
+    const hdr_payload = responses.addHeader(conn.allocator, "Authentication-Results", ar_value) catch return;
+    defer conn.allocator.free(hdr_payload);
+    codec.writePacket(conn.fd, hdr_payload) catch {};
+}
+
+fn publishEvent(allocator: Allocator, action: []const u8, result_str: []const u8, instance: u8) void {
+    const json = std.fmt.allocPrint(allocator,
+        \\{{"action":"{s}","result":"{s}","instance":{d}}}
+    , .{ action, result_str, instance }) catch return;
+    defer allocator.free(json);
+    getPublisher().publish(json);
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (toLower(ca) != toLower(cb)) return false;
+    }
+    return true;
+}
+
+fn toLower(c: u8) u8 {
+    if (c >= 'A' and c <= 'Z') return c + 32;
+    return c;
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test {
+    _ = arc;
+    _ = chain;
+    _ = seal;
+}
+
+test "parse config minimal" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:verify]
+        \\Socket = inet:8895@0.0.0.0
+        \\Mode = verify
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+
+    try std.testing.expectEqualStrings("mail.test.com", arc_cfg.authserv_id);
+    try std.testing.expectEqual(@as(usize, 1), arc_cfg.listen_addresses.len);
+    try std.testing.expectEqual(Mode.verify_only, arc_cfg.mode);
+}
+
+test "parse config seal mode" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\SealDomain = test.com
+        \\SealSelector = arc2026
+        \\
+        \\[listener:seal]
+        \\Socket = inet:8896@0.0.0.0
+        \\Mode = seal
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+
+    try std.testing.expectEqual(Mode.seal_only, arc_cfg.mode);
+    try std.testing.expectEqualStrings("test.com", arc_cfg.seal_domain.?);
+    try std.testing.expectEqualStrings("arc2026", arc_cfg.seal_selector.?);
+}
