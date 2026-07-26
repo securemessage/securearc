@@ -224,14 +224,22 @@ pub fn main() !void {
         .required_actions = required_actions,
     };
 
+    const shutdown_pipe = try posix.pipe();
+    defer posix.close(shutdown_pipe[0]);
+    defer posix.close(shutdown_pipe[1]);
+
+    daemon_mod.ManagedSignals.blockForKqueue();
+
     var threads = try worker_mod.spawnPool(
         allocator,
         arc_cfg.worker_threads,
         arc_cfg.listen_addresses,
         callbacks,
+        shutdown_pipe[0],
     );
     defer threads.deinit(allocator);
 
+    daemon_mod.ManagedSignals.waitForShutdown(shutdown_pipe[1]);
     for (threads.items) |t| t.join();
 }
 

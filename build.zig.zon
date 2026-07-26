@@ -14,7 +14,7 @@
     .dependencies = .{
         .securemilter = .{
             .url = "https://pacyworld.dev/securemessage/securemilter-lib/archive/v0.3.0.tar.gz",
-            .hash = "securemilter_lib-0.3.0-IbMuLD_GAQDiYjbvezjXRPXBsIHgc3VlerPOi6wKVW5C",
+            .hash = "securemilter_lib-0.3.0-IbMuLLfQAQBDJlXuQ7cDYj5Tt6Z3BNM8qrwr3biFxl_y",
         },
         .securemilter_crypto = .{
             .url = "https://pacyworld.dev/securemessage/securemilter-crypto/archive/v0.1.0.tar.gz",
