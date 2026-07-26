@@ -32,6 +32,22 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // securearc-testkey CLI tool (needs securemilter for DNS + securemilter_crypto for key loading)
+    const testkey_mod = b.createModule(.{
+        .root_source_file = b.path("src/testkey.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const testkey_exe = b.addExecutable(.{
+        .name = "securearc-testkey",
+        .root_module = testkey_mod,
+    });
+    b.installArtifact(testkey_exe);
+
     const test_step = b.step("test", "Run unit tests");
 
     const test_mod = b.createModule(.{
