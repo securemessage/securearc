@@ -226,7 +226,6 @@ pub fn main() !void {
 
     const shutdown_pipe = try posix.pipe();
     defer posix.close(shutdown_pipe[0]);
-    defer posix.close(shutdown_pipe[1]);
 
     daemon_mod.ManagedSignals.blockForKqueue();
 
