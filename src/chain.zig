@@ -5,6 +5,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const dns_mod = securemilter.dns;
 const crypto = securemilter.crypto;
+const canon = securemilter.canon;
 
 const arc = @import("arc.zig");
 
@@ -110,9 +111,6 @@ fn verifyAms(
     all_headers: []const arc.Header,
     body_hash: []const u8,
 ) bool {
-    _ = all_headers;
-    _ = body_hash;
-
     // Fetch public key from DNS
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
         set.ams_selector,
@@ -123,27 +121,131 @@ fn verifyAms(
     var dns_result = resolver.resolve(qname, .TXT) catch return false;
     defer dns_result.deinit();
 
-    // Find key record
+    // Find key record and extract p= value
+    var pubkey_b64: ?[]const u8 = null;
     var txt_iter = dns_result.txtRecords();
-    var pubkey_data: ?[]const u8 = null;
     while (txt_iter.next()) |txt| {
-        if (mem.indexOf(u8, txt, "p=")) |_| {
-            pubkey_data = txt;
-            break;
+        if (arc.findTag(txt, "p")) |p| {
+            if (p.len > 0) {
+                pubkey_b64 = p;
+                break;
+            }
         }
     }
-    if (pubkey_data == null) return false;
+    const key_data_b64 = pubkey_b64 orelse return false;
 
-    // Extract p= value
-    const p_val = arc.findTag(pubkey_data.?, "p") orelse return false;
-    if (p_val.len == 0) return false; // revoked key
+    // Decode public key from base64
+    const key_der = crypto.base64Decode(allocator, key_data_b64) catch return false;
+    defer allocator.free(key_der);
 
-    // TODO: full cryptographic verification
-    // Full implementation: canonicalize headers per h= tag, compute signing input,
-    // verify with RSA/Ed25519 depending on a= tag using securemilter.crypto.
-    // For now: DNS key fetch + non-revoked key = structural validation passes.
-    _ = p_val.len; // suppress unused; key existence confirmed above
-    return true;
+    // Build signing input: canonicalize headers per h= tag + AMS header with empty b=
+    const signing_input = buildAmsSigningInput(allocator, set, all_headers) catch return false;
+    defer allocator.free(signing_input);
+
+    // Verify body hash matches
+    const claimed_bh = crypto.base64Decode(allocator, set.ams_body_hash) catch return false;
+    defer allocator.free(claimed_bh);
+    if (claimed_bh.len != body_hash.len) return false;
+    if (!mem.eql(u8, claimed_bh, body_hash)) return false;
+
+    // Decode signature from base64
+    const sig_bytes = crypto.base64Decode(allocator, set.ams_signature) catch return false;
+    defer allocator.free(sig_bytes);
+
+    // Verify with RSA-SHA256
+    const pkey = crypto.loadRsaPublicKeyDer(key_der) catch return false;
+    defer crypto.freePublicKey(pkey);
+
+    return crypto.rsaVerify(pkey, signing_input, sig_bytes) catch false;
+}
+
+/// Build the signing input for AMS verification.
+/// Canonicalizes headers listed in h= tag (relaxed), then appends the AMS
+/// header itself with the b= value removed (same as DKIM signing input).
+fn buildAmsSigningInput(
+    allocator: Allocator,
+    set: *const arc.ArcSet,
+    all_headers: []const arc.Header,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+
+    // Canonicalize headers listed in h= tag
+    var h_rest = set.ams_signed_headers;
+    while (h_rest.len > 0) {
+        const colon_pos = mem.indexOfScalar(u8, h_rest, ':');
+        const hdr_name = if (colon_pos) |cp| h_rest[0..cp] else h_rest;
+        h_rest = if (colon_pos) |cp| h_rest[cp + 1 ..] else "";
+
+        const trimmed_name = mem.trim(u8, hdr_name, &std.ascii.whitespace);
+        if (trimmed_name.len == 0) continue;
+
+        // Find this header in the message (last occurrence, per DKIM spec)
+        var found: ?[]const u8 = null;
+        for (all_headers) |hdr| {
+            if (arc.eqlLower(hdr.name, trimmed_name)) {
+                const full = std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
+                if (found) |f| allocator.free(f);
+                found = full;
+            }
+        }
+        if (found) |full| {
+            defer allocator.free(full);
+            const canonicalized = canon.canonicalizeHeader(allocator, .relaxed, full) catch continue;
+            defer allocator.free(canonicalized);
+            try buf.appendSlice(allocator, canonicalized);
+            try buf.appendSlice(allocator, "\r\n");
+        }
+    }
+
+    // Append AMS header with b= value emptied (for self-referencing signature)
+    const ams_full = std.fmt.allocPrint(allocator, "ARC-Message-Signature: {s}", .{set.ams_value}) catch
+        return error.OutOfMemory;
+    defer allocator.free(ams_full);
+
+    // Remove the b= value: replace "b=<sig>" with "b="
+    const stripped = stripBValue(allocator, ams_full) catch ams_full;
+    defer if (stripped.ptr != ams_full.ptr) allocator.free(stripped);
+
+    const canon_ams = canon.canonicalizeHeader(allocator, .relaxed, stripped) catch
+        return error.OutOfMemory;
+    defer allocator.free(canon_ams);
+    try buf.appendSlice(allocator, canon_ams);
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Strip the b= tag value from a DKIM/AMS header (set to empty for signing input).
+fn stripBValue(allocator: Allocator, header: []const u8) ![]u8 {
+    // Find "b=" that isn't "bh="
+    var i: usize = 0;
+    while (i < header.len) {
+        if (header[i] == 'b' and i + 1 < header.len and header[i + 1] == '=') {
+            // Make sure it's not "bh="
+            if (i > 0 and header[i - 1] != ';' and header[i - 1] != ' ' and header[i - 1] != '\t') {
+                i += 1;
+                continue;
+            }
+            // Check it's not "bh="
+            if (i > 0 and i >= 2 and header[i - 1] == 'h') {
+                i += 1;
+                continue;
+            }
+            // Found standalone "b=" — strip everything after = until next ;
+            const val_start = i + 2;
+            const semi = mem.indexOfScalar(u8, header[val_start..], ';');
+            const val_end = if (semi) |s| val_start + s else header.len;
+
+            var result: std.ArrayListUnmanaged(u8) = .{};
+            try result.appendSlice(allocator, header[0..val_start]);
+            if (val_end < header.len) {
+                try result.appendSlice(allocator, header[val_end..]);
+            }
+            return result.toOwnedSlice(allocator);
+        }
+        i += 1;
+    }
+    return allocator.dupe(u8, header);
 }
 
 /// Verify an ARC-Seal signature.
@@ -157,8 +259,6 @@ fn verifySeal(
     set: *const arc.ArcSet,
     prior_sets: []const arc.ArcSet,
 ) bool {
-    _ = prior_sets;
-
     // Fetch public key
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
         set.seal_selector,
@@ -169,19 +269,88 @@ fn verifySeal(
     var dns_result = resolver.resolve(qname, .TXT) catch return false;
     defer dns_result.deinit();
 
+    // Find and decode public key
+    var pubkey_b64: ?[]const u8 = null;
     var txt_iter = dns_result.txtRecords();
     while (txt_iter.next()) |txt| {
-        if (mem.indexOf(u8, txt, "p=")) |_| {
-            const p_val = arc.findTag(txt, "p") orelse continue;
-            if (p_val.len == 0) continue;
-            // Structural validation: key exists and is not revoked
-            // Full implementation: canonicalize ARC headers in strict order,
-            // compute seal signing input, verify with RSA/Ed25519.
-            return true; // TODO: full cryptographic verification
+        if (arc.findTag(txt, "p")) |p| {
+            if (p.len > 0) {
+                pubkey_b64 = p;
+                break;
+            }
         }
     }
+    const key_b64 = pubkey_b64 orelse return false;
 
-    return false;
+    const key_der = crypto.base64Decode(allocator, key_b64) catch return false;
+    defer allocator.free(key_der);
+
+    // Build seal signing input: all prior ARC headers (relaxed canonicalized)
+    // in order (AAR, AMS, AS for each prior instance), plus current AAR + AMS
+    const signing_input = buildSealSigningInput(allocator, set, prior_sets) catch return false;
+    defer allocator.free(signing_input);
+
+    // Decode signature
+    const sig_bytes = crypto.base64Decode(allocator, set.seal_signature) catch return false;
+    defer allocator.free(sig_bytes);
+
+    // Verify with RSA-SHA256
+    const pkey = crypto.loadRsaPublicKeyDer(key_der) catch return false;
+    defer crypto.freePublicKey(pkey);
+
+    return crypto.rsaVerify(pkey, signing_input, sig_bytes) catch false;
+}
+
+/// Build the seal signing input per RFC 8617 §5.1.1.
+/// Order: for each instance 1..i, canonicalize AAR, AMS, AS headers.
+/// For the current instance (last in prior_sets), include AAR + AMS but NOT AS
+/// (the seal signs over everything except itself).
+fn buildSealSigningInput(
+    allocator: Allocator,
+    set: *const arc.ArcSet,
+    prior_sets: []const arc.ArcSet,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+
+    // Prior sets (i=1..i-1): include all 3 headers for each
+    for (prior_sets) |prior| {
+        if (prior.instance >= set.instance) break;
+        try appendCanonHeader(allocator, &buf, "ARC-Authentication-Results", prior.aar_value);
+        try appendCanonHeader(allocator, &buf, "ARC-Message-Signature", prior.ams_value);
+        try appendCanonHeader(allocator, &buf, "ARC-Seal", prior.as_value);
+    }
+
+    // Current instance: AAR + AMS only (not the AS being verified)
+    try appendCanonHeader(allocator, &buf, "ARC-Authentication-Results", set.aar_value);
+    try appendCanonHeader(allocator, &buf, "ARC-Message-Signature", set.ams_value);
+
+    // Append AS header with empty b= (self-referencing)
+    const as_full = try std.fmt.allocPrint(allocator, "ARC-Seal: {s}", .{set.as_value});
+    defer allocator.free(as_full);
+    const stripped = stripBValue(allocator, as_full) catch as_full;
+    defer if (stripped.ptr != as_full.ptr) allocator.free(stripped);
+
+    const canon_as = try canon.canonicalizeHeader(allocator, .relaxed, stripped);
+    defer allocator.free(canon_as);
+    try buf.appendSlice(allocator, canon_as);
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Canonicalize a header and append it (with CRLF) to the buffer.
+fn appendCanonHeader(
+    allocator: Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, value });
+    defer allocator.free(full);
+    const canonicalized = try canon.canonicalizeHeader(allocator, .relaxed, full);
+    defer allocator.free(canonicalized);
+    try buf.appendSlice(allocator, canonicalized);
+    try buf.appendSlice(allocator, "\r\n");
 }
 
 // =============================================================================

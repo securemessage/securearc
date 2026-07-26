@@ -210,7 +210,7 @@ pub const Header = struct {
     value: []const u8,
 };
 
-fn eqlLower(a: []const u8, b: []const u8) bool {
+pub fn eqlLower(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ca, cb| {
         const la: u8 = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
