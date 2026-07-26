@@ -346,27 +346,165 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
     prependHeader(conn, "ARC-Authentication-Results", aar);
 
-    // TODO: build AMS and AS with actual cryptographic signatures
-    // For now, add structural headers indicating seal was attempted
-    const ams_stub = std.fmt.allocPrint(conn.allocator, "i={d}; a=rsa-sha256; d={s}; s={s}; b=", .{
-        new_instance,
-        domain,
-        selector,
-    }) catch return @intFromEnum(responses.Code.@"continue");
-    defer conn.allocator.free(ams_stub);
-    prependHeader(conn, "ARC-Message-Signature", ams_stub);
+    // Build AMS: sign the message (same as DKIM signing)
+    const body_data = conn.getBody();
+    const canon_mod = securemilter.canon;
 
-    const as_stub = std.fmt.allocPrint(conn.allocator, "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b=", .{
-        new_instance,
-        cv.toString(),
-        domain,
-        selector,
-    }) catch return @intFromEnum(responses.Code.@"continue");
-    defer conn.allocator.free(as_stub);
-    prependHeader(conn, "ARC-Seal", as_stub);
+    // Canonicalize body and compute body hash
+    var body_canon = canon_mod.BodyCanonicalizer.init(conn.allocator, .relaxed);
+    defer body_canon.deinit();
+    body_canon.update(body_data) catch return @intFromEnum(responses.Code.@"continue");
+    const canon_body = body_canon.finish() catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(canon_body);
+    const body_hash_raw = crypto.sha256(canon_body);
+    const body_hash_b64 = crypto.base64Encode(conn.allocator, &body_hash_raw) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(body_hash_b64);
+
+    // Build AMS signing input (canonicalized headers per h= tag + AMS with empty b=)
+    const ams_template = std.fmt.allocPrint(
+        conn.allocator,
+        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s}; h={s}; bh={s}; b=",
+        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64 },
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_template);
+
+    // Canonicalize selected headers for AMS signing input
+    var ams_input: std.ArrayListUnmanaged(u8) = .{};
+    defer ams_input.deinit(conn.allocator);
+    buildSigningHeaders(conn, &ams_input) catch return @intFromEnum(responses.Code.@"continue");
+
+    // Append AMS header template (with empty b=) as final line (no trailing CRLF)
+    const ams_full_template = std.fmt.allocPrint(conn.allocator, "ARC-Message-Signature: {s}", .{ams_template}) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_full_template);
+    const canon_ams_tmpl = canon_mod.canonicalizeHeader(conn.allocator, .relaxed, ams_full_template) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(canon_ams_tmpl);
+    ams_input.appendSlice(conn.allocator, canon_ams_tmpl) catch
+        return @intFromEnum(responses.Code.@"continue");
+
+    // Sign AMS
+    const sign_key = &g_seal_key.?;
+    const ams_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, ams_input.items) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_sig_raw);
+    const ams_sig_b64 = crypto.base64Encode(conn.allocator, ams_sig_raw) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_sig_b64);
+
+    // Final AMS header value
+    const ams_value = std.fmt.allocPrint(
+        conn.allocator,
+        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s}; h={s}; bh={s}; b={s}",
+        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, ams_sig_b64 },
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ams_value);
+    prependHeader(conn, "ARC-Message-Signature", ams_value);
+
+    // Build ARC-Seal: signs over all prior ARC headers + current AAR + AMS + AS(empty b=)
+    const as_template = std.fmt.allocPrint(
+        conn.allocator,
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b=",
+        .{ new_instance, cv.toString(), domain, selector },
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(as_template);
+
+    // Build seal signing input
+    var seal_input: std.ArrayListUnmanaged(u8) = .{};
+    defer seal_input.deinit(conn.allocator);
+    buildSealInput(conn, &seal_input, sets, aar, ams_value, as_template) catch
+        return @intFromEnum(responses.Code.@"continue");
+
+    // Sign seal
+    const seal_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, seal_input.items) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(seal_sig_raw);
+    const seal_sig_b64 = crypto.base64Encode(conn.allocator, seal_sig_raw) catch
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(seal_sig_b64);
+
+    // Final AS header value
+    const as_value = std.fmt.allocPrint(
+        conn.allocator,
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b={s}",
+        .{ new_instance, cv.toString(), domain, selector, seal_sig_b64 },
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(as_value);
+    prependHeader(conn, "ARC-Seal", as_value);
 
     publishEvent(conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
+}
+
+/// Canonicalize headers listed in g_signed_headers and append to buf.
+fn buildSigningHeaders(conn: *connection_mod.Connection, buf: *std.ArrayListUnmanaged(u8)) !void {
+    const canon_mod = securemilter.canon;
+    var h_rest: []const u8 = g_signed_headers;
+    while (h_rest.len > 0) {
+        const colon_pos = mem.indexOfScalar(u8, h_rest, ':');
+        const hdr_name = if (colon_pos) |cp| h_rest[0..cp] else h_rest;
+        h_rest = if (colon_pos) |cp| h_rest[cp + 1 ..] else "";
+
+        const trimmed = mem.trim(u8, hdr_name, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+
+        // Find last occurrence of this header
+        var found: ?[]const u8 = null;
+        for (conn.headers.items) |hdr| {
+            if (eqlIgnoreCase(hdr.name, trimmed)) {
+                found = hdr.value;
+            }
+        }
+        if (found) |value| {
+            const full = try std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ trimmed, value });
+            defer conn.allocator.free(full);
+            const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
+            defer conn.allocator.free(canonicalized);
+            try buf.appendSlice(conn.allocator, canonicalized);
+            try buf.appendSlice(conn.allocator, "\r\n");
+        }
+    }
+}
+
+/// Build the seal signing input: prior ARC headers + current AAR + AMS + AS template.
+fn buildSealInput(
+    conn: *connection_mod.Connection,
+    buf: *std.ArrayListUnmanaged(u8),
+    prior_sets: []const arc.ArcSet,
+    current_aar: []const u8,
+    current_ams_value: []const u8,
+    as_template: []const u8,
+) !void {
+    const canon_mod = securemilter.canon;
+
+    // Prior sets: canonicalize all 3 headers for each
+    for (prior_sets) |prior| {
+        try appendCanonHdr(conn.allocator, buf, "ARC-Authentication-Results", prior.aar_value);
+        try appendCanonHdr(conn.allocator, buf, "ARC-Message-Signature", prior.ams_value);
+        try appendCanonHdr(conn.allocator, buf, "ARC-Seal", prior.as_value);
+    }
+
+    // Current instance: AAR + AMS
+    try appendCanonHdr(conn.allocator, buf, "ARC-Authentication-Results", current_aar);
+    try appendCanonHdr(conn.allocator, buf, "ARC-Message-Signature", current_ams_value);
+
+    // AS header with empty b= (no trailing CRLF — last header in signing input)
+    const as_full = try std.fmt.allocPrint(conn.allocator, "ARC-Seal: {s}", .{as_template});
+    defer conn.allocator.free(as_full);
+    const canon_as = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, as_full);
+    defer conn.allocator.free(canon_as);
+    try buf.appendSlice(conn.allocator, canon_as);
+}
+
+fn appendCanonHdr(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8, value: []const u8) !void {
+    const canon_mod = securemilter.canon;
+    const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, value });
+    defer allocator.free(full);
+    const canonicalized = try canon_mod.canonicalizeHeader(allocator, .relaxed, full);
+    defer allocator.free(canonicalized);
+    try buf.appendSlice(allocator, canonicalized);
+    try buf.appendSlice(allocator, "\r\n");
 }
 
 fn buildAarContent(conn: *connection_mod.Connection) ?[]const u8 {
