@@ -3,8 +3,10 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
-const crypto = securemilter.crypto;
 const auth_results = securemilter.auth_results;
+
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
 
 const arc = @import("arc.zig");
 

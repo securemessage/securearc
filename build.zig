@@ -10,12 +10,19 @@ pub fn build(b: *std.Build) void {
     });
     const securemilter_mod = securemilter_dep.module("securemilter");
 
+    const crypto_dep = b.dependency("securemilter_crypto", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const crypto_mod = crypto_dep.module("securemilter_crypto");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
         },
     });
 
@@ -33,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
         },
     });
 

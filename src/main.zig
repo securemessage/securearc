@@ -15,8 +15,10 @@ const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
-const crypto = securemilter.crypto;
 const zmq = securemilter.zmq;
+
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
 
 pub const arc = @import("arc.zig");
 pub const chain = @import("chain.zig");
@@ -348,7 +350,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
     // Build AMS: sign the message (same as DKIM signing)
     const body_data = conn.getBody();
-    const canon_mod = securemilter.canon;
+    const canon_mod = securemilter_crypto.canon;
 
     // Canonicalize body and compute body hash
     var body_canon = canon_mod.BodyCanonicalizer.init(conn.allocator, .relaxed);
@@ -439,7 +441,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
 /// Canonicalize headers listed in g_signed_headers and append to buf.
 fn buildSigningHeaders(conn: *connection_mod.Connection, buf: *std.ArrayListUnmanaged(u8)) !void {
-    const canon_mod = securemilter.canon;
+    const canon_mod = securemilter_crypto.canon;
     var h_rest: []const u8 = g_signed_headers;
     while (h_rest.len > 0) {
         const colon_pos = mem.indexOfScalar(u8, h_rest, ':');
@@ -476,7 +478,7 @@ fn buildSealInput(
     current_ams_value: []const u8,
     as_template: []const u8,
 ) !void {
-    const canon_mod = securemilter.canon;
+    const canon_mod = securemilter_crypto.canon;
 
     // Prior sets: canonicalize all 3 headers for each
     for (prior_sets) |prior| {
@@ -498,7 +500,7 @@ fn buildSealInput(
 }
 
 fn appendCanonHdr(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8, value: []const u8) !void {
-    const canon_mod = securemilter.canon;
+    const canon_mod = securemilter_crypto.canon;
     const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, value });
     defer allocator.free(full);
     const canonicalized = try canon_mod.canonicalizeHeader(allocator, .relaxed, full);

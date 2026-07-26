@@ -4,8 +4,10 @@ const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
 const dns_mod = securemilter.dns;
-const crypto = securemilter.crypto;
-const canon = securemilter.canon;
+
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
+const canon = securemilter_crypto.canon;
 
 const arc = @import("arc.zig");
 
