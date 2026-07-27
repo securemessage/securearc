@@ -193,15 +193,6 @@ pub fn main() !void {
         .retries = arc_cfg.dns_retries,
     };
 
-    // Start proactive DNS health monitor
-    if (dns_mod.HealthMonitor.init(allocator, arc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
-        monitor.start() catch |err| {
-            std.log.warn("DNS health monitor thread failed: {}", .{err});
-        };
-        g_health_monitor = monitor;
-    } else |err| {
-        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
-    }
     g_mode = arc_cfg.mode;
     g_seal_domain = arc_cfg.seal_domain;
     g_seal_selector = arc_cfg.seal_selector;
@@ -217,12 +208,22 @@ pub fn main() !void {
         };
     }
 
-    // Daemonize
+    // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!arc_cfg.foreground) {
         daemon_mod.daemonize() catch |err| {
             std.log.err("daemonize failed: {}", .{err});
             return err;
         };
+    }
+
+    // Start proactive DNS health monitor AFTER daemonize
+    if (dns_mod.HealthMonitor.init(allocator, arc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
+        monitor.start() catch |err| {
+            std.log.warn("DNS health monitor thread failed: {}", .{err});
+        };
+        g_health_monitor = monitor;
+    } else |err| {
+        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
     }
 
     daemon_mod.writePidFile(arc_cfg.pid_file) catch |err| {
