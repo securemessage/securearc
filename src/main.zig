@@ -347,12 +347,13 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
     const client_addr = conn.macros.client_addr orelse "unknown";
+    const peer = conn.getPeerDisplay();
     const mode_str: []const u8 = switch (g_mode) {
         .verify_only => "verify",
         .seal_only => "seal",
         .both => "both",
     };
-    log.info("id={s} client={s} mode={s} elapsed={d}ms", .{ queue_id, client_addr, mode_str, elapsed_ms });
+    log.info("id={s} peer={s}[{s}] client={s} mode={s} elapsed={d}ms", .{ queue_id, peer.name, peer.ip, client_addr, mode_str, elapsed_ms });
     return result;
 }
 
