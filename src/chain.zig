@@ -31,7 +31,7 @@ pub fn validateChain(
     resolver: *dns_mod.Resolver,
     sets: []const arc.ArcSet,
     all_headers: []const arc.Header,
-    body_hash: []const u8,
+    body_data: []const u8,
 ) ValidationResult {
     if (sets.len == 0) {
         return .{ .status = .none, .highest_instance = 0, .failure_reason = null };
@@ -76,7 +76,7 @@ pub fn validateChain(
 
     // Step 3: Verify the most recent AMS (i=N) — validates message integrity
     const newest = sets[sets.len - 1];
-    if (!verifyAms(allocator, resolver, &newest, all_headers, body_hash)) {
+    if (!verifyAms(allocator, resolver, &newest, all_headers, body_data)) {
         return .{
             .status = .fail,
             .highest_instance = newest.instance,
@@ -111,7 +111,7 @@ fn verifyAms(
     resolver: *dns_mod.Resolver,
     set: *const arc.ArcSet,
     all_headers: []const arc.Header,
-    body_hash: []const u8,
+    body_data: []const u8,
 ) bool {
     // Fetch public key from DNS
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
@@ -144,11 +144,20 @@ fn verifyAms(
     const signing_input = buildAmsSigningInput(allocator, set, all_headers) catch return false;
     defer allocator.free(signing_input);
 
-    // Verify body hash matches
+    // Canonicalize body and compute SHA-256 hash, then compare against claimed bh=
+    const canon_pair = canon.parseCanonicalization(set.ams_canonicalization) catch
+        canon.CanonicalizationPair{ .header = .relaxed, .body = .relaxed };
+    var body_canon = canon.BodyCanonicalizer.init(allocator, canon_pair.body);
+    defer body_canon.deinit();
+    body_canon.update(body_data) catch return false;
+    const canon_body = body_canon.finish() catch return false;
+    defer allocator.free(canon_body);
+    const computed_hash = crypto.sha256(canon_body);
+
     const claimed_bh = crypto.base64Decode(allocator, set.ams_body_hash) catch return false;
     defer allocator.free(claimed_bh);
-    if (claimed_bh.len != body_hash.len) return false;
-    if (!mem.eql(u8, claimed_bh, body_hash)) return false;
+    if (claimed_bh.len != computed_hash.len) return false;
+    if (!mem.eql(u8, claimed_bh, &computed_hash)) return false;
 
     // Decode signature from base64
     const sig_bytes = crypto.base64Decode(allocator, set.ams_signature) catch return false;
