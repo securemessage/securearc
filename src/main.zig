@@ -424,10 +424,11 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(body_hash_b64);
 
-    // Build AMS signing input (canonicalized headers per h= tag + AMS with empty b=)
+    // Build AMS template (pre-folded — SAME format used for both signing input AND
+    // the header prepended to the message, ensuring byte-identical canonicalization)
     const ams_template = std.fmt.allocPrint(
         conn.allocator,
-        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s}; h={s}; bh={s}; b=",
+        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
         .{ new_instance, domain, selector, g_signed_headers, body_hash_b64 },
     ) catch return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_template);
@@ -456,11 +457,12 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_sig_b64);
 
-    // Final AMS header value (pre-folded to prevent Postfix mid-token folding)
+    // Final AMS header value: same pre-folded template + signature (folded base64)
+    const folded_ams_sig = foldBase64(conn.allocator, ams_sig_b64) catch ams_sig_b64;
     const ams_value = std.fmt.allocPrint(
         conn.allocator,
-        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
-        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, foldBase64(conn.allocator, ams_sig_b64) catch ams_sig_b64 },
+        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
+        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, folded_ams_sig },
     ) catch return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_value);
     prependHeader(conn, "ARC-Message-Signature", ams_value);

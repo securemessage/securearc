@@ -16,8 +16,7 @@
             .path = "../securemilter-lib",
         },
         .securemilter_crypto = .{
-            .url = "https://pacyworld.dev/securemessage/securemilter-crypto/archive/v0.1.0.tar.gz",
-            .hash = "securemilter_crypto-0.1.0-R5f4tbViAAB-nKG29b2ukzWATybSgPoa93r_aSu60d7o",
+            .path = "../securemilter-crypto",
         },
     },
 }
