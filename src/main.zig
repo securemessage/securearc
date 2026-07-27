@@ -42,6 +42,8 @@ pub const ArcConfig = struct {
     dns_nameservers: []const []const u8,
     dns_timeout_ms: u32,
     dns_retries: u8,
+    dns_cache_size: u32,
+    dns_negative_ttl: u32,
     mode: Mode,
     seal_domain: ?[]const u8,
     seal_selector: ?[]const u8,
@@ -131,6 +133,8 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     const dns_nameservers = try ns_list.toOwnedSlice(allocator);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
     const dns_retries = global.getInt("DnsRetries", u8, 2);
+    const dns_cache_size = global.getInt("DnsCacheSize", u32, 1000);
+    const dns_negative_ttl = global.getInt("DnsNegativeTTL", u32, 60);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
@@ -145,6 +149,8 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .dns_nameservers = dns_nameservers,
         .dns_timeout_ms = dns_timeout,
         .dns_retries = dns_retries,
+        .dns_cache_size = dns_cache_size,
+        .dns_negative_ttl = dns_negative_ttl,
         .mode = mode,
         .seal_domain = seal_domain,
         .seal_selector = seal_selector,
@@ -191,6 +197,8 @@ pub fn main() !void {
         .nameservers = arc_cfg.dns_nameservers,
         .timeout_ms = arc_cfg.dns_timeout_ms,
         .retries = arc_cfg.dns_retries,
+        .cache_size = arc_cfg.dns_cache_size,
+        .negative_ttl = arc_cfg.dns_negative_ttl,
     };
 
     g_mode = arc_cfg.mode;
