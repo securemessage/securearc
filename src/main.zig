@@ -204,8 +204,10 @@ pub fn main() !void {
     };
     defer daemon_mod.removePidFile(arc_cfg.pid_file);
 
-    // Raise fd limit before dropping privileges (requires root)
-    daemon_mod.raiseFileLimit();
+    // Raise fd limit to calculated budget before dropping privileges
+    const num_workers = if (arc_cfg.worker_threads == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else arc_cfg.worker_threads;
+    const fd_need = daemon_mod.calculateFdNeed(num_workers, worker_mod.DEFAULT_MAX_CONNECTIONS, @intCast(arc_cfg.listen_addresses.len));
+    daemon_mod.raiseFileLimit(fd_need);
 
     // Drop privileges after PID file is written, before workers spawn
     if (arc_cfg.user) |user| {
@@ -247,6 +249,7 @@ pub fn main() !void {
         callbacks,
         shutdown_pipe[0],
         &g_config_gen,
+        worker_mod.DEFAULT_MAX_CONNECTIONS,
     );
     defer threads.deinit(allocator);
 
