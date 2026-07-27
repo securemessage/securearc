@@ -39,7 +39,7 @@ pub const ArcConfig = struct {
     pid_file: []const u8,
     foreground: bool,
     user: ?[]const u8,
-    dns_nameserver: []const u8,
+    dns_nameservers: []const []const u8,
     dns_timeout_ms: u32,
     dns_retries: u8,
     mode: Mode,
@@ -120,7 +120,14 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     seal_selector = seal_selector orelse global.get("SealSelector");
     seal_key_file = seal_key_file orelse global.get("SealKeyFile");
 
-    const dns_ns = global.getOrDefault("DnsNameserver", "127.0.0.1");
+    const dns_ns_raw = global.getOrDefault("DnsNameserver", "127.0.0.1");
+    var ns_list: std.ArrayListUnmanaged([]const u8) = .{};
+    var ns_iter = mem.splitSequence(u8, dns_ns_raw, ",");
+    while (ns_iter.next()) |part| {
+        const trimmed = mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) try ns_list.append(allocator, trimmed);
+    }
+    const dns_nameservers = try ns_list.toOwnedSlice(allocator);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
     const dns_retries = global.getInt("DnsRetries", u8, 2);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
@@ -134,7 +141,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .pid_file = pid_file,
         .foreground = foreground_val,
         .user = user,
-        .dns_nameserver = dns_ns,
+        .dns_nameservers = dns_nameservers,
         .dns_timeout_ms = dns_timeout,
         .dns_retries = dns_retries,
         .mode = mode,
@@ -147,6 +154,11 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     };
 }
 
+fn usageError() error{InvalidArgument} {
+    std.log.err("usage: securearc -c <config-file>", .{});
+    return error.InvalidArgument;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -156,20 +168,9 @@ pub fn main() !void {
     // Parse command-line: securearc -c /path/to/config
     var args = std.process.args();
     _ = args.next();
-    const config_path = blk: {
-        const flag = args.next() orelse {
-            std.log.err("usage: securearc -c <config-file>", .{});
-            return error.InvalidArgument;
-        };
-        if (!std.mem.eql(u8, flag, "-c")) {
-            std.log.err("usage: securearc -c <config-file>", .{});
-            return error.InvalidArgument;
-        }
-        break :blk args.next() orelse {
-            std.log.err("usage: securearc -c <config-file>", .{});
-            return error.InvalidArgument;
-        };
-    };
+    const flag = args.next() orelse return usageError();
+    if (!std.mem.eql(u8, flag, "-c")) return usageError();
+    const config_path = args.next() orelse return usageError();
     g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
@@ -186,7 +187,7 @@ pub fn main() !void {
     // Set module-level globals
     g_authserv_id = arc_cfg.authserv_id;
     g_dns_config = .{
-        .nameserver = arc_cfg.dns_nameserver,
+        .nameservers = arc_cfg.dns_nameservers,
         .timeout_ms = arc_cfg.dns_timeout_ms,
         .retries = arc_cfg.dns_retries,
     };
