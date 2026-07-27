@@ -1,0 +1,167 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREARC 8
+.Os
+.Sh NAME
+.Nm securearc
+.Nd ARC chain validation and sealing milter for Postfix
+.Sh SYNOPSIS
+.Nm
+.Fl c Ar config-file
+.Sh DESCRIPTION
+.Nm
+is a high-performance Authenticated Received Chain (ARC) milter implementing
+RFC 8617.
+It validates existing ARC chains on incoming mail and optionally seals
+messages transiting through the mail system, preserving authentication
+results across forwarding hops.
+.Pp
+.Nm
+must be placed last in the milter chain (after SPF, DKIM, and DMARC)
+so that all upstream Authentication-Results are available for inclusion
+in the ARC-Authentication-Results header.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl c Ar config-file
+Path to the INI-style configuration file.
+Required.
+.El
+.Sh CONFIGURATION
+The configuration file uses INI format with a
+.Ql [global]
+section and one or more
+.Ql [listener:name]
+sections.
+.Ss Global Section
+.Bl -tag -width "SyslogFacility" -compact
+.It Cm AuthservID
+Identifier for Authentication-Results headers.
+Default:
+.Dq localhost .
+.It Cm WorkerThreads
+Number of worker threads.
+0 means auto-detect CPU count.
+Default: 0.
+.It Cm PidFile
+Path to the PID file.
+Default:
+.Pa /var/run/securearc/securearc.pid .
+.It Cm Foreground
+Run in foreground without daemonizing.
+Default: no.
+.It Cm User
+Drop privileges to this user after binding sockets.
+.It Cm Syslog
+Enable syslog output.
+Default: yes.
+.It Cm SyslogFacility
+Syslog facility.
+Default: mail.
+.It Cm LogLevel
+Logging verbosity: err, warn, info, debug.
+Default: info.
+.It Cm DnsNameserver
+Comma-separated DNS nameserver IPs.
+Default:
+.Dq 127.0.0.1 .
+.It Cm DnsTimeout
+DNS query timeout in seconds.
+Default: 5.
+.It Cm DnsRetries
+Number of DNS query retries.
+Default: 2.
+.It Cm DnsCacheSize
+Maximum DNS cache entries per worker.
+Default: 1000.
+.It Cm DnsNegativeTTL
+Negative cache TTL in seconds.
+Default: 60.
+.It Cm SignedHeaders
+Colon-separated headers included in ARC-Message-Signature.
+Default:
+.Dq from:to:subject:date:message-id .
+.It Cm ZmqEndpoint
+ZeroMQ PUB endpoint for event publishing.
+Disabled if not set.
+.It Cm ZmqTopic
+ZeroMQ topic prefix.
+Default:
+.Dq arc .
+.El
+.Ss Listener Sections
+Each
+.Ql [listener:name]
+section defines a socket and its operating mode.
+.Bl -tag -width "SealSelector" -compact
+.It Cm Socket
+Listen address.
+Format:
+.Dq inet:port@host
+or
+.Dq unix:/path .
+.It Cm Mode
+Operating mode:
+.Dq seal ,
+.Dq verify ,
+or
+.Dq both .
+Default: verify.
+.It Cm SealDomain
+Domain name for ARC sealing.
+Required for seal mode.
+.It Cm SealSelector
+DNS selector for the ARC signing key.
+Required for seal mode.
+.It Cm SealKeyFile
+Path to the private key file for ARC sealing.
+Required for seal mode.
+Supports RSA and Ed25519 keys in PEM format.
+.El
+.Pp
+If no listener sections are defined, the default is
+.Dq inet:8895@0.0.0.0
+in verify mode.
+.Sh SIGNALS
+.Bl -tag -width "SIGTERM" -compact
+.It Dv SIGHUP
+Reload configuration.
+.It Dv SIGTERM
+Graceful shutdown with 30 second drain timeout.
+.El
+.Sh POSTFIX INTEGRATION
+.Nm
+must be last in the milter chain:
+.Bd -literal -offset indent
+smtpd_milters = inet:127.0.0.1:8890,
+                inet:127.0.0.1:8891,
+                inet:127.0.0.1:8894,
+                inet:127.0.0.1:8895
+milter_connect_macros = j {daemon_name} v {client_addr}
+milter_default_action = accept
+.Ed
+.Sh LOG FORMAT
+.Bd -literal -offset indent
+securearc[pid]: id=QUEUEID peer=HOST[IP] client=IP mode=verify|seal elapsed=Nms
+.Ed
+.Sh EXIT STATUS
+.Ex -std
+.Sh FILES
+.Bl -tag -width "/usr/local/etc/securearc/securearc.conf"
+.It Pa /usr/local/etc/securearc/securearc.conf
+Default configuration file.
+.It Pa /var/run/securearc/securearc.pid
+Default PID file.
+.El
+.Sh SEE ALSO
+.Xr securearc-testkey 8 ,
+.Xr securespf 8 ,
+.Xr securedkim 8 ,
+.Xr securedmarc 8
+.Sh STANDARDS
+.Rs
+.%T Authenticated Received Chain (ARC) Protocol
+.%R RFC 8617
+.Re
+.Sh AUTHORS
+.An Daniel Morante
