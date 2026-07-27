@@ -456,11 +456,11 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_sig_b64);
 
-    // Final AMS header value
+    // Final AMS header value (pre-folded to prevent Postfix mid-token folding)
     const ams_value = std.fmt.allocPrint(
         conn.allocator,
-        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s}; h={s}; bh={s}; b={s}",
-        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, ams_sig_b64 },
+        "i={d}; a=rsa-sha256; c=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
+        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, foldBase64(conn.allocator, ams_sig_b64) catch ams_sig_b64 },
     ) catch return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_value);
     prependHeader(conn, "ARC-Message-Signature", ams_value);
@@ -468,7 +468,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     // Build ARC-Seal: signs over all prior ARC headers + current AAR + AMS + AS(empty b=)
     const as_template = std.fmt.allocPrint(
         conn.allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b=",
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb=",
         .{ new_instance, cv.toString(), domain, selector },
     ) catch return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(as_template);
@@ -487,11 +487,11 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(seal_sig_b64);
 
-    // Final AS header value
+    // Final AS header value (pre-folded)
     const as_value = std.fmt.allocPrint(
         conn.allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; b={s}",
-        .{ new_instance, cv.toString(), domain, selector, seal_sig_b64 },
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
+        .{ new_instance, cv.toString(), domain, selector, foldBase64(conn.allocator, seal_sig_b64) catch seal_sig_b64 },
     ) catch return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(as_value);
     prependHeader(conn, "ARC-Seal", as_value);
@@ -579,6 +579,27 @@ fn buildAarContent(conn: *connection_mod.Connection) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Fold a base64 string by inserting CRLF+TAB every 76 characters.
+/// Prevents Postfix from introducing mid-token folds at arbitrary positions.
+fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
+    const chunk_size = 76;
+    if (b64.len <= chunk_size) return b64;
+
+    var result: std.ArrayListUnmanaged(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    var offset: usize = 0;
+    while (offset < b64.len) {
+        const end = @min(offset + chunk_size, b64.len);
+        try result.appendSlice(allocator, b64[offset..end]);
+        if (end < b64.len) {
+            try result.appendSlice(allocator, "\r\n\t");
+        }
+        offset = end;
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 fn prependHeader(conn: *connection_mod.Connection, name: []const u8, value: []const u8) void {

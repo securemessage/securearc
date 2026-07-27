@@ -227,21 +227,32 @@ fn buildAmsSigningInput(
 }
 
 /// Strip the b= tag value from a DKIM/AMS header (set to empty for signing input).
+/// Correctly distinguishes "b=" from "bh=" even when whitespace/folding separates
+/// the preceding delimiter from the tag name.
 fn stripBValue(allocator: Allocator, header: []const u8) ![]u8 {
     // Find "b=" that isn't "bh="
     var i: usize = 0;
     while (i < header.len) {
         if (header[i] == 'b' and i + 1 < header.len and header[i + 1] == '=') {
-            // Make sure it's not "bh="
-            if (i > 0 and header[i - 1] != ';' and header[i - 1] != ' ' and header[i - 1] != '\t') {
+            // Look backward past any WSP/CRLF to find the real preceding non-WSP char.
+            // If that char is 'h', this is "bh=" not "b=".
+            var j: usize = i;
+            while (j > 0) {
+                j -= 1;
+                if (header[j] != ' ' and header[j] != '\t' and header[j] != '\r' and header[j] != '\n') {
+                    break;
+                }
+            }
+            // If preceding non-WSP is a letter (not ';' or ':'), this b is part of a larger tag name
+            if (j < i and j > 0 and header[j] >= 'a' and header[j] <= 'z') {
                 i += 1;
                 continue;
             }
-            // Check it's not "bh="
-            if (i > 0 and i >= 2 and header[i - 1] == 'h') {
+            if (j < i and j > 0 and header[j] >= 'A' and header[j] <= 'Z') {
                 i += 1;
                 continue;
             }
+
             // Found standalone "b=" — strip everything after = until next ;
             const val_start = i + 2;
             const semi = mem.indexOfScalar(u8, header[val_start..], ';');
