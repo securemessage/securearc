@@ -16,6 +16,7 @@ const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
 const zmq = securemilter.zmq;
+const log = securemilter.log;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -162,7 +163,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
 }
 
 fn usageError() error{InvalidArgument} {
-    std.log.err("usage: securearc -c <config-file>", .{});
+    log.err("usage: securearc -c <config-file>", .{});
     return error.InvalidArgument;
 }
 
@@ -181,15 +182,20 @@ pub fn main() !void {
     g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
-        std.log.err("failed to load config {s}: {}", .{ config_path, err });
+        log.err("failed to load config {s}: {}", .{ config_path, err });
         return err;
     };
     defer cfg.deinit();
 
     const arc_cfg = parseArcConfig(allocator, &cfg) catch |err| {
-        std.log.err("config parse error: {}", .{err});
+        log.err("config parse error: {}", .{err});
         return err;
     };
+
+    // Initialize logging from config
+    const log_cfg = if (cfg.global()) |g| log.LogConfig.fromSection(g, "securearc") else log.LogConfig.init(true, .mail, .info, "securearc");
+    log.initGlobal(&log_cfg);
+    log.initThread();
 
     // Set module-level globals
     g_authserv_id = arc_cfg.authserv_id;
@@ -211,7 +217,7 @@ pub fn main() !void {
     // Load seal key if configured
     if (arc_cfg.seal_key_file) |key_path| {
         g_seal_key = crypto.loadRsaKeyFile(key_path) catch |err| {
-            std.log.err("failed to load seal key {s}: {}", .{ key_path, err });
+            log.err("failed to load seal key {s}: {}", .{ key_path, err });
             return err;
         };
     }
@@ -219,23 +225,24 @@ pub fn main() !void {
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!arc_cfg.foreground) {
         daemon_mod.daemonize() catch |err| {
-            std.log.err("daemonize failed: {}", .{err});
+            log.err("daemonize failed: {}", .{err});
             return err;
         };
+        log.initThread(); // re-init after fork (PID changed)
     }
 
     // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, arc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
-            std.log.warn("DNS health monitor thread failed: {}", .{err});
+            log.warn("DNS health monitor thread failed: {}", .{err});
         };
         g_health_monitor = monitor;
     } else |err| {
-        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
+        log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
     }
 
     daemon_mod.writePidFile(arc_cfg.pid_file) catch |err| {
-        std.log.err("pid file write failed: {}", .{err});
+        log.err("pid file write failed: {}", .{err});
     };
     defer daemon_mod.removePidFile(arc_cfg.pid_file);
 
@@ -247,12 +254,12 @@ pub fn main() !void {
     // Drop privileges after PID file is written, before workers spawn
     if (arc_cfg.user) |user| {
         daemon_mod.dropPrivileges(user) catch |err| {
-            std.log.err("privilege drop to '{s}' failed: {}", .{ user, err });
+            log.err("privilege drop to '{s}' failed: {}", .{ user, err });
             return err;
         };
     }
 
-    std.log.info("SecureARC starting, AuthservID={s}, mode={s}, listeners={d}", .{
+    log.info("SecureARC starting, AuthservID={s}, mode={s}, listeners={d}", .{
         arc_cfg.authserv_id,
         @tagName(arc_cfg.mode),
         arc_cfg.listen_addresses.len,
@@ -668,14 +675,14 @@ fn toLower(c: u8) u8 {
 fn reloadConfig() void {
     // Re-read seal key file
     var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
-        std.log.warn("reload: failed to re-read config file, keeping previous", .{});
+        log.warn("reload: failed to re-read config file, keeping previous", .{});
         g_config_gen.increment();
         return;
     };
     defer cfg.deinit();
 
     const arc_cfg = parseArcConfig(g_allocator, &cfg) catch {
-        std.log.warn("reload: failed to parse config, keeping previous", .{});
+        log.warn("reload: failed to parse config, keeping previous", .{});
         g_config_gen.increment();
         return;
     };
@@ -683,18 +690,18 @@ fn reloadConfig() void {
     if (arc_cfg.seal_key_file) |key_path| {
         if (crypto.loadRsaKeyFile(key_path)) |new_key| {
             g_seal_key = new_key;
-            std.log.info("seal key reloaded from {s}", .{key_path});
+            log.info("seal key reloaded from {s}", .{key_path});
         } else |_| {
-            std.log.warn("reload: failed to reload seal key {s}", .{key_path});
+            log.warn("reload: failed to reload seal key {s}", .{key_path});
         }
     }
 
     g_config_gen.increment();
-    std.log.info("config generation advanced to {d}", .{g_config_gen.load()});
+    log.info("config generation advanced to {d}", .{g_config_gen.load()});
 }
 
 fn onWorkerReload() void {
-    std.log.debug("worker: config reload acknowledged", .{});
+    log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
