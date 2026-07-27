@@ -335,14 +335,25 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 }
 
 fn onEom(conn: *connection_mod.Connection) u8 {
-    switch (g_mode) {
-        .verify_only => return doVerify(conn),
-        .seal_only => return doSeal(conn),
-        .both => {
+    const start_ns = std.time.nanoTimestamp();
+    const result = switch (g_mode) {
+        .verify_only => doVerify(conn),
+        .seal_only => doSeal(conn),
+        .both => blk: {
             _ = doVerify(conn);
-            return doSeal(conn);
+            break :blk doSeal(conn);
         },
-    }
+    };
+    const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
+    const queue_id = conn.macros.queue_id orelse "-";
+    const client_addr = conn.macros.client_addr orelse "unknown";
+    const mode_str: []const u8 = switch (g_mode) {
+        .verify_only => "verify",
+        .seal_only => "seal",
+        .both => "both",
+    };
+    log.info("id={s} client={s} mode={s} elapsed={d}ms", .{ queue_id, client_addr, mode_str, elapsed_ms });
+    return result;
 }
 
 fn doVerify(conn: *connection_mod.Connection) u8 {
