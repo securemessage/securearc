@@ -400,9 +400,17 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
     }
 
-    // Parse ARC sets from headers
-    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch {
-        addArHeaderSimple(conn, "arc", "none", "parse error");
+    // Parse ARC sets from headers.
+    //
+    // A chain that does not parse is a broken chain, not an absent one
+    // (RFC 8617 §5.1.2). Answering arc=none here would let a sender downgrade
+    // a failed chain to "unsealed" simply by malforming it — and, before the
+    // parser rejected gaps, by appending a garbage set above a genuine one.
+    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch |err| {
+        if (err == error.OutOfMemory) return @intFromEnum(responses.Code.tempfail);
+        const reason = arc.describeChainError(err);
+        addArHeaderSimple(conn, "arc", "fail", reason);
+        publishEvent(conn.allocator, "verify", "fail", 0);
         return @intFromEnum(responses.Code.@"continue");
     };
     defer conn.allocator.free(sets);
@@ -444,8 +452,14 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
     }
 
-    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch
+    // A chain we cannot parse cannot be extended: sealing it would attest to a
+    // sequence we were unable to read. Pass the message through unsealed.
+    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch |err| {
+        if (err != error.OutOfMemory) {
+            log.warn("not sealing: {s}", .{arc.describeChainError(err)});
+        }
         return @intFromEnum(responses.Code.@"continue");
+    };
     defer conn.allocator.free(sets);
 
     const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;

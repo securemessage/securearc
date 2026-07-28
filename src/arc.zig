@@ -5,8 +5,9 @@ const Allocator = mem.Allocator;
 /// Maximum ARC chain length per RFC 8617 §5.1.1
 pub const MAX_INSTANCES: u8 = 50;
 
-/// ARC header types in a set.
-pub const HeaderType = enum {
+/// ARC header types in a set. The values index the per-instance duplicate
+/// tracking in parseArcSets.
+pub const HeaderType = enum(u2) {
     aar, // ARC-Authentication-Results
     ams, // ARC-Message-Signature
     as, // ARC-Seal
@@ -64,12 +65,45 @@ pub const ChainValidation = enum {
     }
 };
 
+/// Why a set of ARC headers does not form a chain that can be validated.
+///
+/// RFC 8617 §5.1.2: a chain that is too long, or whose instance numbers are
+/// not a complete sequence, is `cv=fail`. Reporting anything else — including
+/// validating whatever prefix happens to be well-formed — asserts a verdict
+/// over a chain that is not the one attached to the message.
+pub const ChainError = error{
+    /// An instance number between 1 and the highest one seen is missing.
+    ChainGap,
+    /// An instance carries the same ARC header twice.
+    DuplicateHeader,
+    /// An instance number above MAX_INSTANCES.
+    ChainTooLong,
+    /// An instance is missing its AAR, AMS or AS.
+    IncompleteSet,
+    /// An ARC header whose i= tag is absent, zero or unparseable.
+    MalformedInstance,
+};
+
+/// Human-readable reason for an A-R header.
+pub fn describeChainError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ChainGap => "broken ARC chain: missing instance",
+        error.DuplicateHeader => "broken ARC chain: duplicate header in instance",
+        error.ChainTooLong => "broken ARC chain: too many instances",
+        error.IncompleteSet => "broken ARC chain: incomplete instance",
+        error.MalformedInstance => "broken ARC chain: malformed i= tag",
+        else => "broken ARC chain",
+    };
+}
+
 /// Parse ARC-related headers from a list of message headers and build ordered ARC sets.
 ///
-/// Returns sets ordered by instance number (1..N). Any gaps or duplicates
-/// within a single instance invalidate the chain.
+/// Returns sets ordered by instance number, 1..N with no gaps, each complete.
+/// Anything else is a ChainError: the caller must report `cv=fail` rather than
+/// validate a subset of the chain the message actually carries.
 pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
     var sets: [MAX_INSTANCES]?ArcSet = .{null} ** MAX_INSTANCES;
+    var seen: [MAX_INSTANCES][3]bool = .{.{ false, false, false }} ** MAX_INSTANCES;
     var max_instance: u8 = 0;
 
     for (headers) |hdr| {
@@ -82,9 +116,15 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
         else
             continue;
 
-        const instance = parseInstance(hdr.value) orelse continue;
-        if (instance == 0 or instance > MAX_INSTANCES) continue;
+        const instance = parseInstance(hdr.value) orelse return error.MalformedInstance;
+        if (instance == 0) return error.MalformedInstance;
+        if (instance > MAX_INSTANCES) return error.ChainTooLong;
         if (instance > max_instance) max_instance = instance;
+
+        // RFC 8617 §5.1.1: exactly one of each header per instance.
+        const slot = @intFromEnum(htype);
+        if (seen[instance - 1][slot]) return error.DuplicateHeader;
+        seen[instance - 1][slot] = true;
 
         const idx = instance - 1;
         if (sets[idx] == null) {
@@ -128,12 +168,11 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
 
     var i: u8 = 0;
     while (i < max_instance) : (i += 1) {
-        if (sets[i]) |set| {
-            try result.append(allocator, set);
-        } else {
-            // Gap in chain — return what we have; caller validates completeness
-            break;
+        const set = sets[i] orelse return error.ChainGap;
+        if (set.aar_value.len == 0 or set.ams_value.len == 0 or set.as_value.len == 0) {
+            return error.IncompleteSet;
         }
+        try result.append(allocator, set);
     }
 
     return result.toOwnedSlice(allocator);
@@ -289,6 +328,81 @@ test "parseArcSets single set" {
     try std.testing.expectEqualStrings("example.com", sets[0].seal_domain);
     try std.testing.expectEqualStrings("rsa-sha256", sets[0].ams_algorithm);
     try std.testing.expectEqualStrings("from:to", sets[0].ams_signed_headers);
+}
+
+test "parseArcSets rejects a gap in the chain" {
+    // The A-4 exploit: a genuine i=1 set with a garbage i=3 set prepended.
+    // Truncating to [i=1] and validating it asserts arc=pass over a chain the
+    // message does not have.
+    const headers = [_]Header{
+        .{ .name = "ARC-Authentication-Results", .value = "i=3; evil.test; spf=pass" },
+        .{ .name = "ARC-Message-Signature", .value = "i=3; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==; bh=QUFBQQ==; h=from" },
+        .{ .name = "ARC-Seal", .value = "i=3; cv=pass; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==" },
+        .{ .name = "ARC-Authentication-Results", .value = "i=1; mail.example.com; spf=pass" },
+        .{ .name = "ARC-Message-Signature", .value = "i=1; a=rsa-sha256; d=example.com; s=arc; b=sig==; bh=hash==; h=from" },
+        .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=example.com; s=arc; b=seal==" },
+    };
+
+    try std.testing.expectError(error.ChainGap, parseArcSets(std.testing.allocator, &headers));
+}
+
+test "parseArcSets rejects a duplicated header within an instance" {
+    const headers = [_]Header{
+        .{ .name = "ARC-Authentication-Results", .value = "i=1; mail.example.com; spf=pass" },
+        .{ .name = "ARC-Message-Signature", .value = "i=1; a=rsa-sha256; d=example.com; s=arc; b=sig==; bh=hash==; h=from" },
+        .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=example.com; s=arc; b=seal==" },
+        // A second seal for the same instance: which one is the chain?
+        .{ .name = "ARC-Seal", .value = "i=1; cv=pass; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==" },
+    };
+
+    try std.testing.expectError(error.DuplicateHeader, parseArcSets(std.testing.allocator, &headers));
+}
+
+test "parseArcSets rejects an incomplete instance" {
+    const headers = [_]Header{
+        .{ .name = "ARC-Authentication-Results", .value = "i=1; mail.example.com; spf=pass" },
+        .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=example.com; s=arc; b=seal==" },
+    };
+
+    try std.testing.expectError(error.IncompleteSet, parseArcSets(std.testing.allocator, &headers));
+}
+
+test "parseArcSets rejects an instance above the chain limit" {
+    const headers = [_]Header{
+        .{ .name = "ARC-Seal", .value = "i=51; cv=pass; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==" },
+    };
+
+    try std.testing.expectError(error.ChainTooLong, parseArcSets(std.testing.allocator, &headers));
+}
+
+test "parseArcSets rejects a malformed instance tag" {
+    const missing = [_]Header{
+        .{ .name = "ARC-Seal", .value = "cv=pass; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==" },
+    };
+    try std.testing.expectError(error.MalformedInstance, parseArcSets(std.testing.allocator, &missing));
+
+    const zero = [_]Header{
+        .{ .name = "ARC-Seal", .value = "i=0; cv=pass; a=rsa-sha256; d=evil.test; s=x; b=QUFBQQ==" },
+    };
+    try std.testing.expectError(error.MalformedInstance, parseArcSets(std.testing.allocator, &zero));
+}
+
+test "parseArcSets accepts a complete two-instance chain" {
+    const headers = [_]Header{
+        .{ .name = "ARC-Authentication-Results", .value = "i=2; relay.test; spf=pass" },
+        .{ .name = "ARC-Message-Signature", .value = "i=2; a=rsa-sha256; d=relay.test; s=arc; b=s2==; bh=h2==; h=from" },
+        .{ .name = "ARC-Seal", .value = "i=2; cv=pass; a=rsa-sha256; d=relay.test; s=arc; b=seal2==" },
+        .{ .name = "ARC-Authentication-Results", .value = "i=1; mail.example.com; spf=pass" },
+        .{ .name = "ARC-Message-Signature", .value = "i=1; a=rsa-sha256; d=example.com; s=arc; b=sig==; bh=hash==; h=from" },
+        .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=example.com; s=arc; b=seal==" },
+    };
+
+    const sets = try parseArcSets(std.testing.allocator, &headers);
+    defer std.testing.allocator.free(sets);
+
+    try std.testing.expectEqual(@as(usize, 2), sets.len);
+    try std.testing.expectEqual(@as(u8, 1), sets[0].instance);
+    try std.testing.expectEqual(@as(u8, 2), sets[1].instance);
 }
 
 test "parseArcSets empty" {
