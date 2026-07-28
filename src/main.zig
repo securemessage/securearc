@@ -823,32 +823,33 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         }
     };
 
+    // Nothing below writes to the message until every header of the set has been
+    // built. See `emitArcSet`: a partial set is worse than no set at all, because
+    // the next hop reads it as a broken chain and makes that permanent (X-8).
+
     // Build AAR content from the results this ADMD produced
     const ar_content = buildAarContent(conn) orelse
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("building the ARC-Authentication-Results content");
     defer conn.allocator.free(ar_content);
 
-    // Build ARC-Authentication-Results header and prepend
     const aar = std.fmt.allocPrint(conn.allocator, "i={d}; {s}", .{ new_instance, ar_content }) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("formatting the ARC-Authentication-Results header");
     defer conn.allocator.free(aar);
-
-    prependHeader(conn, "ARC-Authentication-Results", aar);
 
     // Build AMS: sign the message (same as DKIM signing). Guarded at the top of
     // doSeal, so the body here is the whole body.
-    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
+    const body_data = conn.getBody() orelse return sealInternalError("the accumulated body is unavailable");
     const canon_mod = securemilter_crypto.canon;
 
     // Canonicalize body and compute body hash
     var body_canon = canon_mod.BodyCanonicalizer.init(conn.allocator, .relaxed);
     defer body_canon.deinit();
-    body_canon.update(body_data) catch return @intFromEnum(responses.Code.@"continue");
-    const canon_body = body_canon.finish() catch return @intFromEnum(responses.Code.@"continue");
+    body_canon.update(body_data) catch return sealInternalError("canonicalizing the body");
+    const canon_body = body_canon.finish() catch return sealInternalError("finishing body canonicalization");
     defer conn.allocator.free(canon_body);
     const body_hash_raw = crypto.sha256(canon_body);
     const body_hash_b64 = crypto.base64Encode(conn.allocator, &body_hash_raw) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("encoding the body hash");
     defer conn.allocator.free(body_hash_b64);
 
     // Build AMS template (pre-folded — SAME format used for both signing input AND
@@ -857,30 +858,30 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         conn.allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
         .{ new_instance, domain, selector, g_signed_headers, body_hash_b64 },
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return sealInternalError("formatting the AMS template");
     defer conn.allocator.free(ams_template);
 
     // Canonicalize selected headers for AMS signing input
     var ams_input: std.ArrayListUnmanaged(u8) = .{};
     defer ams_input.deinit(conn.allocator);
-    buildSigningHeaders(conn, &ams_input) catch return @intFromEnum(responses.Code.@"continue");
+    buildSigningHeaders(conn, &ams_input) catch return sealInternalError("canonicalizing the signed headers");
 
     // Append AMS header template (with empty b=) as final line (no trailing CRLF)
     const ams_full_template = std.fmt.allocPrint(conn.allocator, "ARC-Message-Signature: {s}", .{ams_template}) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("formatting the AMS signing input");
     defer conn.allocator.free(ams_full_template);
     const canon_ams_tmpl = canon_mod.canonicalizeHeader(conn.allocator, .relaxed, ams_full_template) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("canonicalizing the AMS header");
     defer conn.allocator.free(canon_ams_tmpl);
     ams_input.appendSlice(conn.allocator, canon_ams_tmpl) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("assembling the AMS signing input");
 
     // Sign AMS
     const ams_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, ams_input.items) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("signing the AMS");
     defer conn.allocator.free(ams_sig_raw);
     const ams_sig_b64 = crypto.base64Encode(conn.allocator, ams_sig_raw) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("encoding the AMS signature");
     defer conn.allocator.free(ams_sig_b64);
 
     // Final AMS header value: same pre-folded template + signature (folded base64)
@@ -889,30 +890,29 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         conn.allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
         .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, folded_ams_sig },
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return sealInternalError("formatting the AMS header");
     defer conn.allocator.free(ams_value);
-    prependHeader(conn, "ARC-Message-Signature", ams_value);
 
     // Build ARC-Seal: signs over all prior ARC headers + current AAR + AMS + AS(empty b=)
     const as_template = std.fmt.allocPrint(
         conn.allocator,
         "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb=",
         .{ new_instance, cv.toString(), domain, selector },
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return sealInternalError("formatting the ARC-Seal template");
     defer conn.allocator.free(as_template);
 
     // Build seal signing input
     var seal_input: std.ArrayListUnmanaged(u8) = .{};
     defer seal_input.deinit(conn.allocator);
     buildSealInput(conn, &seal_input, sets, aar, ams_value, as_template) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("assembling the ARC-Seal signing input");
 
     // Sign seal
     const seal_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, seal_input.items) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("signing the ARC-Seal");
     defer conn.allocator.free(seal_sig_raw);
     const seal_sig_b64 = crypto.base64Encode(conn.allocator, seal_sig_raw) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return sealInternalError("encoding the ARC-Seal signature");
     defer conn.allocator.free(seal_sig_b64);
 
     // Final AS header value (pre-folded)
@@ -920,9 +920,13 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         conn.allocator,
         "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
         .{ new_instance, cv.toString(), domain, selector, foldBase64(conn.allocator, seal_sig_b64) catch seal_sig_b64 },
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return sealInternalError("formatting the ARC-Seal header");
     defer conn.allocator.free(as_value);
-    prependHeader(conn, "ARC-Seal", as_value);
+
+    // The whole set exists now, so it can go out as a unit. Nothing above this
+    // line has touched the message.
+    emitArcSet(conn.allocator, conn.fd, aar, ams_value, as_value) catch
+        return sealInternalError("writing the ARC set");
 
     publishEvent(conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
@@ -1072,10 +1076,58 @@ fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
-fn prependHeader(conn: *connection_mod.Connection, name: []const u8, value: []const u8) void {
-    const hdr_payload = responses.addHeader(conn.allocator, name, value) catch return;
-    defer conn.allocator.free(hdr_payload);
-    codec.writePacket(conn.fd, hdr_payload) catch {};
+/// Emit the three headers of one ARC set as a unit.
+///
+/// A milter `addHeader` packet cannot be recalled once it is on the wire, and
+/// the old code built and wrote each header where it was computed, with fallible
+/// allocations in between. An allocation failure partway through therefore
+/// delivered a message carrying a *partial* set — AAR alone, or AAR and AMS with
+/// no ARC-Seal. RFC 8617 requires all three per instance, so the next hop reads
+/// that as a malformed chain and records a permanent `cv=fail` (§5.1.2). Our own
+/// resource failure thus destroyed a chain that may have been perfectly valid,
+/// which is precisely the harm A-12 was filed to prevent, reached through a
+/// different door (audit X-8).
+///
+/// Every payload is built before the first byte is written, so allocation
+/// failures all land while the message is still untouched. What remains is a
+/// socket that dies mid-set, and that fails the whole transaction anyway; the
+/// milter protocol offers nothing stronger, since three headers cannot be sent
+/// as one packet.
+/// Takes the allocator and fd rather than the `Connection` it came from: those
+/// are all it uses, and the property that matters here — nothing on the wire
+/// unless everything is on the wire — is then testable against a pipe.
+fn emitArcSet(
+    allocator: Allocator,
+    fd: posix.fd_t,
+    aar: []const u8,
+    ams: []const u8,
+    seal_hdr: []const u8,
+) !void {
+    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar);
+    defer allocator.free(p_aar);
+    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams);
+    defer allocator.free(p_ams);
+    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr);
+    defer allocator.free(p_seal);
+
+    // Nothing fallible between here and the final write. Each addHeader prepends,
+    // so writing AAR, AMS, AS leaves the message reading AS, AMS, AAR downward —
+    // the conventional order for the newest set, and byte-for-byte what the
+    // previous code produced.
+    try codec.writePacket(fd, p_aar);
+    try codec.writePacket(fd, p_ams);
+    try codec.writePacket(fd, p_seal);
+}
+
+/// Defer the message after an internal failure while sealing (audit X-8).
+///
+/// Never `continue`: delivering here would either charge our own fault to the
+/// sender's chain or, worse, leave a half-written set behind. The man page
+/// already promises that an internal fault defers in either role, and this is
+/// what keeps that promise on the sealing path.
+fn sealInternalError(what: []const u8) u8 {
+    log.err("not sealing: internal error {s}", .{what});
+    return @intFromEnum(responses.Code.tempfail);
 }
 
 fn addArHeaderSimple(
@@ -1506,6 +1558,70 @@ test "a bad On-DNSError value stops the daemon rather than picking a policy" {
     defer cfg.deinit();
 
     try std.testing.expectError(error.InvalidOnDnsError, parseArcConfig(std.testing.allocator, &cfg));
+}
+
+// --- X-8: a partial ARC set must never reach the wire ------------------------
+
+test "emitArcSet writes the whole set or nothing, at every failure point" {
+    // The harmful state is a *partial* set. RFC 8617 requires all three headers
+    // per instance, so AAR alone, or AAR+AMS with no ARC-Seal, is a malformed
+    // chain: the next hop records cv=fail and 5.1.2 makes that permanent. Our own
+    // allocation failure would then destroy a chain that may be perfectly valid.
+    //
+    // Stated as a property over every allocation the function performs rather
+    // than against a hand-picked fail index, so it cannot rot as the number of
+    // allocations inside addHeader changes.
+    var fail_index: usize = 0;
+    var saw_success = false;
+    var saw_failure = false;
+    while (fail_index < 16) : (fail_index += 1) {
+        const fds = try posix.pipe2(.{ .NONBLOCK = true });
+        defer posix.close(fds[0]);
+        defer posix.close(fds[1]);
+
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const res = emitArcSet(
+            failing.allocator(),
+            fds[1],
+            "i=1; mail.test; spf=pass",
+            "i=1; a=rsa-sha256; b=AAAA",
+            "i=1; cv=none; a=rsa-sha256; b=BBBB",
+        );
+
+        var buf: [1024]u8 = undefined;
+        const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+
+        if (res) |_| {
+            saw_success = true;
+            // All three present, and in the order that makes the message read
+            // ARC-Seal, AMS, AAR downward once each prepend is applied.
+            const aar_at = mem.indexOf(u8, buf[0..n], "ARC-Authentication-Results") orelse
+                return error.TestUnexpectedResult;
+            const ams_at = mem.indexOf(u8, buf[0..n], "ARC-Message-Signature") orelse
+                return error.TestUnexpectedResult;
+            const seal_at = mem.indexOf(u8, buf[0..n], "ARC-Seal") orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expect(aar_at < ams_at);
+            try std.testing.expect(ams_at < seal_at);
+        } else |_| {
+            saw_failure = true;
+            // The message must be untouched. Before X-8 was fixed, headers were
+            // built and written where they were computed, so a failure here left
+            // one or two of the three on the wire and this read returned bytes.
+            try std.testing.expectEqual(@as(usize, 0), n);
+        }
+    }
+
+    // Guard against the test passing because it exercised nothing: the range must
+    // cover both a failing allocation and the fully successful case.
+    try std.testing.expect(saw_failure);
+    try std.testing.expect(saw_success);
 }
 
 // A typo used to leave the mode at whatever the previous section set, silently.
