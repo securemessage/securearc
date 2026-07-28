@@ -105,6 +105,61 @@ Default: 60.
 Colon-separated headers included in ARC-Message-Signature.
 Default:
 .Dq from:to:subject:date:message-id .
+.It Cm MaxBodyBytes
+Largest message body buffered in order to hash it.
+Accepts an optional
+.Cm K , Cm M
+or
+.Cm G
+suffix.
+Default: 10M.
+0 disables the limit.
+.Pp
+Should be at least the MTA's
+.Va message_size_limit .
+A body over the limit is neither hashed nor silently truncated: chain validation
+reports
+.Cm arc=temperror
+and sealing is skipped, since an
+.Cm ARC-Message-Signature
+taken over a partial copy would name this ADMD as the hop that broke the chain.
+.It Cm MaxHeaders
+Largest number of headers accumulated for one message.
+Default: 500.
+0 disables the limit.
+.It Cm MaxHeaderBytes
+Largest total header size, names plus values, accumulated for one message.
+Accepts a size suffix.
+Default: 1M.
+0 disables the limit.
+.Pp
+A message exceeding either header limit is tempfailed rather than delivered.
+Headers past the limit are never read, and
+.Nm
+can only strip a forged
+.Cm Authentication-Results
+header that it read.
+.Pp
+.Cm MaxHeaders
+is also what bounds ARC verification cost.
+One ARC set is three headers and RFC 8617 permits 50 sets, so a full-length
+chain is 150 headers by itself; do not tune this below roughly 300 where deep
+chains are expected.
+There is no
+.Cm MaxSignatures
+for
+.Nm :
+RFC 8617 Section 5.1.1 already caps a chain at 50 sets and
+.Nm
+fails any chain longer than that, so rejecting a shorter, RFC-legal chain to
+save work would be a conformance bug rather than hardening.
+.Pp
+.Cm MaxBodyBytes , Cm MaxHeaders
+and
+.Cm MaxHeaderBytes
+are read at startup only.
+.Dv SIGHUP
+does not change them.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

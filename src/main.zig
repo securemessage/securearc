@@ -55,6 +55,7 @@ pub const ArcConfig = struct {
     strip_auth_results: bool,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
+    limits: connection_mod.Limits,
 };
 
 const reload_mod = securemilter.reload;
@@ -184,6 +185,9 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     // just the arc= results this daemon replaces (RFC 8601 §5).
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
+    // Caps on attacker-controlled message content (audit X-4).
+    const limits = connection_mod.Limits.fromSection(global);
+
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
 
@@ -208,6 +212,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
+        .limits = limits,
     };
 }
 
@@ -339,6 +344,7 @@ pub fn main() !void {
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
+        .limits = arc_cfg.limits,
     };
 
     const shutdown_pipe = try posix.pipe();
@@ -398,7 +404,23 @@ fn onEoh(conn: *connection_mod.Connection) u8 {
 }
 
 fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
-    conn.appendBody(data) catch {};
+    // See securedkim's onBody: the connection latches the overflow and
+    // end-of-message declines to validate or seal, rather than hashing a body
+    // the MTA is not delivering (audit X-4). Log only the chunk that trips it.
+    const already_tripped = conn.body_overflow;
+    conn.appendBody(data) catch |e| {
+        if (!already_tripped) {
+            const peer = conn.getPeerDisplay();
+            if (e == error.BodyTooLarge) {
+                log.warn(
+                    "body exceeds MaxBodyBytes={d} from {s}[{s}]: message will not be validated or sealed",
+                    .{ conn.limits.max_body_bytes, peer.name, peer.ip },
+                );
+            } else {
+                log.err("body accumulation failed for {s}[{s}]: {}", .{ peer.name, peer.ip, e });
+            }
+        }
+    };
     return @intFromEnum(responses.Code.@"continue");
 }
 
@@ -430,6 +452,17 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 }
 
 fn doVerify(conn: *connection_mod.Connection) u8 {
+    // An incomplete copy cannot validate a chain: every AMS in it covers the
+    // body, so a truncated body makes each one fail on content grounds rather
+    // than on the chain's own merits. arc=fail would blame the sender for our
+    // resource limit, so this is temperror (RFC 8617 5.2 treats it as a
+    // transient verification failure).
+    if (conn.contentTruncated()) {
+        addArHeaderSimple(conn, "arc", "temperror", "message too large to validate");
+        publishEvent(conn.allocator, "verify", "temperror", 0);
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
     // Build header list in arc.Header format
     var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
     defer arc_headers.deinit(conn.allocator);
@@ -459,8 +492,9 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
     }
 
-    // Validate chain
-    const body_data = conn.getBody();
+    // Validate chain. The truncation check at the top of doVerify established
+    // the body is whole.
+    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
     var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
     defer resolver.deinit();
 
@@ -478,6 +512,18 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
 }
 
 fn doSeal(conn: *connection_mod.Connection) u8 {
+    // A seal is an attestation over content. Sealing a copy we know to be
+    // incomplete would hand the next hop a chain that cannot validate and name
+    // this ADMD as the one that broke it (audit X-4). Pass through unsealed.
+    if (conn.contentTruncated()) {
+        const peer = conn.getPeerDisplay();
+        log.warn(
+            "not sealing message from {s}[{s}]: accumulated copy is incomplete",
+            .{ peer.name, peer.ip },
+        );
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
     const domain = g_seal_domain orelse return @intFromEnum(responses.Code.@"continue");
     const selector = g_seal_selector orelse return @intFromEnum(responses.Code.@"continue");
 
@@ -509,7 +555,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
     // Determine chain status for our seal
     const cv: arc.ChainValidation = if (sets.len == 0) .none else blk: {
-        const body_data = conn.getBody();
+        const body_data = conn.getBody() orelse break :blk arc.ChainValidation.fail;
         var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
         defer resolver.deinit();
         const vr = chain.validateChain(conn.allocator, &resolver, sets, arc_headers.items, body_data);
@@ -528,8 +574,9 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
     prependHeader(conn, "ARC-Authentication-Results", aar);
 
-    // Build AMS: sign the message (same as DKIM signing)
-    const body_data = conn.getBody();
+    // Build AMS: sign the message (same as DKIM signing). Guarded at the top of
+    // doSeal, so the body here is the whole body.
+    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
     const canon_mod = securemilter_crypto.canon;
 
     // Canonicalize body and compute body hash

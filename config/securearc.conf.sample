@@ -34,6 +34,36 @@ LocalAuthMethods = spf, dkim, dmarc
 # Authentication-Results header claiming our AuthservID regardless of method.
 # StripAuthResults = no
 
+# --- Resource limits on attacker-controlled message content ---
+#
+# All take effect at startup, not on SIGHUP. 0 disables the limit.
+
+# Largest message body this daemon will buffer in order to hash it.
+# Accepts a K/M/G suffix. Default 10M.
+#
+# Set this at or above Postfix's message_size_limit. A body over the limit is
+# not hashed and not truncated: chain validation reports arc=temperror and
+# sealing is skipped, since an ARC-Message-Signature over a partial copy would
+# name this ADMD as the hop that broke the chain.
+# MaxBodyBytes  = 10M
+
+# Largest number of headers, and largest total header size, this daemon will
+# accumulate. Defaults 500 and 1M.
+#
+# A message whose header block exceeds either is tempfailed rather than
+# delivered: headers past the limit are never seen, so a forged
+# Authentication-Results hidden beyond it could not be stripped.
+#
+# MaxHeaders is what bounds ARC verification cost. Note that one ARC set is three
+# headers and RFC 8617 permits 50 sets, so a full-length chain is 150 headers on
+# its own; do not tune this below roughly 300 if deep chains are expected.
+# MaxHeaders     = 500
+# MaxHeaderBytes = 1M
+
+# MaxSignatures is not used by SecureARC. RFC 8617 section 5.1.1 caps a chain at
+# 50 sets and SecureARC already fails any chain longer than that, so refusing a
+# shorter, RFC-legal chain to save work would be a conformance bug.
+
 [listener:verify-inbound]
 Socket          = inet:8895@0.0.0.0
 Mode            = verify
