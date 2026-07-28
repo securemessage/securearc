@@ -56,6 +56,7 @@ pub const ArcConfig = struct {
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
     limits: connection_mod.Limits,
+    min_key_bits: crypto.MinRsaBits,
 };
 
 const reload_mod = securemilter.reload;
@@ -67,6 +68,13 @@ var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_mode: Mode = .verify_only;
 var g_seal_domain: ?[]const u8 = null;
 var g_seal_selector: ?[]const u8 = null;
+
+/// Smallest RSA modulus accepted on an AMS or ARC-Seal signature.
+///
+/// Set once at startup and read by every worker thereafter. Kept out of
+/// `connection.Limits` because that struct is shared by all four daemons and
+/// only the two that verify signatures have any use for this.
+var g_min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS;
 /// Seal key behind an RCU container.
 ///
 /// A single ARC set is signed twice — once for the AMS, once for the AS — and
@@ -188,6 +196,12 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     // Caps on attacker-controlled message content (audit X-4).
     const limits = connection_mod.Limits.fromSection(global);
 
+    // Smallest RSA key accepted on an AMS or ARC-Seal (audit C-3). ARC inherits
+    // DKIM's cryptography, so RFC 8301's floor applies to sealed hops too.
+    const min_key_bits = crypto.resolveMinRsaBits(
+        global.getInt(crypto.MIN_KEY_BITS_OPTION, u32, crypto.RFC8301_MIN_RSA_BITS),
+    );
+
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
 
@@ -213,6 +227,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
         .limits = limits,
+        .min_key_bits = min_key_bits,
     };
 }
 
@@ -269,14 +284,37 @@ pub fn main() !void {
     g_strip_policy = .{ .own_methods = &.{"arc"}, .strip_all = arc_cfg.strip_auth_results };
     g_zmq_endpoint = arc_cfg.zmq_endpoint;
     g_zmq_topic = arc_cfg.zmq_topic;
+    g_min_key_bits = arc_cfg.min_key_bits.bits;
+
+    if (arc_cfg.min_key_bits.raised) {
+        log.warn(
+            "{s} below the RFC 8301 minimum: using {d} bits",
+            .{ crypto.MIN_KEY_BITS_OPTION, arc_cfg.min_key_bits.bits },
+        );
+    }
 
     // Load seal key if configured
     g_seal_key = SealKeyRcu.init(allocator, freeSealKey);
     if (arc_cfg.seal_key_file) |key_path| {
-        var key = crypto.loadRsaKeyFile(key_path) catch |err| {
-            log.err("failed to load seal key {s}: {}", .{ key_path, err });
+        // The RFC floor, not the operator's MinimumKeyBits: that option is a
+        // policy about keys other ADMDs publish. Sealing with an undersized key
+        // is its own fault though — RFC 8301 §3.2 binds signers to 1024 bits
+        // too, and a seal no downstream verifier will accept is worse than no
+        // seal at all, because it claims a chain of custody that cannot be
+        // checked.
+        const min_bits = crypto.RFC8301_MIN_RSA_BITS;
+        var key = crypto.loadRsaKeyFile(key_path, min_bits) catch |err| {
+            if (err == error.RsaKeyTooSmall) {
+                log.err(
+                    "seal key {s} is below the RFC 8301 minimum of {d} bits: refusing to seal with it",
+                    .{ key_path, min_bits },
+                );
+            } else {
+                log.err("failed to load seal key {s}: {}", .{ key_path, err });
+            }
             return err;
         };
+        log.info("loaded {d}-bit seal key from {s}", .{ crypto.signingKeyBits(&key), key_path });
         const boxed = boxSealKey(allocator, key) catch |err| {
             key.deinit();
             log.err("failed to store seal key: {}", .{err});
@@ -326,9 +364,10 @@ pub fn main() !void {
         };
     }
 
-    log.info("SecureARC starting, AuthservID={s}, mode={s}, listeners={d}", .{
+    log.info("SecureARC starting, AuthservID={s}, mode={s}, MinimumKeyBits={d}, listeners={d}", .{
         arc_cfg.authserv_id,
         @tagName(arc_cfg.mode),
+        arc_cfg.min_key_bits.bits,
         arc_cfg.listen_addresses.len,
     });
 
@@ -504,6 +543,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         sets,
         arc_headers.items,
         body_data,
+        g_min_key_bits,
     );
 
     addArHeaderSimple(conn, "arc", result.status.toString(), result.failure_reason);
@@ -558,7 +598,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         const body_data = conn.getBody() orelse break :blk arc.ChainValidation.fail;
         var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
         defer resolver.deinit();
-        const vr = chain.validateChain(conn.allocator, &resolver, sets, arc_headers.items, body_data);
+        const vr = chain.validateChain(conn.allocator, &resolver, sets, arc_headers.items, body_data, g_min_key_bits);
         break :blk vr.status;
     };
 
@@ -888,7 +928,8 @@ fn reloadConfig() void {
     }
 
     if (arc_cfg.seal_key_file) |key_path| {
-        if (crypto.loadRsaKeyFile(key_path)) |new_key| {
+        const min_bits = crypto.RFC8301_MIN_RSA_BITS;
+        if (crypto.loadRsaKeyFile(key_path, min_bits)) |new_key| {
             var key = new_key;
             if (boxSealKey(g_allocator, new_key)) |boxed| {
                 if (g_seal_key.publish(&g_config_gen, boxed)) {

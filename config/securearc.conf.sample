@@ -64,6 +64,25 @@ LocalAuthMethods = spf, dkim, dmarc
 # 50 sets and SecureARC already fails any chain longer than that, so refusing a
 # shorter, RFC-legal chain to save work would be a conformance bug.
 
+# --- Minimum key size for sealed hops ---
+
+# Smallest RSA key, in bits, accepted on an ARC-Message-Signature or ARC-Seal.
+# Default 1024.
+#
+# ARC inherits DKIM's cryptography, so RFC 8301 section 3.2 applies here too:
+# verifiers "MUST NOT consider signatures using RSA keys of less than 1024 bits
+# as valid signatures". Unlike the MaxNNN limits above, 0 does NOT disable this;
+# anything below 1024 is raised to 1024 and a warning is logged.
+#
+# A set signed with an undersized key fails the chain (arc=fail), because a hop
+# whose signature proves nothing cannot be a link in a chain of custody. The
+# reported reason names the key rather than the signature, so the failure can be
+# taken up with the forwarder that produced it.
+#
+# This applies only to keys other ADMDs publish. This daemon's own seal key is
+# always held to the 1024-bit floor regardless of what is set here.
+# MinimumKeyBits = 1024
+
 [listener:verify-inbound]
 Socket          = inet:8895@0.0.0.0
 Mode            = verify

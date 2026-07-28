@@ -26,12 +26,18 @@ pub const ValidationResult = struct {
 /// 3. For each ARC set, verify the ARC-Seal (signs over all prior ARC headers)
 /// 4. Check cv= values: i=1 must be "none", i>1 must be "pass"
 /// 5. If any step fails, result is "fail"
+///
+/// `min_key_bits` is the smallest RSA modulus accepted for an AMS or AS
+/// signature. ARC inherits DKIM's cryptography, so RFC 8301's floor applies
+/// here too: a set signed with a factorable key must not validate, or the whole
+/// point of a chain of custody is lost at that hop.
 pub fn validateChain(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
     sets: []const arc.ArcSet,
     all_headers: []const arc.Header,
     body_data: []const u8,
+    min_key_bits: u32,
 ) ValidationResult {
     if (sets.len == 0) {
         return .{ .status = .none, .highest_instance = 0, .failure_reason = null };
@@ -76,21 +82,23 @@ pub fn validateChain(
 
     // Step 3: Verify the most recent AMS (i=N) — validates message integrity
     const newest = sets[sets.len - 1];
-    if (!verifyAms(allocator, resolver, &newest, all_headers, body_data)) {
+    var ams_reason: ?[]const u8 = null;
+    if (!verifyAms(allocator, resolver, &newest, all_headers, body_data, min_key_bits, &ams_reason)) {
         return .{
             .status = .fail,
             .highest_instance = newest.instance,
-            .failure_reason = "AMS verification failed for newest set",
+            .failure_reason = ams_reason orelse "AMS verification failed for newest set",
         };
     }
 
     // Step 4: Verify each ARC-Seal (validates chain integrity)
     for (sets) |set| {
-        if (!verifySeal(allocator, resolver, &set, sets[0..set.instance])) {
+        var seal_reason: ?[]const u8 = null;
+        if (!verifySeal(allocator, resolver, &set, sets[0..set.instance], min_key_bits, &seal_reason)) {
             return .{
                 .status = .fail,
                 .highest_instance = set.instance,
-                .failure_reason = "ARC-Seal verification failed",
+                .failure_reason = seal_reason orelse "ARC-Seal verification failed",
             };
         }
     }
@@ -106,12 +114,18 @@ pub fn validateChain(
 ///
 /// Fetches the public key via DNS: <selector>._domainkey.<domain> TXT
 /// Then verifies the signature over canonicalized headers + body hash.
+/// `reason`, when set, replaces the caller's generic failure message. Most
+/// failures here are genuinely "the signature did not verify" and leave it
+/// alone; a key refused on policy grounds is worth naming, because the fix
+/// belongs to the signing hop and nobody can act on it unless it is reported.
 fn verifyAms(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
     set: *const arc.ArcSet,
     all_headers: []const arc.Header,
     body_data: []const u8,
+    min_key_bits: u32,
+    reason: *?[]const u8,
 ) bool {
     // Fetch public key from DNS
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
@@ -164,7 +178,14 @@ fn verifyAms(
     defer allocator.free(sig_bytes);
 
     // Verify with RSA-SHA256
-    const pkey = crypto.loadRsaPublicKeyDer(key_der) catch return false;
+    const pkey = crypto.loadRsaPublicKeyDer(key_der, min_key_bits, null) catch |err| {
+        reason.* = switch (err) {
+            error.RsaKeyTooSmall => "AMS signed with an RSA key below the minimum size",
+            error.NotRsaPublicKey => "AMS key record p= is not an RSA key",
+            else => null,
+        };
+        return false;
+    };
     defer crypto.freePublicKey(pkey);
 
     return crypto.rsaVerify(pkey, signing_input, sig_bytes) catch false;
@@ -275,11 +296,14 @@ fn stripBValue(allocator: Allocator, header: []const u8) ![]u8 {
 /// The seal signs over ALL prior ARC headers (AAR, AMS, AS) for instances
 /// 1..i-1, plus the current instance's AAR and AMS (but NOT the current AS
 /// being verified — that would be circular).
+/// See `verifyAms` for the meaning of `reason`.
 fn verifySeal(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
     set: *const arc.ArcSet,
     prior_sets: []const arc.ArcSet,
+    min_key_bits: u32,
+    reason: *?[]const u8,
 ) bool {
     // Fetch public key
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
@@ -317,7 +341,14 @@ fn verifySeal(
     defer allocator.free(sig_bytes);
 
     // Verify with RSA-SHA256
-    const pkey = crypto.loadRsaPublicKeyDer(key_der) catch return false;
+    const pkey = crypto.loadRsaPublicKeyDer(key_der, min_key_bits, null) catch |err| {
+        reason.* = switch (err) {
+            error.RsaKeyTooSmall => "ARC-Seal signed with an RSA key below the minimum size",
+            error.NotRsaPublicKey => "ARC-Seal key record p= is not an RSA key",
+            else => null,
+        };
+        return false;
+    };
     defer crypto.freePublicKey(pkey);
 
     return crypto.rsaVerify(pkey, signing_input, sig_bytes) catch false;
@@ -382,7 +413,7 @@ fn appendCanonHeader(
 test "validateChain empty" {
     const sets: []const arc.ArcSet = &.{};
     const headers: []const arc.Header = &.{};
-    const result = validateChain(std.testing.allocator, undefined, sets, headers, "");
+    const result = validateChain(std.testing.allocator, undefined, sets, headers, "", crypto.RFC8301_MIN_RSA_BITS);
     try std.testing.expectEqual(arc.ChainValidation.none, result.status);
     try std.testing.expectEqual(@as(u8, 0), result.highest_instance);
 }
@@ -429,7 +460,7 @@ test "validateChain cv=pass required for i>1" {
     };
 
     const headers: []const arc.Header = &.{};
-    const result = validateChain(std.testing.allocator, undefined, &sets, headers, "");
+    const result = validateChain(std.testing.allocator, undefined, &sets, headers, "", crypto.RFC8301_MIN_RSA_BITS);
     try std.testing.expectEqual(arc.ChainValidation.fail, result.status);
     try std.testing.expectEqualStrings("ARC-Seal cv must be pass for i>1", result.failure_reason.?);
 }

@@ -160,6 +160,35 @@ and
 are read at startup only.
 .Dv SIGHUP
 does not change them.
+.It Cm MinimumKeyBits
+Smallest RSA key, in bits, accepted on an
+.Cm ARC-Message-Signature
+or
+.Cm ARC-Seal .
+Default: 1024.
+.Pp
+ARC inherits DKIM's cryptography, so RFC 8301 \[sc]3.2 applies to sealed hops as
+well: verifiers
+.Dq MUST NOT consider signatures using RSA keys of less than 1024 bits as valid signatures .
+Unlike the
+.Cm Max Ns -prefixed
+limits above, 0 does not disable this check; a configured value below 1024 is
+raised to 1024 and a warning is logged.
+.Pp
+A set signed with an undersized key fails the chain
+.Pq Cm arc=fail ,
+because a hop whose signature proves nothing cannot be a link in a chain of
+custody.
+The reported reason names the key rather than the signature, so the failure can
+be taken up with the forwarder that produced it instead of being mistaken for
+message modification in transit.
+.Pp
+This option governs only keys published by other ADMDs.
+The seal key configured with
+.Cm SealKeyFile
+is always held to the 1024-bit floor irrespective of this setting, and the daemon
+refuses to start if it is smaller.
+Read at startup only.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.
