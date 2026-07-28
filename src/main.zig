@@ -58,6 +58,7 @@ pub const ArcConfig = struct {
 };
 
 const reload_mod = securemilter.reload;
+const rcu_mod = securemilter.rcu;
 
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
@@ -65,7 +66,27 @@ var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_mode: Mode = .verify_only;
 var g_seal_domain: ?[]const u8 = null;
 var g_seal_selector: ?[]const u8 = null;
-var g_seal_key: ?crypto.SigningKey = null;
+/// Seal key behind an RCU container.
+///
+/// A single ARC set is signed twice — once for the AMS, once for the AS — and
+/// both signatures must come from the same key or the set is internally
+/// inconsistent and unverifiable. The previous code held `&g_seal_key.?`
+/// across both calls while SIGHUP overwrote the struct underneath, which
+/// could straddle a reload and also leaked the old EVP_PKEY every time
+/// (audit X-2).
+const SealKeyRcu = rcu_mod.Rcu(crypto.SigningKey);
+var g_seal_key: SealKeyRcu = undefined;
+
+fn freeSealKey(allocator: Allocator, key: *crypto.SigningKey) void {
+    key.deinit();
+    allocator.destroy(key);
+}
+
+fn boxSealKey(allocator: Allocator, key: crypto.SigningKey) !*crypto.SigningKey {
+    const boxed = try allocator.create(crypto.SigningKey);
+    boxed.* = key;
+    return boxed;
+}
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
 var g_local_auth_methods: []const []const u8 = &.{};
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"arc"} };
@@ -245,9 +266,20 @@ pub fn main() !void {
     g_zmq_topic = arc_cfg.zmq_topic;
 
     // Load seal key if configured
+    g_seal_key = SealKeyRcu.init(allocator, freeSealKey);
     if (arc_cfg.seal_key_file) |key_path| {
-        g_seal_key = crypto.loadRsaKeyFile(key_path) catch |err| {
+        var key = crypto.loadRsaKeyFile(key_path) catch |err| {
             log.err("failed to load seal key {s}: {}", .{ key_path, err });
+            return err;
+        };
+        const boxed = boxSealKey(allocator, key) catch |err| {
+            key.deinit();
+            log.err("failed to store seal key: {}", .{err});
+            return err;
+        };
+        g_seal_key.publish(&g_config_gen, boxed) catch |err| {
+            freeSealKey(allocator, boxed);
+            log.err("failed to publish seal key: {}", .{err});
             return err;
         };
     }
@@ -327,6 +359,12 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
+
+    // Workers are joined: no seal is in progress, so the live key and any
+    // retired ones can all be freed.
+    g_seal_key.deinit();
+    g_config_gen.deinit(allocator);
+
     if (g_health_monitor) |monitor| monitor.deinit();
 }
 
@@ -442,7 +480,11 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
 fn doSeal(conn: *connection_mod.Connection) u8 {
     const domain = g_seal_domain orelse return @intFromEnum(responses.Code.@"continue");
     const selector = g_seal_selector orelse return @intFromEnum(responses.Code.@"continue");
-    _ = g_seal_key orelse return @intFromEnum(responses.Code.@"continue");
+
+    // One key for the whole set. Acquired once here and used for both the AMS
+    // and the AS below: a reload landing between the two signatures must not
+    // be able to sign the halves of one ARC set with different keys.
+    const sign_key = g_seal_key.get() orelse return @intFromEnum(responses.Code.@"continue");
 
     // Determine instance number: count existing ARC sets + 1
     var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
@@ -526,7 +568,6 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         return @intFromEnum(responses.Code.@"continue");
 
     // Sign AMS
-    const sign_key = &g_seal_key.?;
     const ams_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, ams_input.items) catch
         return @intFromEnum(responses.Code.@"continue");
     defer conn.allocator.free(ams_sig_raw);
@@ -780,27 +821,51 @@ fn reloadConfig() void {
     // Re-read seal key file
     var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
         log.warn("reload: failed to re-read config file, keeping previous", .{});
-        g_config_gen.increment();
+        _ = g_config_gen.increment();
         return;
     };
     defer cfg.deinit();
 
     const arc_cfg = parseArcConfig(g_allocator, &cfg) catch {
         log.warn("reload: failed to parse config, keeping previous", .{});
-        g_config_gen.increment();
+        _ = g_config_gen.increment();
         return;
     };
+    // parseArcConfig hands back three slices it allocated. Only the seal key
+    // is adopted below; the rest were dropped on the floor here, leaking a
+    // little more on every SIGHUP.
+    defer {
+        g_allocator.free(arc_cfg.listen_addresses);
+        g_allocator.free(arc_cfg.dns_nameservers);
+        g_allocator.free(arc_cfg.local_auth_methods);
+    }
 
     if (arc_cfg.seal_key_file) |key_path| {
         if (crypto.loadRsaKeyFile(key_path)) |new_key| {
-            g_seal_key = new_key;
-            log.info("seal key reloaded from {s}", .{key_path});
+            var key = new_key;
+            if (boxSealKey(g_allocator, new_key)) |boxed| {
+                if (g_seal_key.publish(&g_config_gen, boxed)) {
+                    log.info("seal key reloaded from {s} ({d} awaiting reclamation)", .{
+                        key_path,
+                        g_seal_key.retiredCount(),
+                    });
+                } else |err| {
+                    freeSealKey(g_allocator, boxed);
+                    log.warn("reload: failed to publish seal key ({}), keeping previous", .{err});
+                }
+            } else |err| {
+                key.deinit();
+                log.warn("reload: failed to store seal key ({}), keeping previous", .{err});
+            }
         } else |_| {
             log.warn("reload: failed to reload seal key {s}", .{key_path});
         }
     }
 
-    g_config_gen.increment();
+    _ = g_config_gen.increment();
+    // Wake the workers so they reach a quiescent point and any superseded key
+    // becomes reclaimable rather than accumulating.
+    g_config_gen.wake();
     log.info("config generation advanced to {d}", .{g_config_gen.load()});
 }
 
