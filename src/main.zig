@@ -10,6 +10,7 @@ const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
+const auth_stamp = securemilter.auth_stamp;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -650,7 +651,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     // resource limit, so this is temperror (RFC 8617 5.2 treats it as a
     // transient verification failure).
     if (conn.contentTruncated()) {
-        addArHeaderSimple(conn, "arc", "temperror", "message too large to validate");
+        addArHeaderSimple(conn, "arc", "temperror", "message too large to validate") catch |err|
+            return auth_stamp.deferCode(err, "arc");
         publishEvent(conn.allocator, "verify", "temperror", 0);
         return @intFromEnum(responses.Code.@"continue");
     }
@@ -672,14 +674,16 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch |err| {
         if (err == error.OutOfMemory) return @intFromEnum(responses.Code.tempfail);
         const reason = arc.describeChainError(err);
-        addArHeaderSimple(conn, "arc", "fail", reason);
+        addArHeaderSimple(conn, "arc", "fail", reason) catch |e|
+            return auth_stamp.deferCode(e, "arc");
         publishEvent(conn.allocator, "verify", "fail", 0);
         return @intFromEnum(responses.Code.@"continue");
     };
     defer conn.allocator.free(sets);
 
     if (sets.len == 0) {
-        addArHeaderSimple(conn, "arc", "none", null);
+        addArHeaderSimple(conn, "arc", "none", null) catch |err|
+            return auth_stamp.deferCode(err, "arc");
         publishEvent(conn.allocator, "verify", "none", 0);
         return @intFromEnum(responses.Code.@"continue");
     }
@@ -707,7 +711,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     switch (result.evaluation) {
         .complete => {},
         .dns_temp_error => {
-            addArHeaderSimple(conn, "arc", "temperror", result.failure_reason);
+            addArHeaderSimple(conn, "arc", "temperror", result.failure_reason) catch |err|
+                return auth_stamp.deferCode(err, "arc");
             publishEvent(conn.allocator, "verify", "temperror", result.highest_instance);
             return @intFromEnum(responses.Code.@"continue");
         },
@@ -720,7 +725,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         },
     }
 
-    addArHeaderSimple(conn, "arc", result.status.toString(), result.failure_reason);
+    addArHeaderSimple(conn, "arc", result.status.toString(), result.failure_reason) catch |err|
+        return auth_stamp.deferCode(err, "arc");
     publishEvent(conn.allocator, "verify", result.status.toString(), result.highest_instance);
     return @intFromEnum(responses.Code.@"continue");
 }
@@ -808,7 +814,8 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
                         "not sealing: {s} (On-DNSError=skip-seal)",
                         .{vr.failure_reason orelse "transient DNS failure"},
                     );
-                    addArHeaderSimple(conn, "arc", "temperror", vr.failure_reason);
+                    addArHeaderSimple(conn, "arc", "temperror", vr.failure_reason) catch |err|
+                        return auth_stamp.deferCode(err, "arc");
                     publishEvent(conn.allocator, "seal", "temperror", vr.highest_instance);
                     return @intFromEnum(responses.Code.@"continue");
                 },
@@ -1130,25 +1137,27 @@ fn sealInternalError(what: []const u8) u8 {
     return @intFromEnum(responses.Code.tempfail);
 }
 
+/// Record the ARC result on the message.
+///
+/// Returned `void` and swallowed all three failures, so a message could be
+/// delivered with no `arc=` field while the daemon reported success (audit X-9).
+/// On a verify listener that field is the only record of what this hop concluded
+/// about the chain, and a later hop cannot reconstruct it: the AMS covers content
+/// as it was *here*, so once the message moves on, the evidence is gone.
 fn addArHeaderSimple(
     conn: *connection_mod.Connection,
     method: []const u8,
     result_str: []const u8,
     reason: ?[]const u8,
-) void {
-    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+) !void {
+    try auth_stamp.stamp(conn.allocator, conn.fd, g_authserv_id, &.{
         .{
             .method = method,
             .result = result_str,
             .reason = reason,
             .properties = &.{},
         },
-    }) catch return;
-    defer conn.allocator.free(ar_value);
-
-    const hdr_payload = responses.addHeader(conn.allocator, "Authentication-Results", ar_value) catch return;
-    defer conn.allocator.free(hdr_payload);
-    codec.writePacket(conn.fd, hdr_payload) catch {};
+    });
 }
 
 fn publishEvent(allocator: Allocator, action: []const u8, result_str: []const u8, instance: u8) void {
@@ -1622,6 +1631,28 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
     // cover both a failing allocation and the fully successful case.
     try std.testing.expect(saw_failure);
     try std.testing.expect(saw_success);
+}
+
+// X-9: this wrapper must stay fallible.
+//
+// It returned `void` and swallowed all three failure points, so a message could
+// be delivered with no `arc=` field while this daemon reported success. On a
+// verify listener that field is the only record of what this hop concluded about
+// the chain, and no later hop can reconstruct it: each AMS covers content as it
+// was here, so once the message moves on the evidence is gone.
+test "the Authentication-Results wrapper cannot swallow failures" {
+    comptime {
+        const ret = @typeInfo(@TypeOf(addArHeaderSimple)).@"fn".return_type.?;
+        if (@typeInfo(ret) != .error_union) @compileError(
+            "addArHeaderSimple must return an error union. Swallowing a stamping failure " ++
+                "delivers the message with no arc= field while reporting success, and no " ++
+                "later hop can reconstruct it: each AMS covers content as it was here " ++
+                "(audit X-9).",
+        );
+        if (@typeInfo(ret).error_union.payload != void) @compileError(
+            "addArHeaderSimple should return !void; the caller maps the error to a tempfail.",
+        );
+    }
 }
 
 // A typo used to leave the mode at whatever the previous section set, silently.
