@@ -11,6 +11,7 @@ const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
+const escape = securemilter.escape;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -584,11 +585,11 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
             const peer = conn.getPeerDisplay();
             if (e == error.BodyTooLarge) {
                 log.warn(
-                    "body exceeds MaxBodyBytes={d} from {s}[{s}]: message will not be validated or sealed",
-                    .{ conn.limits.max_body_bytes, peer.name, peer.ip },
+                    "body exceeds MaxBodyBytes={d} from {f}[{f}]: message will not be validated or sealed",
+                    .{ conn.limits.max_body_bytes, escape.logField(peer.name), escape.logField(peer.ip) },
                 );
             } else {
-                log.err("body accumulation failed for {s}[{s}]: {}", .{ peer.name, peer.ip, e });
+                log.err("body accumulation failed for {f}[{f}]: {}", .{ escape.logField(peer.name), escape.logField(peer.ip), e });
             }
         }
     };
@@ -615,11 +616,15 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const queue_id = conn.macros.queue_id orelse "-";
     const client_addr = conn.macros.client_addr orelse "unknown";
     const peer = conn.getPeerDisplay();
-    log.info("id={s} peer={s}[{s}] client={s} listener={d} mode={s} elapsed={d}ms", .{
-        queue_id,
-        peer.name,
-        peer.ip,
-        client_addr,
+    // The queue id, peer name and client address are attacker-influenced -- the
+    // peer name comes from rDNS the sender may control -- so each is rendered as
+    // a single bare token, keeping the line to one line and each value inside its
+    // own field (audit X-5).
+    log.info("id={f} peer={f}[{f}] client={f} listener={d} mode={s} elapsed={d}ms", .{
+        escape.logField(queue_id),
+        escape.logField(peer.name),
+        escape.logField(peer.ip),
+        escape.logField(client_addr),
         conn.listener_index,
         modeLabel(mode),
         elapsed_ms,
@@ -738,8 +743,8 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     if (conn.contentTruncated()) {
         const peer = conn.getPeerDisplay();
         log.warn(
-            "not sealing message from {s}[{s}]: accumulated copy is incomplete",
-            .{ peer.name, peer.ip },
+            "not sealing message from {f}[{f}]: accumulated copy is incomplete",
+            .{ escape.logField(peer.name), escape.logField(peer.ip) },
         );
         return @intFromEnum(responses.Code.@"continue");
     }
@@ -1160,6 +1165,14 @@ fn addArHeaderSimple(
     });
 }
 
+/// Publish a seal or verify event.
+///
+/// Nothing here is attacker-derived: `action` and `result_str` are this daemon's
+/// own fixed strings and `instance` is an integer, so no value can carry a `"`
+/// into the payload. That is why this is the one publisher in the suite the X-5
+/// pass did not have to change -- stated explicitly so the absence of
+/// `escape.jsonString` reads as a checked conclusion rather than an omission. Any
+/// future field taken from the message must be wrapped.
 fn publishEvent(allocator: Allocator, action: []const u8, result_str: []const u8, instance: u8) void {
     const json = std.fmt.allocPrint(allocator,
         \\{{"action":"{s}","result":"{s}","instance":{d}}}
