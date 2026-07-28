@@ -39,6 +39,30 @@ sections.
 Identifier for Authentication-Results headers.
 Default:
 .Dq localhost .
+.It Cm LocalAuthMethods
+Comma-separated list of authentication methods this ADMD evaluates locally,
+for example
+.Dq spf, dkim, dmarc .
+When sealing, only Authentication-Results headers that claim our
+.Cm AuthservID
+and assert nothing outside this list are copied into the
+ARC-Authentication-Results header and signed.
+A host that lists no local methods has authenticated nothing, so its AAR
+reports
+.Dq none
+rather than repeating results supplied by the sender
+(RFC 8617 Section 5.1.1).
+Default: empty.
+.It Cm StripAuthResults
+Remove every pre-existing Authentication-Results header claiming our
+.Cm AuthservID ,
+not just the ones asserting an
+.Li arc=
+result.
+Enable this when
+.Nm
+is the first or only milter in the chain (RFC 8601 Section 5).
+Default: no.
 .It Cm WorkerThreads
 Number of worker threads.
 0 means auto-detect CPU count.

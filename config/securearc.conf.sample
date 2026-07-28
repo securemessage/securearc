@@ -18,6 +18,22 @@ SealSelector    = arc2026
 SealKeyFile     = /usr/local/etc/securearc/keys/arc.key
 SignedHeaders    = from:to:subject:date:message-id
 
+# Authentication methods this ADMD evaluates locally, i.e. the results the
+# other SecureMilter daemons on this host add to the message.
+# Only these may be copied into an ARC-Authentication-Results header and
+# sealed with our key. Empty (the default) means this host authenticates
+# nothing itself, so its AAR honestly reports "none" instead of repeating
+# whatever the sender wrote (RFC 8617 section 5.1.1).
+# Set it only for the methods that really run here:
+LocalAuthMethods = spf, dkim, dmarc
+
+# Trust boundary (RFC 8601 section 5).
+# SecureARC always removes pre-existing Authentication-Results headers that
+# claim our AuthservID and assert an arc= result. Set this to yes when
+# SecureARC is the first (or only) milter in the chain, to remove every
+# Authentication-Results header claiming our AuthservID regardless of method.
+# StripAuthResults = no
+
 [listener:verify-inbound]
 Socket          = inet:8895@0.0.0.0
 Mode            = verify

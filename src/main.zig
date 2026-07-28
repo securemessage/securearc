@@ -17,6 +17,7 @@ const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
+const header_scrub = securemilter.header_scrub;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -50,6 +51,8 @@ pub const ArcConfig = struct {
     seal_selector: ?[]const u8,
     seal_key_file: ?[]const u8,
     signed_headers: []const u8,
+    local_auth_methods: []const []const u8,
+    strip_auth_results: bool,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
 };
@@ -64,6 +67,8 @@ var g_seal_domain: ?[]const u8 = null;
 var g_seal_selector: ?[]const u8 = null;
 var g_seal_key: ?crypto.SigningKey = null;
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
+var g_local_auth_methods: []const []const u8 = &.{};
+var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"arc"} };
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "arc";
 var g_allocator: Allocator = undefined;
@@ -137,6 +142,27 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     const dns_cache_size = global.getInt("DnsCacheSize", u32, 1000);
     const dns_negative_ttl = global.getInt("DnsNegativeTTL", u32, 60);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
+
+    // Authentication methods this ADMD actually evaluates, i.e. the results
+    // other SecureMilter daemons on this host contribute to the chain. Only
+    // these may be copied into an ARC-Authentication-Results header and sealed.
+    // Empty by default: a host that runs nothing but the sealer has performed
+    // no authentication, so its AAR must say so rather than repeat whatever the
+    // sender wrote (RFC 8617 §5.1.1).
+    var methods: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer methods.deinit(allocator);
+    if (global.get("LocalAuthMethods")) |raw| {
+        var it = mem.splitSequence(u8, raw, ",");
+        while (it.next()) |part| {
+            const trimmed = mem.trim(u8, part, " \t");
+            if (trimmed.len > 0) try methods.append(allocator, trimmed);
+        }
+    }
+
+    // Trust boundary: remove every A-R header claiming our authserv-id, not
+    // just the arc= results this daemon replaces (RFC 8601 §5).
+    const strip_auth_results = global.getBool("StripAuthResults", false);
+
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
 
@@ -157,6 +183,8 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .seal_selector = seal_selector,
         .seal_key_file = seal_key_file,
         .signed_headers = signed_headers,
+        .local_auth_methods = try methods.toOwnedSlice(allocator),
+        .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
     };
@@ -211,6 +239,8 @@ pub fn main() !void {
     g_seal_domain = arc_cfg.seal_domain;
     g_seal_selector = arc_cfg.seal_selector;
     g_signed_headers = arc_cfg.signed_headers;
+    g_local_auth_methods = arc_cfg.local_auth_methods;
+    g_strip_policy = .{ .own_methods = &.{"arc"}, .strip_all = arc_cfg.strip_auth_results };
     g_zmq_endpoint = arc_cfg.zmq_endpoint;
     g_zmq_topic = arc_cfg.zmq_topic;
 
@@ -265,7 +295,7 @@ pub fn main() !void {
         arc_cfg.listen_addresses.len,
     });
 
-    const required_actions = negotiate.ActionFlags{ .add_headers = true };
+    const required_actions = negotiate.ActionFlags{ .add_headers = true, .change_headers = true };
 
     const callbacks = worker_mod.Callbacks{
         .on_connect = onConnect,
@@ -336,6 +366,10 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 
 fn onEom(conn: *connection_mod.Connection) u8 {
     const start_ns = std.time.nanoTimestamp();
+
+    // Drop forged arc= claims before validating or sealing.
+    _ = header_scrub.stripAuthResults(conn, g_authserv_id, g_strip_policy);
+
     const result = switch (g_mode) {
         .verify_only => doVerify(conn),
         .seal_only => doSeal(conn),
@@ -426,8 +460,10 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
         break :blk vr.status;
     };
 
-    // Build AAR content from existing A-R headers matching our authserv-id
-    const ar_content = buildAarContent(conn) orelse "none";
+    // Build AAR content from the results this ADMD produced
+    const ar_content = buildAarContent(conn) orelse
+        return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ar_content);
 
     // Build ARC-Authentication-Results header and prepend
     const aar = std.fmt.allocPrint(conn.allocator, "i={d}; {s}", .{ new_instance, ar_content }) catch
@@ -599,15 +635,57 @@ fn appendCanonHdr(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), name: 
     try buf.appendSlice(allocator, "\r\n");
 }
 
+/// Assemble the ARC-Authentication-Results content from results this ADMD
+/// actually produced (RFC 8617 §5.1.1).
+///
+/// An A-R header qualifies only if it claims our authserv-id *and* every
+/// method it asserts is listed in `LocalAuthMethods`. Anything else is a
+/// sender-supplied claim: copying it here would have this host cryptographically
+/// vouch for authentication it never performed. A host that lists no local
+/// methods therefore seals an honest `none`.
+///
+/// Caller owns the returned slice. Returns null only on allocation failure.
 fn buildAarContent(conn: *connection_mod.Connection) ?[]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(conn.allocator);
+
+    var found = false;
     for (conn.headers.items) |hdr| {
-        if (eqlIgnoreCase(hdr.name, "Authentication-Results")) {
-            if (auth_results.matchesAuthservId(hdr.value, g_authserv_id)) {
-                return hdr.value;
-            }
+        if (!eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
+        if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
+        if (!auth_results.assertsAnyMethod(hdr.value, g_local_auth_methods)) continue;
+        if (auth_results.assertsMethodOutside(hdr.value, g_local_auth_methods)) {
+            log.warn("ignoring Authentication-Results claiming our authserv-id with non-local methods", .{});
+            continue;
         }
+
+        // Keep the raw result text (properties included); drop the repeated
+        // authserv-id, which the AAR states once up front.
+        const results = resultsPart(hdr.value) orelse continue;
+        if (!found) {
+            buf.appendSlice(conn.allocator, g_authserv_id) catch return null;
+            found = true;
+        }
+        buf.appendSlice(conn.allocator, "; ") catch return null;
+        buf.appendSlice(conn.allocator, results) catch return null;
     }
-    return null;
+
+    if (!found) {
+        buf.deinit(conn.allocator);
+        return std.fmt.allocPrint(conn.allocator, "{s}; none", .{g_authserv_id}) catch null;
+    }
+    return buf.toOwnedSlice(conn.allocator) catch null;
+}
+
+/// The portion of an A-R value after the authserv-id, trimmed of surrounding
+/// whitespace and trailing separators.
+fn resultsPart(header_value: []const u8) ?[]const u8 {
+    const trimmed = mem.trimLeft(u8, header_value, &std.ascii.whitespace);
+    const semi = mem.indexOfScalar(u8, trimmed, ';') orelse return null;
+    const rest = mem.trim(u8, trimmed[semi + 1 ..], &std.ascii.whitespace);
+    const cleaned = mem.trim(u8, rest, ";");
+    const result = mem.trim(u8, cleaned, &std.ascii.whitespace);
+    return if (result.len == 0) null else result;
 }
 
 /// Fold a base64 string by inserting CRLF+TAB every 76 characters.
@@ -741,10 +819,67 @@ test "parse config minimal" {
 
     const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
     defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
 
     try std.testing.expectEqualStrings("mail.test.com", arc_cfg.authserv_id);
     try std.testing.expectEqual(@as(usize, 1), arc_cfg.listen_addresses.len);
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.mode);
+}
+
+test "local auth methods default to none" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+    // A sealer that authenticates nothing locally must not vouch for anything.
+    try std.testing.expectEqual(@as(usize, 0), arc_cfg.local_auth_methods.len);
+    try std.testing.expect(!arc_cfg.strip_auth_results);
+}
+
+test "local auth methods parse as a comma separated list" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\LocalAuthMethods = spf, dkim ,dmarc
+        \\StripAuthResults = yes
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+    try std.testing.expectEqual(@as(usize, 3), arc_cfg.local_auth_methods.len);
+    try std.testing.expectEqualStrings("spf", arc_cfg.local_auth_methods[0]);
+    try std.testing.expectEqualStrings("dkim", arc_cfg.local_auth_methods[1]);
+    try std.testing.expectEqualStrings("dmarc", arc_cfg.local_auth_methods[2]);
+    try std.testing.expect(arc_cfg.strip_auth_results);
+}
+
+test "results part drops the authserv-id" {
+    try std.testing.expectEqualStrings(
+        "spf=pass smtp.mailfrom=a.test",
+        resultsPart("mail.example.org; spf=pass smtp.mailfrom=a.test").?,
+    );
+    try std.testing.expectEqualStrings(
+        "dkim=pass header.d=a.test",
+        resultsPart("  mail.example.org;  dkim=pass header.d=a.test;  ").?,
+    );
+    try std.testing.expect(resultsPart("mail.example.org") == null);
+    try std.testing.expect(resultsPart("mail.example.org;   ") == null);
 }
 
 test "parse config seal mode" {
@@ -764,6 +899,8 @@ test "parse config seal mode" {
 
     const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
     defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
 
     try std.testing.expectEqual(Mode.seal_only, arc_cfg.mode);
     try std.testing.expectEqualStrings("test.com", arc_cfg.seal_domain.?);
