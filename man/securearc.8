@@ -189,6 +189,64 @@ The seal key configured with
 is always held to the 1024-bit floor irrespective of this setting, and the daemon
 refuses to start if it is smaller.
 Read at startup only.
+.It Cm On-DNSError
+What a sealing listener does when a previous hop's key cannot be fetched
+because DNS failed transiently
+.Pq SERVFAIL, timeout, unreachable resolver .
+One of
+.Dq tempfail ,
+.Dq skip-seal
+or
+.Dq seal-fail .
+Default:
+.Dq tempfail .
+An unrecognised value is refused at startup.
+.Pp
+RFC 8617 Section 5.1.2 makes
+.Cm cv=fail
+permanent for the life of a message: no later hop may revise it.
+A transient nameserver failure is therefore the one condition where the
+cheapest local response is the most destructive one, because the cost lands
+entirely on the sender and every downstream receiver rather than on this host.
+.Bl -tag -width "skip-seal" -compact
+.It Dq tempfail
+Defer with a 4xx and let the sender retry.
+The only non-destructive answer for a hop that modifies messages, which is what
+sealing exists for.
+The risk is a lame delegation that keeps returning a transient-looking error:
+the message then occupies the queue until
+.Cm maximal_queue_lifetime
+expires and bounces.
+.It Dq skip-seal
+Add no ARC set, report
+.Cm arc=temperror
+and pass the message through unchanged.
+No delay.
+Correct for a relay that does not alter messages.
+Note that it does
+.Em not
+rescue the chain if this hop does alter them: the previous hop's
+.Cm ARC-Message-Signature
+then covers content that changed, the next hop computes
+.Cm cv=fail ,
+and the effect is only to move which hop breaks the chain.
+Whether this path rewrites mail is something the operator knows and the daemon
+cannot, which is why this is configuration rather than a heuristic.
+.It Dq seal-fail
+Seal
+.Cm cv=fail .
+The behaviour of releases before this option existed.
+Not recommended: it is the only setting that permanently destroys a chain which
+may be perfectly valid.
+.El
+.Pp
+Verifying listeners are not configurable and always report
+.Cm arc=temperror
+and deliver.
+A verifier records no permanent verdict in the message, so it has no such
+decision to make.
+An internal fault on this host \(em an allocation failure, for instance \(em
+always defers, in either role, and is never charged to the sender's chain.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.
@@ -209,12 +267,34 @@ Format:
 or
 .Dq unix:/path .
 .It Cm Mode
-Operating mode:
+Operating mode for
+.Em this listener :
 .Dq seal ,
 .Dq verify ,
 or
 .Dq both .
-Default: verify.
+A listener that does not set
+.Cm Mode
+inherits
+.Cm Mode
+from the
+.Ql [global]
+section, or
+.Dq verify
+if that is unset.
+Any other value is a configuration error and
+.Nm
+refuses to start.
+.Pp
+Each listener is independent.
+Releases before this one held a single daemon-wide mode that every
+.Ql [listener:...]
+section overwrote in turn, so the last section in the file decided the mode
+for every socket — including the two-listener layout shown in the sample
+configuration, which ran both sockets in seal mode.
+Check the
+.Ql listener[N] mode=...
+lines logged at startup against the intended configuration after upgrading.
 .It Cm SealDomain
 Domain name for ARC sealing.
 Required for seal mode.
@@ -226,6 +306,14 @@ Path to the private key file for ARC sealing.
 Required for seal mode.
 Supports RSA and Ed25519 keys in PEM format.
 .El
+.Pp
+.Cm SealDomain ,
+.Cm SealSelector
+and
+.Cm SealKeyFile
+are accepted in a listener section but apply to the whole daemon, not to that
+listener alone: there is one seal key.
+Per-listener sealing identities are not supported.
 .Pp
 If no listener sections are defined, the default is
 .Dq inet:8895@0.0.0.0
@@ -250,7 +338,7 @@ milter_default_action = accept
 .Ed
 .Sh LOG FORMAT
 .Bd -literal -offset indent
-securearc[pid]: id=QUEUEID peer=HOST[IP] client=IP mode=verify|seal elapsed=Nms
+securearc[pid]: id=QUEUEID peer=HOST[IP] client=IP listener=N mode=verify|seal|both elapsed=Nms
 .Ed
 .Sh EXIT STATUS
 .Ex -std

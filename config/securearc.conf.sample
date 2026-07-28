@@ -83,6 +83,47 @@ LocalAuthMethods = spf, dkim, dmarc
 # always held to the 1024-bit floor regardless of what is set here.
 # MinimumKeyBits = 1024
 
+# What a sealing listener does when a previous hop's key cannot be fetched
+# because DNS failed transiently — SERVFAIL, a timeout, an unreachable resolver.
+#
+# RFC 8617 5.1.2 makes cv=fail permanent for the life of the message: no later
+# hop may revise it. So this is the one condition where the cheapest response
+# for this host is the most destructive one overall, because the cost lands on
+# the sender and every downstream receiver instead of here.
+#
+#   tempfail   (default) Defer with a 4xx; the sender retries. The only
+#              non-destructive answer for a hop that modifies messages, which
+#              is what sealing is for. Risk: a lame delegation that keeps
+#              returning a transient-looking error burns maximal_queue_lifetime
+#              and then bounces.
+#   skip-seal  Add no ARC set, report arc=temperror, pass through unchanged.
+#              No delay, and right for a relay that does not alter messages.
+#              It does NOT rescue the chain if this hop does alter them: the
+#              previous hop's AMS then covers changed content and the next hop
+#              computes cv=fail anyway. It only moves who breaks the chain.
+#   seal-fail  Seal cv=fail. What releases before this option did. NOT
+#              RECOMMENDED — the only setting that permanently destroys a chain
+#              that may be perfectly valid.
+#
+# Verify listeners are not configurable: they report arc=temperror and deliver,
+# because a verifier writes no permanent verdict into the message. An internal
+# fault here (an allocation failure, say) always defers, in either role, and is
+# never charged to the sender's chain.
+# On-DNSError = tempfail
+
+# Each listener has its own Mode: verify, seal, or both. A listener that omits
+# Mode inherits a [global] Mode if one is set, otherwise verify. An unrecognised
+# value is refused at startup rather than silently falling back.
+#
+# Releases before this one kept a single daemon-wide mode that each listener
+# section overwrote in turn, so the last section won for every socket — this
+# exact two-listener layout ran BOTH sockets in seal mode. Confirm the
+# "listener[N] mode=..." lines logged at startup after upgrading.
+#
+# SealDomain, SealSelector and SealKeyFile are read from a listener section but
+# apply daemon-wide: there is one seal key, so per-listener sealing identities
+# are not supported.
+
 [listener:verify-inbound]
 Socket          = inet:8895@0.0.0.0
 Mode            = verify
