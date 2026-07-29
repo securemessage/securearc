@@ -247,3 +247,98 @@ test "an A-R claiming our authserv-id that asserts nothing parseable is rejected
 
     try std.testing.expectEqualStrings("mail.relay.test; none", out);
 }
+
+// --- A-20: the ARC-Seal scope for a failed chain (RFC 8617 §5.1.2) -----------
+//
+// These exist because THE CONFORMANCE SUITE CANNOT SEE THIS DEFECT. Reverting the
+// fix leaves the ValiMail signing suite at 17/17, measured: for a `cv=fail` chain a
+// validator stops at the failed seal (§5.2 step 2) and never reaches ours, and `b=`
+// is not byte-comparable because ValiMail's expected values come from dkimpy's
+// alphabetical tag ordering. An external oracle covering 17 cases and an independent
+// validator both miss it, so it is pinned directly.
+//
+// The rule inverts the usual one, which is why it is easy to get wrong: normally a
+// seal covers the whole chain, but for a chain that does not validate §5.1.2 makes
+// covering the prior sets a MUST NOT in effect -- there is no deterministic set of
+// prior AS fields to sign, so the resulting signature is unverifiable rather than
+// merely unusual.
+
+const arc = @import("arc.zig");
+
+/// Two prior sets, enough to tell "all of them" from "none of them".
+fn priorSets() [2]arc.ArcSet {
+    const empty = arc.ArcSet{
+        .instance = 1,
+        .aar_value = "i=1; example.org; none",
+        .ams_value = "i=1; a=rsa-sha256; b=AAAA",
+        .as_value = "i=1; cv=none; a=rsa-sha256; b=BBBB",
+        .seal_cv = .none,
+        .seal_algorithm = "rsa-sha256",
+        .seal_domain = "example.org",
+        .seal_selector = "s1",
+        .seal_signature = "BBBB",
+        .ams_algorithm = "rsa-sha256",
+        .ams_domain = "example.org",
+        .ams_selector = "s1",
+        .ams_signature = "AAAA",
+        .ams_body_hash = "CCCC",
+        .ams_canonicalization = "relaxed/relaxed",
+        .ams_signed_headers = "from",
+    };
+    var second = empty;
+    second.instance = 2;
+    second.seal_cv = .pass;
+    return .{ empty, second };
+}
+
+test "a cv=fail seal covers only the new set, not the prior chain" {
+    const sets = priorSets();
+    // The MUST in §5.1.2: as if this newest ARC Set were the only set present.
+    try std.testing.expectEqual(@as(usize, 0), sealbuild.sealScope(.fail, &sets).len);
+}
+
+test "a live chain's seal still covers every prior set" {
+    const sets = priorSets();
+    // The inverse must keep working: narrowing the scope for a passing chain would
+    // break the chain of custody ARC exists to provide.
+    try std.testing.expectEqual(@as(usize, 2), sealbuild.sealScope(.pass, &sets).len);
+    try std.testing.expectEqual(@as(usize, 2), sealbuild.sealScope(.none, &sets).len);
+    // `unknown` means no determination was made. It is not `fail`, so it must not
+    // silently take the narrowed path.
+    try std.testing.expectEqual(@as(usize, 2), sealbuild.sealScope(.unknown, &sets).len);
+}
+
+// --- A-19: a chain already marked cv=fail cannot be continued (§5.1.3) -------
+//
+// "Once broken, the chain cannot be continued, as the chain of custody is no longer
+// valid, and responsibility for the message has been lost."
+//
+// The distinction these tests protect is the one that makes the rule subtle: a chain
+// that fails validation HERE must be sealed cv=fail, because that is what records
+// the break. Only a break an EARLIER hop already recorded stops us sealing. Getting
+// that backwards would stop us marking newly detected failures, which is worse than
+// the defect being fixed.
+
+test "an existing cv=fail seal marks the chain as already broken" {
+    var sets = priorSets();
+    try std.testing.expect(!arc.chainAlreadyBroken(&sets));
+
+    sets[1].seal_cv = .fail;
+    try std.testing.expect(arc.chainAlreadyBroken(&sets));
+}
+
+test "a broken seal anywhere in the chain counts, not just the newest" {
+    var sets = priorSets();
+    // §5.1.3 is about the chain, not the last link: an earlier hop having recorded
+    // the break is just as terminal, and a later cv=pass cannot revive it.
+    sets[0].seal_cv = .fail;
+    sets[1].seal_cv = .pass;
+    try std.testing.expect(arc.chainAlreadyBroken(&sets));
+}
+
+test "an empty chain is not broken, it is absent" {
+    // No sets means i=1 and cv=none, not a refusal to seal. Conflating "nothing to
+    // continue" with "cannot continue" would stop this daemon sealing unsigned mail
+    // at all, which is the common case.
+    try std.testing.expect(!arc.chainAlreadyBroken(&.{}));
+}

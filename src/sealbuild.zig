@@ -65,6 +65,30 @@ pub fn buildSigningHeaders(
     }
 }
 
+/// Which prior ARC sets the ARC-Seal signature covers.
+///
+/// RFC 8617 §5.1.2 is a MUST, and it inverts the usual rule: *"In the case of a
+/// failed Authenticated Received Chain, the header fields included in the signature
+/// scope of the AS header field b= value MUST only include the ARC Set header fields
+/// created by the MTA that detected the malformed chain, as if this newest ARC Set
+/// was the only set present."*
+///
+/// The section's own informational note gives the reason: for a malformed chain
+/// *"there is no way to generate a deterministic set of AS header fields"*. Signing
+/// the prior sets anyway produces a signature over bytes no verifier can reliably
+/// reconstruct, so a `cv=fail` seal built that way is not merely different — it is
+/// unverifiable (audit A-20).
+///
+/// **Its own function because the conformance suite cannot see this.** Reintroducing
+/// the defect leaves the ValiMail signing suite at 17/17: for a `cv=fail` chain a
+/// validator stops at the failed seal (§5.2 step 2) and never checks ours, and `b=`
+/// is not byte-comparable across tag orderings. Verified by reverting it and
+/// re-running. So the rule is pinned by the test below instead, and the extraction
+/// exists to make that test possible without a signing key.
+pub fn sealScope(cv: arc.ChainValidation, prior_sets: []const arc.ArcSet) []const arc.ArcSet {
+    return if (cv == .fail) &.{} else prior_sets;
+}
+
 /// Build the seal signing input: prior ARC headers + current AAR + AMS + AS template.
 pub fn buildSealInput(
     conn: *connection_mod.Connection,
@@ -248,6 +272,15 @@ pub const SetParams = struct {
     sign_key: *const crypto.SigningKey,
     /// Sets already on the message, for the ARC-Seal's signing input.
     prior_sets: []const arc.ArcSet,
+    /// Signature timestamp for `t=` on both the AMS and the ARC-Seal.
+    ///
+    /// Injected rather than read from the clock here, for two reasons that happen to
+    /// point the same way. Sealing must be reproducible to be testable at all -- the
+    /// ValiMail signing suite supplies a fixed timestamp and compares the resulting
+    /// `b=` byte for byte, which is impossible if this layer calls `time()` itself.
+    /// And this module decides nothing by design (see the file comment), so reading
+    /// ambient state would be the one exception.
+    timestamp: u64,
 };
 
 /// Record which step failed and fail. Keeps each failure site one line, as it was
@@ -313,8 +346,8 @@ pub fn buildSet(
     // carry, and every verifier everywhere would report a failure.
     const ams_template = std.fmt.allocPrint(
         allocator,
-        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
-        .{ p.instance, p.domain, p.selector, p.signed_headers, body_hash_b64 },
+        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s}; t={d};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
+        .{ p.instance, p.domain, p.selector, p.timestamp, p.signed_headers, body_hash_b64 },
     ) catch return fail(failed_step, "formatting the AMS template");
     defer allocator.free(ams_template);
 
@@ -353,17 +386,20 @@ pub fn buildSet(
         return fail(failed_step, "formatting the AMS header");
     errdefer allocator.free(ams_value);
 
-    // ARC-Seal: signs every prior ARC header plus this set's AAR and AMS.
+    // ARC-Seal: signs this set's AAR and AMS, plus whatever prior ARC headers
+    // `sealScope` admits -- everything for a live chain, nothing for a failed one.
     const as_template = std.fmt.allocPrint(
         allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb=",
-        .{ p.instance, p.cv.toString(), p.domain, p.selector },
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; t={d};\r\n\tb=",
+        .{ p.instance, p.cv.toString(), p.domain, p.selector, p.timestamp },
     ) catch return fail(failed_step, "formatting the ARC-Seal template");
     defer allocator.free(as_template);
 
+    const seal_scope = sealScope(p.cv, p.prior_sets);
+
     var seal_input: std.ArrayListUnmanaged(u8) = .{};
     defer seal_input.deinit(allocator);
-    buildSealInput(conn, &seal_input, p.prior_sets, aar, ams_value, as_template) catch
+    buildSealInput(conn, &seal_input, seal_scope, aar, ams_value, as_template) catch
         return fail(failed_step, "assembling the ARC-Seal signing input");
 
     const seal_sig_raw = crypto.rsaSign(allocator, p.sign_key.rsa_pkey.?, seal_input.items) catch

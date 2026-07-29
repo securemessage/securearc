@@ -23,6 +23,7 @@ const dns_mod = securemilter.dns;
 
 const arc = @import("arc.zig");
 const chain = @import("chain.zig");
+const msgfile = @import("msgfile.zig");
 
 fn writeOut(data: []const u8) void {
     _ = posix.write(posix.STDOUT_FILENO, data) catch {};
@@ -62,124 +63,13 @@ const Usage =
 /// few kilobytes, and bounded so a stray argument cannot exhaust memory.
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
-/// A parsed message: header fields in order, plus the body.
-const Message = struct {
-    headers: []const arc.Header,
-    body: []const u8,
-    arena: std.heap.ArenaAllocator,
-
-    fn deinit(self: *Message) void {
-        self.arena.deinit();
-    }
-};
-
-/// Split an RFC 5322 message into header fields and a body.
-///
-/// Folded values keep their line breaks. That is not a convenience: DKIM and ARC
-/// relaxed canonicalization is defined as an operation *on* the folded form, and
-/// the milter receives values from Postfix with folding intact, so unfolding
-/// here would test a canonicalizer against input it never sees in production.
-///
-/// Line endings are normalised to CRLF first. A message arrives over SMTP with
-/// CRLF, both canonicalizations in RFC 6376 §3.4 are specified in terms of it,
-/// and the suite's YAML carries bare LF purely because that is how YAML block
-/// scalars work. Converting here rather than tolerating LF further down keeps
-/// the conformance run testing the same byte sequence a real message produces.
-/// **If cases fail with a body-hash mismatch, check this first.**
-fn parseMessage(allocator: Allocator, raw: []const u8) !Message {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    const text = try toCrlf(a, raw);
-
-    // Header section ends at the first empty line. A message with no empty line
-    // is all headers and an empty body.
-    const sep = mem.indexOf(u8, text, "\r\n\r\n");
-    const header_block = if (sep) |s| text[0..s] else text;
-    const body = if (sep) |s| text[s + 4 ..] else "";
-
-    var headers: std.ArrayListUnmanaged(arc.Header) = .{};
-
-    // Walk the header block, starting a new field on a line that does not begin
-    // with WSP and folding the rest into the value.
-    var field_start: ?usize = null;
-    var i: usize = 0;
-    while (i <= header_block.len) {
-        const line_end = mem.indexOfPos(u8, header_block, i, "\r\n") orelse header_block.len;
-        const line = header_block[i..line_end];
-        const is_continuation = line.len > 0 and (line[0] == ' ' or line[0] == '\t');
-
-        if (!is_continuation and field_start != null) {
-            try appendField(a, &headers, header_block[field_start.?..i]);
-            field_start = null;
-        }
-        if (line.len > 0 and !is_continuation) field_start = i;
-
-        if (line_end >= header_block.len) break;
-        i = line_end + 2;
-    }
-    if (field_start) |s| try appendField(a, &headers, header_block[s..]);
-
-    return .{
-        .headers = try headers.toOwnedSlice(a),
-        .body = body,
-        .arena = arena,
-    };
-}
-
-/// Record one complete field, trailing CRLF trimmed, split at the first colon.
-///
-/// A field with no colon is skipped rather than guessed at: it is not a header
-/// field, and inventing a name for it would put a fabricated entry into the list
-/// the signature covers.
-///
-/// **The space after the colon is dropped, on purpose.** A milter receives header
-/// values from the MTA with leading whitespace already removed unless it
-/// negotiates `SMFIP_HDR_LEADSPC`, which no daemon in this suite does — see the
-/// sendmail `xxfi_header` documentation, and `ProtocolFlags.header_leading_space`
-/// in `securemilter-lib`, which is defined and never requested. Keeping the space
-/// here would hand the verifier a byte sequence production never produces, and
-/// `simple` header canonicalization — which hashes the field verbatim — would
-/// disagree for every case.
-///
-/// Continuation lines keep their own leading whitespace, which is also what the
-/// MTA delivers.
-fn appendField(
-    a: Allocator,
-    headers: *std.ArrayListUnmanaged(arc.Header),
-    field_raw: []const u8,
-) !void {
-    const field = mem.trimRight(u8, field_raw, "\r\n");
-    if (field.len == 0) return;
-    const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    var value = field[colon + 1 ..];
-    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-    try headers.append(a, .{
-        .name = field[0..colon],
-        .value = value,
-    });
-}
-
-/// Normalise CR, LF and CRLF to CRLF.
-fn toCrlf(a: Allocator, raw: []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    try out.ensureTotalCapacity(a, raw.len + raw.len / 8 + 2);
-    var i: usize = 0;
-    while (i < raw.len) {
-        const c = raw[i];
-        if (c == '\r') {
-            try out.appendSlice(a, "\r\n");
-            i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
-        } else if (c == '\n') {
-            try out.appendSlice(a, "\r\n");
-            i += 1;
-        } else {
-            try out.append(a, c);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(a);
+/// Convert the shared parser's fields into `arc.Header`, which is what
+/// `parseArcSets` and `validateChain` take. A field-for-field copy; the two types
+/// are structurally identical and `msgfile` sits below both.
+fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header {
+    const out = try a.alloc(arc.Header, fields.len);
+    for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value };
+    return out;
 }
 
 pub fn main() !void {
@@ -233,8 +123,11 @@ pub fn main() !void {
     };
     defer allocator.free(raw);
 
-    var msg = parseMessage(allocator, raw) catch return fatal("out of memory parsing message");
+    var msg = msgfile.parseMessage(allocator, raw) catch return fatal("out of memory parsing message");
     defer msg.deinit();
+
+    const headers = toArcHeaders(msg.arena.allocator(), msg.fields) catch
+        return fatal("out of memory converting headers");
 
     const ns_slice: []const []const u8 = &.{nameserver};
     var resolver = dns_mod.Resolver.init(allocator, .{
@@ -251,7 +144,7 @@ pub fn main() !void {
     // sender that could downgrade a broken chain to "unsealed" by malforming it
     // would defeat the point of the chain. The conformance suite tests that
     // distinction directly, which is why the check tool must not simplify it.
-    const sets = arc.parseArcSets(allocator, msg.headers) catch |err| {
+    const sets = arc.parseArcSets(allocator, headers) catch |err| {
         if (err == error.OutOfMemory) return fatal("out of memory parsing ARC sets");
         writeOut("fail");
         if (verbose) {
@@ -272,7 +165,7 @@ pub fn main() !void {
         allocator,
         &resolver,
         sets,
-        msg.headers,
+        headers,
         msg.body,
         min_key_bits,
     );

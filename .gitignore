@@ -14,6 +14,11 @@ test/keys/
 __pycache__/
 *.pyc
 
+# The conformance harness virtualenv: thousands of third-party files, rebuilt from
+# requirements.txt in one command. Noticed while committing the ARC signing suite,
+# where `git status` offered to add the whole tree.
+.venv/
+
 # Crash dumps. FreeBSD writes <progname>.core into the cwd, so the name follows
 # whichever binary died -- build.core, test.core, securearc.core. A single filename
 # only ever blocks the crash that has already happened: build.core was listed here

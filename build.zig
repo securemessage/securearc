@@ -66,6 +66,30 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(check_exe);
 
+    // securearc-seal: seal a message file with the daemon's own sealing path.
+    //
+    // The counterpart to securearc-check, and it closes the last untested signing
+    // path in this repository -- nothing had ever examined a seal securearc
+    // produced. The cost of leaving that open was measured on securedkim the same
+    // day: D-18 broke Ed25519 signing and verification symmetrically, so they
+    // round-tripped perfectly while every emitted signature was rejected by the
+    // rest of the internet, and reverting only the signing half is invisible to
+    // every test that does not hand the output to an outside verifier.
+    const seal_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/seal_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const seal_cli_exe = b.addExecutable(.{
+        .name = "securearc-seal",
+        .root_module = seal_cli_mod,
+    });
+    b.installArtifact(seal_cli_exe);
+
     const test_step = b.step("test", "Run unit tests");
 
     const test_mod = b.createModule(.{

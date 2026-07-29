@@ -231,6 +231,16 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     };
     defer conn.allocator.free(sets);
 
+    // RFC 8617 §5.1.3: "Once broken, the chain cannot be continued." A seal already
+    // on the message saying cv=fail means an earlier hop recorded the break, so
+    // there is nothing to extend and no set to add (audit A-19). Distinct from a
+    // chain that fails validation *here* — that one is sealed cv=fail below, which
+    // is how the break gets recorded in the first place.
+    if (arc.chainAlreadyBroken(sets)) {
+        log.info("not sealing: the chain is already marked cv=fail and cannot be continued", .{});
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
     const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
     if (new_instance > arc.MAX_INSTANCES) return @intFromEnum(responses.Code.@"continue");
 
@@ -306,6 +316,10 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
         .local_auth_methods = ctx.local_auth_methods,
         .sign_key = ctx.sign_key,
         .prior_sets = sets,
+        // Read here rather than in `sealbuild`, which is deliberately free of
+        // ambient state so that a fixed timestamp can be injected and the resulting
+        // signature compared byte for byte.
+        .timestamp = @intCast(std.time.timestamp()),
     }, &failed_step) catch
         return sealInternalError(failed_step orelse "building the ARC set");
     defer set.deinit();

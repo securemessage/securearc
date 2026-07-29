@@ -91,6 +91,30 @@ pub const ChainError = error{
     MalformedTagList,
 };
 
+/// True when an ARC-Seal already on the message records `cv=fail`.
+///
+/// RFC 8617 §5.1.3 is unambiguous: *"A message can have only one Authenticated
+/// Received Chain on it at a time. Once broken, the chain cannot be continued, as the
+/// chain of custody is no longer valid, and responsibility for the message has been
+/// lost."* So a hop that finds `cv=fail` already recorded must add no ARC set —
+/// there is nothing left to extend, and a set appended to a terminated chain claims
+/// custody of a message whose custody has already been lost.
+///
+/// **This is a narrower question than "does the chain validate".** A chain can fail
+/// validation here and now for many reasons — a tampered AMS, an unreachable key —
+/// and in those cases the correct action is to seal `cv=fail`, which is what records
+/// the break for the next hop. What this predicate detects is a break some *earlier*
+/// hop already recorded. Conflating the two would stop us marking newly detected
+/// failures, which is the opposite mistake and a worse one.
+///
+/// The ValiMail signing suite separates the two cases directly: `i1_base_fail` and
+/// `i2_base_fail` expect a `cv=fail` set to be added, while `no_additional_sig` —
+/// whose newest existing seal already says `cv=fail` — expects no set at all.
+pub fn chainAlreadyBroken(sets: []const ArcSet) bool {
+    for (sets) |set| if (set.seal_cv == .fail) return true;
+    return false;
+}
+
 /// Human-readable reason for an A-R header.
 pub fn describeChainError(err: anyerror) []const u8 {
     return switch (err) {
