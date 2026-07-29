@@ -322,6 +322,47 @@ in verify mode.
 .Bl -tag -width "SIGTERM" -compact
 .It Dv SIGHUP
 Reload configuration.
+The configuration file is re-read and the reloadable settings are adopted as a
+single unit, so a message is always processed entirely under one configuration:
+.Va AuthservID ,
+.Va SealDomain ,
+.Va SealSelector ,
+.Va SignedHeaders ,
+.Va LocalAuthMethods ,
+.Va StripAuthResults ,
+.Va MinimumKeyBits ,
+.Va On-DNSError ,
+the seal key file, and the resolver settings
+.Pq Va Nameservers , Va DNSTimeout , Va DNSRetries , Va DNSCacheSize , Va DNSNegativeTTL .
+.Pp
+If the file cannot be read or parsed, or the new settings cannot be applied, the
+previous configuration stays in effect and the reason is logged; a reload is
+never applied by halves.
+.Pp
+The following are read at startup only, because a running process cannot change
+them honestly.
+.Va Listen
+and the per-listener
+.Va Mode
+are bound to open sockets, and a mode cannot change under a connection that has
+already been accepted.
+.Va MaxBodyBytes ,
+.Va MaxHeaders
+and
+.Va MaxHeaderBytes
+are fixed when a worker is spawned.
+.Va ZmqEndpoint
+and
+.Va ZmqTopic
+are fixed because each worker holds its own publisher socket for the lifetime of
+the process.
+.Va WorkerThreads ,
+.Va PidFile ,
+.Va User
+and
+.Va Foreground
+are startup decisions.
+Changing any of these requires a restart.
 .It Dv SIGTERM
 Graceful shutdown with 30 second drain timeout.
 .El

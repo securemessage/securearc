@@ -135,8 +135,12 @@ securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
 
 ## Signals
 
-- **SIGHUP** — Reload configuration
+- **SIGHUP** — Reload configuration. The reloadable settings are adopted as one unit, so a message is always handled entirely under a single configuration. Covers the seal key, `AuthservID`, `SealDomain`, `SealSelector`, `SignedHeaders`, `LocalAuthMethods`, `StripAuthResults`, `MinimumKeyBits`, `On-DNSError` and the resolver settings. A failed reload leaves the previous configuration in place and logs why.
 - **SIGTERM** — Graceful shutdown (30s drain timeout)
+
+Listen addresses, per-listener `Mode`, the `Max*` caps, the ZMQ endpoint and the process
+settings are read at startup only and need a restart — see `securearc(8)` SIGNALS for
+the full list and the reason in each case.
 
 ## Part of the SecureMilter Suite
 

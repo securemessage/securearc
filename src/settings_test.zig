@@ -341,3 +341,173 @@ test "an unrecognised Mode is refused" {
 
     try std.testing.expectError(error.InvalidMode, parseArcConfig(std.testing.allocator, &cfg));
 }
+
+// --- Reloadable: the snapshot SIGHUP publishes (audit A-14) -------------------
+//
+// This is fresh memory-management code on the reload path, and X-10 was a
+// borrow-versus-own mistake that shipped because nothing tested the contract. The
+// two properties worth pinning are that the snapshot is genuinely independent of the
+// config it was built from, and that a failure partway through building one leaks
+// nothing.
+
+/// An `ArcConfig` whose strings live in `buf`, so a test can scribble over the
+/// originals afterwards and see whether the snapshot noticed.
+fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const u8, ns: [][]const u8) settings.ArcConfig {
+    return .{
+        .authserv_id = authserv,
+        .listen_addresses = &.{},
+        .worker_threads = 1,
+        .pid_file = "/nonexistent",
+        .foreground = true,
+        .user = null,
+        .dns_nameservers = ns,
+        .dns_timeout_ms = 1234,
+        .dns_retries = 3,
+        .dns_cache_size = 77,
+        .dns_negative_ttl = 88,
+        .modes = &.{},
+        .seal_domain = domain,
+        .seal_selector = "sel",
+        .seal_key_file = null,
+        .signed_headers = headers,
+        .local_auth_methods = methods,
+        .strip_auth_results = true,
+        .zmq_endpoint = null,
+        .zmq_topic = "arc",
+        .limits = .{},
+        .min_key_bits = .{ .bits = 2048, .raised = false },
+        .on_dns_error = .skip_seal,
+    };
+}
+
+test "a reloaded snapshot does not borrow from the config it came from" {
+    // The property that makes reload safe rather than a use-after-free:
+    // `reloadConfig` frees the parsed `Config` before it returns, so anything the
+    // snapshot still points at is gone by the time the next message reads it. Tested
+    // by overwriting the source buffers rather than by freeing them, so the result is
+    // a deterministic comparison instead of a hope that the allocator notices.
+    const a = std.testing.allocator;
+
+    const authserv = try a.dupe(u8, "mail.first.test");
+    defer a.free(authserv);
+    const headers = try a.dupe(u8, "from:to:subject");
+    defer a.free(headers);
+    const domain = try a.dupe(u8, "first.example");
+    defer a.free(domain);
+
+    const method = try a.dupe(u8, "spf");
+    defer a.free(method);
+    const methods = try a.alloc([]const u8, 1);
+    defer a.free(methods);
+    methods[0] = method;
+
+    const server = try a.dupe(u8, "10.0.0.1");
+    defer a.free(server);
+    const ns = try a.alloc([]const u8, 1);
+    defer a.free(ns);
+    ns[0] = server;
+
+    var snap = try settings.Reloadable.init(a, scratchConfig(authserv, headers, domain, methods, ns));
+    defer snap.deinit(a);
+
+    // Scribble over every source string, including the list contents.
+    @memset(authserv, 'X');
+    @memset(headers, 'X');
+    @memset(domain, 'X');
+    @memset(method, 'X');
+    @memset(server, 'X');
+
+    try std.testing.expectEqualStrings("mail.first.test", snap.authserv_id);
+    try std.testing.expectEqualStrings("from:to:subject", snap.signed_headers);
+    try std.testing.expectEqualStrings("first.example", snap.seal_domain.?);
+    try std.testing.expectEqual(@as(usize, 1), snap.local_auth_methods.len);
+    try std.testing.expectEqualStrings("spf", snap.local_auth_methods[0]);
+    try std.testing.expectEqual(@as(usize, 1), snap.dns_config.nameservers.len);
+    try std.testing.expectEqualStrings("10.0.0.1", snap.dns_config.nameservers[0]);
+
+    // Scalars come across too, including the two an operator would change during an
+    // incident and that A-14 made silently ineffective.
+    try std.testing.expectEqual(@as(u32, 2048), snap.min_key_bits);
+    try std.testing.expectEqual(OnDnsError.skip_seal, snap.on_dns_error);
+    try std.testing.expect(snap.strip_all);
+    try std.testing.expectEqual(@as(u32, 1234), snap.dns_config.timeout_ms);
+    try std.testing.expectEqual(@as(u32, 88), snap.dns_config.negative_ttl);
+}
+
+test "a snapshot that fails partway through frees what it had already copied" {
+    // Six separate allocations plus the per-element dupes inside two lists, each
+    // guarded by its own errdefer. Stated as a property over every allocation the
+    // function performs rather than against a hand-picked index, so it cannot rot as
+    // the field list changes -- the same shape as the X-8 test over `emitArcSet`.
+    //
+    // `FailingAllocator` reports any block still outstanding when the test ends, so a
+    // missing errdefer fails here rather than becoming a leak on every SIGHUP that
+    // happens to land under memory pressure.
+    var saw_success = false;
+    var saw_failure = false;
+
+    var fail_index: usize = 0;
+    while (fail_index < 12) : (fail_index += 1) {
+        const a = std.testing.allocator;
+
+        const authserv = try a.dupe(u8, "mail.first.test");
+        defer a.free(authserv);
+        const headers = try a.dupe(u8, "from:to");
+        defer a.free(headers);
+        const domain = try a.dupe(u8, "first.example");
+        defer a.free(domain);
+        const methods = try a.alloc([]const u8, 2);
+        defer a.free(methods);
+        methods[0] = "spf";
+        methods[1] = "dkim";
+        const ns = try a.alloc([]const u8, 2);
+        defer a.free(ns);
+        ns[0] = "10.0.0.1";
+        ns[1] = "10.0.0.2";
+
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const cfg = scratchConfig(authserv, headers, domain, methods, ns);
+
+        if (settings.Reloadable.init(failing.allocator(), cfg)) |made| {
+            saw_success = true;
+            var snap = made;
+            snap.deinit(failing.allocator());
+        } else |_| {
+            saw_failure = true;
+        }
+
+        // Nothing outstanding on either path.
+        try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    }
+
+    // Guard against the loop passing because it exercised nothing.
+    try std.testing.expect(saw_failure);
+    try std.testing.expect(saw_success);
+}
+
+test "the strip policy always claims arc, and carries strip_all through" {
+    // `own_methods` names what this daemon asserts, so it is a property of the
+    // program. `strip_all` is the operator's, and it is reloadable.
+    const a = std.testing.allocator;
+    const authserv = try a.dupe(u8, "mail.first.test");
+    defer a.free(authserv);
+    const headers = try a.dupe(u8, "from");
+    defer a.free(headers);
+    const domain = try a.dupe(u8, "first.example");
+    defer a.free(domain);
+    const methods = try a.alloc([]const u8, 0);
+    defer a.free(methods);
+    const ns = try a.alloc([]const u8, 0);
+    defer a.free(ns);
+
+    var cfg = scratchConfig(authserv, headers, domain, methods, ns);
+    cfg.strip_auth_results = false;
+
+    var snap = try settings.Reloadable.init(a, cfg);
+    defer snap.deinit(a);
+
+    const policy = snap.stripPolicy();
+    try std.testing.expectEqual(@as(usize, 1), policy.own_methods.len);
+    try std.testing.expectEqualStrings("arc", policy.own_methods[0]);
+    try std.testing.expect(!policy.strip_all);
+}

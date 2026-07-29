@@ -14,6 +14,8 @@ const securemilter = @import("securemilter");
 const config_mod = securemilter.config;
 const listener_mod = securemilter.listener;
 const connection_mod = securemilter.connection;
+const dns_mod = securemilter.dns;
+const header_scrub = securemilter.header_scrub;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -273,3 +275,111 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .on_dns_error = on_dns_error,
     };
 }
+
+/// Duplicate a list of strings, list and contents both.
+fn dupeList(allocator: Allocator, src: []const []const u8) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, src.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |s| allocator.free(s);
+        allocator.free(out);
+    }
+    for (src, 0..) |s, i| {
+        out[i] = try allocator.dupe(u8, s);
+        made = i + 1;
+    }
+    return out;
+}
+
+fn freeList(allocator: Allocator, list: []const []const u8) void {
+    for (list) |s| allocator.free(s);
+    allocator.free(list);
+}
+
+/// The configuration a running daemon can adopt without a restart.
+///
+/// Published through an `Rcu` and read exactly once per message, which is what
+/// makes reloading these values safe at all. A message is processed entirely under
+/// one snapshot, so a SIGHUP arriving mid-message cannot leave the verify half
+/// working from one configuration and the seal half from another, and cannot leave
+/// the header-stripping pass using a different `authserv_id` from the stamp that
+/// follows it. Workers announce quiescence only at the top of their event loop
+/// (`reload.zig`), so the pointer stays valid for the message that took it.
+///
+/// Every string is owned. The values arrive pointing into a `Config` that
+/// `reloadConfig` frees before it returns, so adopting them directly is what makes
+/// the difference between a reload and a use-after-free.
+///
+/// What is deliberately *not* here is anything a running process cannot honestly
+/// change: listen addresses and per-listener modes are bound to open sockets, and a
+/// mode cannot change under an established connection; the `connection.Limits` caps
+/// are fixed when a worker is spawned; `worker_threads`, `pid_file`, `user` and
+/// `foreground` are startup decisions. Those stay restart-only and the man page says
+/// so, per option, rather than leaving the operator to infer it.
+pub const Reloadable = struct {
+    authserv_id: []const u8,
+    dns_config: dns_mod.ResolverConfig,
+    seal_domain: ?[]const u8,
+    seal_selector: ?[]const u8,
+    signed_headers: []const u8,
+    local_auth_methods: []const []const u8,
+    min_key_bits: u32,
+    on_dns_error: OnDnsError,
+    strip_all: bool,
+
+    /// Take an owning copy of the reloadable subset of `c`.
+    pub fn init(allocator: Allocator, c: ArcConfig) !Reloadable {
+        const authserv_id = try allocator.dupe(u8, c.authserv_id);
+        errdefer allocator.free(authserv_id);
+
+        const signed_headers = try allocator.dupe(u8, c.signed_headers);
+        errdefer allocator.free(signed_headers);
+
+        const seal_domain = if (c.seal_domain) |d| try allocator.dupe(u8, d) else null;
+        errdefer if (seal_domain) |d| allocator.free(d);
+
+        const seal_selector = if (c.seal_selector) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (seal_selector) |s| allocator.free(s);
+
+        const methods = try dupeList(allocator, c.local_auth_methods);
+        errdefer freeList(allocator, methods);
+
+        const nameservers = try dupeList(allocator, c.dns_nameservers);
+        errdefer freeList(allocator, nameservers);
+
+        return .{
+            .authserv_id = authserv_id,
+            .dns_config = .{
+                .nameservers = nameservers,
+                .timeout_ms = c.dns_timeout_ms,
+                .retries = c.dns_retries,
+                .cache_size = c.dns_cache_size,
+                .negative_ttl = c.dns_negative_ttl,
+            },
+            .seal_domain = seal_domain,
+            .seal_selector = seal_selector,
+            .signed_headers = signed_headers,
+            .local_auth_methods = methods,
+            .min_key_bits = c.min_key_bits.bits,
+            .on_dns_error = c.on_dns_error,
+            .strip_all = c.strip_auth_results,
+        };
+    }
+
+    pub fn deinit(self: *Reloadable, allocator: Allocator) void {
+        allocator.free(self.authserv_id);
+        allocator.free(self.signed_headers);
+        if (self.seal_domain) |d| allocator.free(d);
+        if (self.seal_selector) |s| allocator.free(s);
+        freeList(allocator, self.local_auth_methods);
+        freeList(allocator, self.dns_config.nameservers);
+    }
+
+    /// The forged-header strip rule for this snapshot.
+    ///
+    /// `own_methods` is `arc` and always will be: it names what *this* daemon
+    /// asserts, which is a property of the program rather than of the deployment.
+    pub fn stripPolicy(self: *const Reloadable) header_scrub.StripPolicy {
+        return .{ .own_methods = &.{"arc"}, .strip_all = self.strip_all };
+    }
+};

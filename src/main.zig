@@ -72,28 +72,28 @@ const modeLabel = settings.modeLabel;
 const reload_mod = securemilter.reload;
 const rcu_mod = securemilter.rcu;
 
-// Module-level config set before worker spawn, read-only during runtime.
-var g_authserv_id: []const u8 = "localhost";
-var g_dns_config: dns_mod.ResolverConfig = .{};
-var g_modes: []const Mode = &.{};
-var g_seal_domain: ?[]const u8 = null;
-var g_seal_selector: ?[]const u8 = null;
+// Restart-only state, set before worker spawn and read-only thereafter. Everything
+// a SIGHUP can change lives in `g_reloadable` instead.
 
-/// Smallest RSA modulus accepted on an AMS or ARC-Seal signature.
+/// Mode per listener, index-parallel to the configured listen addresses (audit A-2).
 ///
-/// Set once at startup and read by every worker thereafter. Kept out of
-/// `connection.Limits` because that struct is shared by all four daemons and
-/// only the two that verify signatures have any use for this.
-var g_min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS;
-/// Policy for a transient DNS failure on a sealing listener (audit A-12).
-///
-/// Daemon-wide rather than per-listener, deliberately. Per-listener would mean
-/// another array parallel to `g_modes`, and the value is meaningless on a verify
-/// listener anyway: verifying is fixed at `arc=temperror` and deliver, because a
-/// verifier writes no permanent verdict into the message and so has nothing to
-/// decide. If a future deployment needs per-listener sealing policy that is an
-/// additive change.
-var g_on_dns_error: OnDnsError = .tempfail;
+/// Restart-only, and not merely unimplemented: a listener's mode is a property of an
+/// open socket, and changing it under an established connection would mean a message
+/// whose `connect` was accepted by a verify listener finishing as a seal. Rebinding
+/// sockets is a restart by another name.
+var g_modes: []const Mode = &.{};
+
+/// ZMQ event sink. Restart-only because `tl_publisher` is a thread-local socket
+/// created once per worker; adopting a new endpoint means tearing those down and
+/// recreating them, which is a separate piece of work from reloading values.
+var g_zmq_endpoint: ?[]const u8 = null;
+var g_zmq_topic: []const u8 = "arc";
+
+var g_allocator: Allocator = undefined;
+var g_config_path: []const u8 = "/usr/local/etc/securearc/securearc.conf";
+var g_health_monitor: ?*dns_mod.HealthMonitor = null;
+var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
+
 /// Seal key behind an RCU container.
 ///
 /// A single ARC set is signed twice — once for the AMS, once for the AS — and
@@ -105,6 +105,48 @@ var g_on_dns_error: OnDnsError = .tempfail;
 const SealKeyRcu = rcu_mod.Rcu(crypto.SigningKey);
 var g_seal_key: SealKeyRcu = undefined;
 
+/// The reloadable configuration, published as one immutable snapshot.
+///
+/// One cell rather than nine, deliberately. Nine independently swapped globals
+/// would let a message run against a torn configuration -- a new `authserv_id` with
+/// the old `local_auth_methods`, say -- which is a worse failure than not reloading
+/// at all, because it is invisible. Publishing the set atomically means a message
+/// sees either the whole old configuration or the whole new one (audit A-14).
+const ReloadableRcu = rcu_mod.Rcu(settings.Reloadable);
+var g_reloadable: ReloadableRcu = undefined;
+
+fn freeReloadable(allocator: Allocator, r: *settings.Reloadable) void {
+    r.deinit(allocator);
+    allocator.destroy(r);
+}
+
+/// Take ownership of `r` and make it the live snapshot.
+///
+/// Owns `r` on every path: on failure it is released here rather than left to the
+/// caller, because a caller that has just been told publication failed has no way to
+/// know whether the value was boxed first. That ambiguity is what X-10 was.
+fn adoptReloadable(r: settings.Reloadable) !void {
+    var owned = r;
+    const boxed = g_allocator.create(settings.Reloadable) catch |err| {
+        owned.deinit(g_allocator);
+        return err;
+    };
+    boxed.* = owned;
+    g_reloadable.publish(&g_config_gen, boxed) catch |err| {
+        freeReloadable(g_allocator, boxed);
+        return err;
+    };
+}
+
+/// The snapshot this message runs against.
+///
+/// Non-null for the life of the process: `main` publishes before any listener is
+/// accepting and treats a failure there as fatal, and an `Rcu` only ever replaces a
+/// value, never clears it.
+fn snapshot() *const settings.Reloadable {
+    return g_reloadable.get().?;
+}
+
 fn freeSealKey(allocator: Allocator, key: *crypto.SigningKey) void {
     key.deinit();
     allocator.destroy(key);
@@ -115,15 +157,6 @@ fn boxSealKey(allocator: Allocator, key: crypto.SigningKey) !*crypto.SigningKey 
     boxed.* = key;
     return boxed;
 }
-var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
-var g_local_auth_methods: []const []const u8 = &.{};
-var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"arc"} };
-var g_zmq_endpoint: ?[]const u8 = null;
-var g_zmq_topic: []const u8 = "arc";
-var g_allocator: Allocator = undefined;
-var g_config_path: []const u8 = "/usr/local/etc/securearc/securearc.conf";
-var g_health_monitor: ?*dns_mod.HealthMonitor = null;
-var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
@@ -170,26 +203,21 @@ pub fn main() !void {
     log.initGlobal(&log_cfg);
     log.initThread();
 
-    // Set module-level globals
-    g_authserv_id = arc_cfg.authserv_id;
-    g_dns_config = .{
-        .nameservers = arc_cfg.dns_nameservers,
-        .timeout_ms = arc_cfg.dns_timeout_ms,
-        .retries = arc_cfg.dns_retries,
-        .cache_size = arc_cfg.dns_cache_size,
-        .negative_ttl = arc_cfg.dns_negative_ttl,
-    };
-
+    // Restart-only settings: bound to sockets, worker threads or the process
+    // itself, so a running daemon cannot honestly change them.
     g_modes = arc_cfg.modes;
-    g_seal_domain = arc_cfg.seal_domain;
-    g_seal_selector = arc_cfg.seal_selector;
-    g_signed_headers = arc_cfg.signed_headers;
-    g_local_auth_methods = arc_cfg.local_auth_methods;
-    g_strip_policy = .{ .own_methods = &.{"arc"}, .strip_all = arc_cfg.strip_auth_results };
     g_zmq_endpoint = arc_cfg.zmq_endpoint;
     g_zmq_topic = arc_cfg.zmq_topic;
-    g_min_key_bits = arc_cfg.min_key_bits.bits;
-    g_on_dns_error = arc_cfg.on_dns_error;
+
+    // Everything a SIGHUP can adopt, as one owned snapshot. Published before any
+    // listener is accepting, and fatal if it fails: a daemon with no configuration
+    // to read has nothing useful to do, and continuing would mean discovering it
+    // per-message instead.
+    g_reloadable = ReloadableRcu.init(allocator, freeReloadable);
+    adoptReloadable(try settings.Reloadable.init(allocator, arc_cfg)) catch |err| {
+        log.err("failed to publish initial configuration: {}", .{err});
+        return err;
+    };
 
     if (arc_cfg.min_key_bits.raised) {
         log.warn(
@@ -385,12 +413,12 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 /// a flow that reads none of it. They live here, not in `flow.zig`, because they are
 /// the only things that touch these globals — putting them beside the struct
 /// definitions would make the two files import each other.
-fn msgCtx() MsgCtx {
+fn msgCtx(cfg: *const settings.Reloadable) MsgCtx {
     return .{
-        .dns_config = g_dns_config,
+        .dns_config = cfg.dns_config,
         .health_monitor = g_health_monitor,
-        .min_key_bits = g_min_key_bits,
-        .authserv_id = g_authserv_id,
+        .min_key_bits = cfg.min_key_bits,
+        .authserv_id = cfg.authserv_id,
         .publisher = getPublisher(),
     };
 }
@@ -398,40 +426,45 @@ fn msgCtx() MsgCtx {
 /// Snapshot the seal configuration, or null when this daemon is not configured to
 /// seal — which is the one question the three guards `doSeal` used to open with were
 /// each asking separately.
-fn sealCtx(msg: MsgCtx) ?SealCtx {
+fn sealCtx(msg: MsgCtx, cfg: *const settings.Reloadable) ?SealCtx {
     return .{
         .msg = msg,
-        .domain = g_seal_domain orelse return null,
-        .selector = g_seal_selector orelse return null,
+        .domain = cfg.seal_domain orelse return null,
+        .selector = cfg.seal_selector orelse return null,
         // Acquired exactly once here. See `SealCtx.sign_key` for why that matters.
         .sign_key = g_seal_key.get() orelse return null,
-        .signed_headers = g_signed_headers,
-        .local_auth_methods = g_local_auth_methods,
-        .on_dns_error = g_on_dns_error,
+        .signed_headers = cfg.signed_headers,
+        .local_auth_methods = cfg.local_auth_methods,
+        .on_dns_error = cfg.on_dns_error,
     };
 }
 
 fn onEom(conn: *connection_mod.Connection) u8 {
     const start_ns = std.time.nanoTimestamp();
 
+    // One snapshot for the whole message, taken before anything reads configuration.
+    // In `both` mode this means the verify and seal halves cannot disagree because a
+    // reload landed between them; taken here rather than after the strip, it also
+    // means the `authserv_id` used to drop forged claims is the same one the stamp
+    // below asserts. Stripping first and snapshotting second left a reload able to
+    // slip between the two, so this hop would remove headers under one identity and
+    // then write its own under another (audit A-14).
+    const cfg = snapshot();
+
     // Drop forged arc= claims before validating or sealing.
-    _ = header_scrub.stripAuthResults(conn, g_authserv_id, g_strip_policy);
+    _ = header_scrub.stripAuthResults(conn, cfg.authserv_id, cfg.stripPolicy());
 
     const mode = modeFor(conn.listener_index);
-
-    // One snapshot for the whole message. In `both` mode this also means the
-    // verify and seal halves cannot disagree about the configuration because a
-    // reload landed between them.
-    const ctx = msgCtx();
+    const ctx = msgCtx(cfg);
 
     // `sealCtx` is only reached on a mode that seals, so a verify-only listener
     // never acquires the signing key.
     const result = switch (mode) {
         .verify_only => doVerify(conn, ctx),
-        .seal_only => doSeal(conn, sealCtx(ctx)),
+        .seal_only => doSeal(conn, sealCtx(ctx, cfg)),
         .both => blk: {
             _ = doVerify(conn, ctx);
-            break :blk doSeal(conn, sealCtx(ctx));
+            break :blk doSeal(conn, sealCtx(ctx, cfg));
         },
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
@@ -490,15 +523,34 @@ fn reloadConfig() void {
         _ = g_config_gen.increment();
         return;
     };
-    // parseArcConfig hands back four slices it allocated. Only the seal key
-    // is adopted below; the rest were dropped on the floor here, leaking a
-    // little more on every SIGHUP.
+    // parseArcConfig hands back four slices it allocated. `Reloadable` takes its
+    // own copies of what it keeps, because `cfg` is freed when this function
+    // returns, so these are all released here either way.
     defer {
         g_allocator.free(arc_cfg.listen_addresses);
         g_allocator.free(arc_cfg.modes);
         g_allocator.free(arc_cfg.dns_nameservers);
         g_allocator.free(arc_cfg.local_auth_methods);
     }
+
+    // Adopt the reloadable settings. Published before the seal key so that one
+    // SIGHUP cannot leave the daemon signing with a new key under an old identity;
+    // if this fails the previous snapshot stays live and the key is left alone too,
+    // since a half-applied reload is the failure mode worth avoiding (audit A-14).
+    const fresh = settings.Reloadable.init(g_allocator, arc_cfg) catch |err| {
+        log.warn("reload: failed to copy configuration ({}), keeping previous", .{err});
+        _ = g_config_gen.increment();
+        return;
+    };
+    adoptReloadable(fresh) catch |err| {
+        log.warn("reload: failed to adopt configuration ({}), keeping previous", .{err});
+        _ = g_config_gen.increment();
+        return;
+    };
+    log.info("configuration reloaded from {s} ({d} awaiting reclamation)", .{
+        g_config_path,
+        g_reloadable.retiredCount(),
+    });
 
     if (arc_cfg.seal_key_file) |key_path| {
         const min_bits = crypto.RFC8301_MIN_RSA_BITS;
