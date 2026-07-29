@@ -213,12 +213,6 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     // for exactly those three reasons.
     const ctx = maybe_ctx orelse return @intFromEnum(responses.Code.@"continue");
 
-    // Bound to the names the rest of this function already used, so moving the
-    // source of these values does not touch the signing code below.
-    const domain = ctx.domain;
-    const selector = ctx.selector;
-    const sign_key = ctx.sign_key;
-
     // Determine instance number: count existing ARC sets + 1
     var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
     defer arc_headers.deinit(conn.allocator);
@@ -295,123 +289,29 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
         }
     };
 
-    // Nothing below writes to the message until every header of the set has been
-    // built. See `emitArcSet`: a partial set is worse than no set at all, because
-    // the next hop reads it as a broken chain and makes that permanent (X-8).
+    // Nothing here writes to the message until every header of the set exists. A
+    // partial set is worse than no set at all: the next hop reads it as a broken
+    // chain and makes that permanent (X-8). With construction moved to `sealbuild`,
+    // which touches neither the socket nor daemon state, that ordering is now
+    // structural rather than a rule this function has to remember — there is
+    // nothing to emit until `buildSet` has returned a complete one.
+    var failed_step: ?[]const u8 = null;
+    var set = sealbuild.buildSet(conn, .{
+        .instance = new_instance,
+        .cv = cv,
+        .domain = ctx.domain,
+        .selector = ctx.selector,
+        .signed_headers = ctx.signed_headers,
+        .authserv_id = ctx.msg.authserv_id,
+        .local_auth_methods = ctx.local_auth_methods,
+        .sign_key = ctx.sign_key,
+        .prior_sets = sets,
+    }, &failed_step) catch
+        return sealInternalError(failed_step orelse "building the ARC set");
+    defer set.deinit();
 
-    // Build AAR content from the results this ADMD produced
-    const ar_content = buildAarContent(conn, ctx.msg.authserv_id, ctx.local_auth_methods) orelse
-        return sealInternalError("building the ARC-Authentication-Results content");
-    defer conn.allocator.free(ar_content);
-
-    const aar = std.fmt.allocPrint(conn.allocator, "i={d}; {s}", .{ new_instance, ar_content }) catch
-        return sealInternalError("formatting the ARC-Authentication-Results header");
-    defer conn.allocator.free(aar);
-
-    // Build AMS: sign the message (same as DKIM signing). Guarded at the top of
-    // doSeal, so the body here is the whole body.
-    const body_data = conn.getBody() orelse return sealInternalError("the accumulated body is unavailable");
-    const canon_mod = securemilter_crypto.canon;
-
-    // Canonicalize body and compute body hash
-    var body_canon = canon_mod.BodyCanonicalizer.init(conn.allocator, .relaxed);
-    defer body_canon.deinit();
-    body_canon.update(body_data) catch return sealInternalError("canonicalizing the body");
-    const canon_body = body_canon.finish() catch return sealInternalError("finishing body canonicalization");
-    defer conn.allocator.free(canon_body);
-    const body_hash_raw = crypto.sha256(canon_body);
-    const body_hash_b64 = crypto.base64Encode(conn.allocator, &body_hash_raw) catch
-        return sealInternalError("encoding the body hash");
-    defer conn.allocator.free(body_hash_b64);
-
-    // Build AMS template (pre-folded — SAME format used for both signing input AND
-    // the header prepended to the message, ensuring byte-identical canonicalization)
-    const ams_template = std.fmt.allocPrint(
-        conn.allocator,
-        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
-        .{ new_instance, domain, selector, ctx.signed_headers, body_hash_b64 },
-    ) catch return sealInternalError("formatting the AMS template");
-    defer conn.allocator.free(ams_template);
-
-    // Canonicalize selected headers for AMS signing input
-    var ams_input: std.ArrayListUnmanaged(u8) = .{};
-    defer ams_input.deinit(conn.allocator);
-    buildSigningHeaders(conn, &ams_input, ctx.signed_headers) catch return sealInternalError("canonicalizing the signed headers");
-
-    // Append AMS header template (with empty b=) as final line (no trailing CRLF)
-    const ams_full_template = std.fmt.allocPrint(conn.allocator, "ARC-Message-Signature: {s}", .{ams_template}) catch
-        return sealInternalError("formatting the AMS signing input");
-    defer conn.allocator.free(ams_full_template);
-    const canon_ams_tmpl = canon_mod.canonicalizeHeader(conn.allocator, .relaxed, ams_full_template) catch
-        return sealInternalError("canonicalizing the AMS header");
-    defer conn.allocator.free(canon_ams_tmpl);
-    ams_input.appendSlice(conn.allocator, canon_ams_tmpl) catch
-        return sealInternalError("assembling the AMS signing input");
-
-    // Sign AMS
-    const ams_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, ams_input.items) catch
-        return sealInternalError("signing the AMS");
-    defer conn.allocator.free(ams_sig_raw);
-    const ams_sig_b64 = crypto.base64Encode(conn.allocator, ams_sig_raw) catch
-        return sealInternalError("encoding the AMS signature");
-    defer conn.allocator.free(ams_sig_b64);
-
-    // Final AMS header value: same pre-folded template + signature (folded base64)
-    //
-    // No `catch ams_sig_b64` fallback here. `foldBase64` now always allocates, so
-    // falling back to its input would alias a buffer this scope frees separately, and
-    // an unfoldable signature is an allocation failure like any other on this path
-    // (audit X-10).
-    const folded_ams_sig = foldBase64(conn.allocator, ams_sig_b64) catch
-        return sealInternalError("folding the AMS signature");
-    defer conn.allocator.free(folded_ams_sig);
-    const ams_value = std.fmt.allocPrint(
-        conn.allocator,
-        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
-        .{ new_instance, domain, selector, ctx.signed_headers, body_hash_b64, folded_ams_sig },
-    ) catch return sealInternalError("formatting the AMS header");
-    defer conn.allocator.free(ams_value);
-
-    // Build ARC-Seal: signs over all prior ARC headers + current AAR + AMS + AS(empty b=)
-    const as_template = std.fmt.allocPrint(
-        conn.allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb=",
-        .{ new_instance, cv.toString(), domain, selector },
-    ) catch return sealInternalError("formatting the ARC-Seal template");
-    defer conn.allocator.free(as_template);
-
-    // Build seal signing input
-    var seal_input: std.ArrayListUnmanaged(u8) = .{};
-    defer seal_input.deinit(conn.allocator);
-    buildSealInput(conn, &seal_input, sets, aar, ams_value, as_template) catch
-        return sealInternalError("assembling the ARC-Seal signing input");
-
-    // Sign seal
-    const seal_sig_raw = crypto.rsaSign(conn.allocator, sign_key.rsa_pkey.?, seal_input.items) catch
-        return sealInternalError("signing the ARC-Seal");
-    defer conn.allocator.free(seal_sig_raw);
-    const seal_sig_b64 = crypto.base64Encode(conn.allocator, seal_sig_raw) catch
-        return sealInternalError("encoding the ARC-Seal signature");
-    defer conn.allocator.free(seal_sig_b64);
-
-    // Final AS header value (pre-folded)
-    //
-    // Folded into a named binding rather than inline in the argument list, because
-    // inline it had nowhere to be freed and leaked on every sealed message (X-10).
-    const folded_seal_sig = foldBase64(conn.allocator, seal_sig_b64) catch
-        return sealInternalError("folding the ARC-Seal signature");
-    defer conn.allocator.free(folded_seal_sig);
-
-    const as_value = std.fmt.allocPrint(
-        conn.allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
-        .{ new_instance, cv.toString(), domain, selector, folded_seal_sig },
-    ) catch return sealInternalError("formatting the ARC-Seal header");
-    defer conn.allocator.free(as_value);
-
-    // The whole set exists now, so it can go out as a unit. Nothing above this
-    // line has touched the message.
-    emitArcSet(conn.allocator, conn.fd, aar, ams_value, as_value) catch
+    // The whole set exists now, so it can go out as a unit.
+    emitArcSet(conn.allocator, conn.fd, set.aar, set.ams, set.seal) catch
         return sealInternalError("writing the ARC set");
 
     publishEvent(ctx.msg.publisher, conn.allocator, "seal", cv.toString(), new_instance);

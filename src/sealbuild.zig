@@ -24,6 +24,7 @@ const log = securemilter.log;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const header_select = securemilter_crypto.header_select;
+const crypto = securemilter_crypto.crypto;
 
 const arc = @import("arc.zig");
 
@@ -201,4 +202,183 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn toLower(c: u8) u8 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
+}
+
+/// Failure to build the set. The step that failed is reported out-of-band rather
+/// than as a distinct error per step: the caller logs it and tempfails either way,
+/// and twenty error names would be twenty things to keep in sync with one `switch`.
+pub const BuildError = error{BuildFailed};
+
+/// The three header values of one ARC set, owned as a unit.
+///
+/// Modelled on `securedkim`'s `SignResult`: the struct names the allocator that
+/// made it and frees itself, so a caller cannot get the ownership wrong. That is
+/// exactly the contract `foldBase64` lacked, and X-10 was the price -- two
+/// allocations leaked per sealed message that no caller could have known to free,
+/// because the signature did not say. Handing back three bare slices instead would
+/// be the same trap three times over.
+pub const BuiltSet = struct {
+    aar: []u8,
+    ams: []u8,
+    seal: []u8,
+    allocator: Allocator,
+
+    pub fn deinit(self: *BuiltSet) void {
+        self.allocator.free(self.aar);
+        self.allocator.free(self.ams);
+        self.allocator.free(self.seal);
+    }
+};
+
+/// Everything `buildSet` needs beyond the message already on the connection.
+///
+/// All of it is resolved configuration and an already-acquired key: this layer
+/// reads no daemon state and makes no policy choice. `cv` in particular arrives
+/// *decided*, because deciding it is where A-12 lived — a nameserver blip must not
+/// become a permanent `cv=fail` — and that judgement needs to see the DNS outcome,
+/// so it stays with the flow.
+pub const SetParams = struct {
+    instance: u8,
+    cv: arc.ChainValidation,
+    domain: []const u8,
+    selector: []const u8,
+    signed_headers: []const u8,
+    authserv_id: []const u8,
+    local_auth_methods: []const []const u8,
+    sign_key: *const crypto.SigningKey,
+    /// Sets already on the message, for the ARC-Seal's signing input.
+    prior_sets: []const arc.ArcSet,
+};
+
+/// Record which step failed and fail. Keeps each failure site one line, as it was
+/// when these lines called `sealInternalError` directly.
+fn fail(step: *?[]const u8, what: []const u8) BuildError {
+    step.* = what;
+    return error.BuildFailed;
+}
+
+/// Build all three header values of the new ARC set. Writes nothing.
+///
+/// That it writes nothing is the point rather than an incidental property. A milter
+/// header packet cannot be recalled once it is on the wire, so an allocation failure
+/// partway through emission used to deliver a *partial* set — and RFC 8617 §5.1.2
+/// makes the next hop record that as a permanent `cv=fail`, destroying a chain that
+/// may have been valid (audit X-8). Keeping every allocation in this module and every
+/// write in the flow makes that ordering structural: the caller has no set to emit
+/// until it has all of it.
+///
+/// On failure `failed_step` names the step, following the `reason: *?[]const u8`
+/// convention `chain.zig` already uses for the same job. Partially built values are
+/// released here, so a failed call returns nothing and leaks nothing.
+pub fn buildSet(
+    conn: *connection_mod.Connection,
+    p: SetParams,
+    failed_step: *?[]const u8,
+) BuildError!BuiltSet {
+    const allocator = conn.allocator;
+    const canon_mod = securemilter_crypto.canon;
+
+    // AAR: the results this ADMD produced, from its own headers only. The trust
+    // rule that decides "its own" is in `buildAarContent`.
+    const ar_content = buildAarContent(conn, p.authserv_id, p.local_auth_methods) orelse
+        return fail(failed_step, "building the ARC-Authentication-Results content");
+    defer allocator.free(ar_content);
+
+    const aar = std.fmt.allocPrint(allocator, "i={d}; {s}", .{ p.instance, ar_content }) catch
+        return fail(failed_step, "formatting the ARC-Authentication-Results header");
+    errdefer allocator.free(aar);
+
+    // AMS: signs the message content. The caller has already refused to seal a
+    // truncated copy, so this is the whole body.
+    const body_data = conn.getBody() orelse
+        return fail(failed_step, "the accumulated body is unavailable");
+
+    var body_canon = canon_mod.BodyCanonicalizer.init(allocator, .relaxed);
+    defer body_canon.deinit();
+    body_canon.update(body_data) catch return fail(failed_step, "canonicalizing the body");
+    const canon_body = body_canon.finish() catch
+        return fail(failed_step, "finishing body canonicalization");
+    defer allocator.free(canon_body);
+
+    const body_hash_raw = crypto.sha256(canon_body);
+    const body_hash_b64 = crypto.base64Encode(allocator, &body_hash_raw) catch
+        return fail(failed_step, "encoding the body hash");
+    defer allocator.free(body_hash_b64);
+
+    // Pre-folded, and the same layout is used for the signing input and for the
+    // header placed on the message, so what a verifier canonicalizes is
+    // byte-identical to what we hashed.
+    const ams_template = std.fmt.allocPrint(
+        allocator,
+        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
+        .{ p.instance, p.domain, p.selector, p.signed_headers, body_hash_b64 },
+    ) catch return fail(failed_step, "formatting the AMS template");
+    defer allocator.free(ams_template);
+
+    var ams_input: std.ArrayListUnmanaged(u8) = .{};
+    defer ams_input.deinit(allocator);
+    buildSigningHeaders(conn, &ams_input, p.signed_headers) catch
+        return fail(failed_step, "canonicalizing the signed headers");
+
+    // The template goes in as the final line, b= empty and no trailing CRLF
+    // (RFC 6376 §3.7).
+    const ams_full_template = std.fmt.allocPrint(
+        allocator,
+        "ARC-Message-Signature: {s}",
+        .{ams_template},
+    ) catch return fail(failed_step, "formatting the AMS signing input");
+    defer allocator.free(ams_full_template);
+    const canon_ams_tmpl = canon_mod.canonicalizeHeader(allocator, .relaxed, ams_full_template) catch
+        return fail(failed_step, "canonicalizing the AMS header");
+    defer allocator.free(canon_ams_tmpl);
+    ams_input.appendSlice(allocator, canon_ams_tmpl) catch
+        return fail(failed_step, "assembling the AMS signing input");
+
+    const ams_sig_raw = crypto.rsaSign(allocator, p.sign_key.rsa_pkey.?, ams_input.items) catch
+        return fail(failed_step, "signing the AMS");
+    defer allocator.free(ams_sig_raw);
+    const ams_sig_b64 = crypto.base64Encode(allocator, ams_sig_raw) catch
+        return fail(failed_step, "encoding the AMS signature");
+    defer allocator.free(ams_sig_b64);
+    const folded_ams_sig = foldBase64(allocator, ams_sig_b64) catch
+        return fail(failed_step, "folding the AMS signature");
+    defer allocator.free(folded_ams_sig);
+
+    const ams_value = std.fmt.allocPrint(
+        allocator,
+        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
+        .{ p.instance, p.domain, p.selector, p.signed_headers, body_hash_b64, folded_ams_sig },
+    ) catch return fail(failed_step, "formatting the AMS header");
+    errdefer allocator.free(ams_value);
+
+    // ARC-Seal: signs every prior ARC header plus this set's AAR and AMS.
+    const as_template = std.fmt.allocPrint(
+        allocator,
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb=",
+        .{ p.instance, p.cv.toString(), p.domain, p.selector },
+    ) catch return fail(failed_step, "formatting the ARC-Seal template");
+    defer allocator.free(as_template);
+
+    var seal_input: std.ArrayListUnmanaged(u8) = .{};
+    defer seal_input.deinit(allocator);
+    buildSealInput(conn, &seal_input, p.prior_sets, aar, ams_value, as_template) catch
+        return fail(failed_step, "assembling the ARC-Seal signing input");
+
+    const seal_sig_raw = crypto.rsaSign(allocator, p.sign_key.rsa_pkey.?, seal_input.items) catch
+        return fail(failed_step, "signing the ARC-Seal");
+    defer allocator.free(seal_sig_raw);
+    const seal_sig_b64 = crypto.base64Encode(allocator, seal_sig_raw) catch
+        return fail(failed_step, "encoding the ARC-Seal signature");
+    defer allocator.free(seal_sig_b64);
+    const folded_seal_sig = foldBase64(allocator, seal_sig_b64) catch
+        return fail(failed_step, "folding the ARC-Seal signature");
+    defer allocator.free(folded_seal_sig);
+
+    const as_value = std.fmt.allocPrint(
+        allocator,
+        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
+        .{ p.instance, p.cv.toString(), p.domain, p.selector, folded_seal_sig },
+    ) catch return fail(failed_step, "formatting the ARC-Seal header");
+
+    return .{ .aar = aar, .ams = ams_value, .seal = as_value, .allocator = allocator };
 }
