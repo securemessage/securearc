@@ -344,7 +344,7 @@ test "an unrecognised Mode is refused" {
 
 // --- Reloadable: the snapshot SIGHUP publishes (audit A-14) -------------------
 //
-// This is fresh memory-management code on the reload path, and X-10 was a
+// This is fresh memory-management code on the reload path, and X-11 was a
 // borrow-versus-own mistake that shipped because nothing tested the contract. The
 // two properties worth pinning are that the snapshot is genuinely independent of the
 // config it was built from, and that a failure partway through building one leaks

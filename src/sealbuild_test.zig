@@ -26,7 +26,7 @@ test "results part drops the authserv-id" {
     try std.testing.expect(resultsPart("mail.example.org;   ") == null);
 }
 
-// --- X-10: the fold must always hand back an allocation the caller owns ------
+// --- X-11: the fold must always hand back an allocation the caller owns ------
 //
 // It used to return its input unchanged when short enough to need no folding, so the
 // result was owned on one path and borrowed on the other with nothing in the type to

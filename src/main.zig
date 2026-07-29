@@ -124,7 +124,7 @@ fn freeReloadable(allocator: Allocator, r: *settings.Reloadable) void {
 ///
 /// Owns `r` on every path: on failure it is released here rather than left to the
 /// caller, because a caller that has just been told publication failed has no way to
-/// know whether the value was boxed first. That ambiguity is what X-10 was.
+/// know whether the value was boxed first. That ambiguity is what X-11 was.
 fn adoptReloadable(r: settings.Reloadable) !void {
     var owned = r;
     const boxed = g_allocator.create(settings.Reloadable) catch |err| {

@@ -170,7 +170,7 @@ pub fn resultsPart(header_value: []const u8) ?[]const u8 {
 /// It used to return `b64` itself when short enough to need no folding, so the result
 /// was sometimes borrowed and sometimes owned, with nothing in the type to say which.
 /// Both call sites did the only thing available to them and freed neither, which leaked
-/// a folded RSA signature on every sealed message (audit X-10). Duplicating the short
+/// a folded RSA signature on every sealed message (audit X-11). Duplicating the short
 /// case costs one copy of a value that is, by definition, at most 76 bytes, and makes
 /// `defer allocator.free(...)` correct unconditionally.
 pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
@@ -213,7 +213,7 @@ pub const BuildError = error{BuildFailed};
 ///
 /// Modelled on `securedkim`'s `SignResult`: the struct names the allocator that
 /// made it and frees itself, so a caller cannot get the ownership wrong. That is
-/// exactly the contract `foldBase64` lacked, and X-10 was the price -- two
+/// exactly the contract `foldBase64` lacked, and X-11 was the price -- two
 /// allocations leaked per sealed message that no caller could have known to free,
 /// because the signature did not say. Handing back three bare slices instead would
 /// be the same trap three times over.
