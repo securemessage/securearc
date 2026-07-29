@@ -66,4 +66,14 @@ pub fn build(b: *std.Build) void {
 
     const run_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_tests.step);
+
+    // One canonical checker, shared from securemilter-lib rather than copied.
+    const lint = b.addSystemCommand(&.{"sh"});
+    lint.addFileArg(securemilter_dep.path("tools/check-line-limit.sh"));
+    lint.addArg("src");
+    lint.addArg(".line-limit-allow");
+    if (b.args) |args| lint.addArgs(args);
+    lint.has_side_effects = true;
+    const lint_step = b.step("lint", "Fail on source files over the 400-line limit");
+    lint_step.dependOn(&lint.step);
 }

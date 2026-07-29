@@ -1,0 +1,7 @@
+# Per-file line ceilings for files over the 400-line limit.
+# A ratchet: these may shrink, never grow. Regenerate with
+#   zig build lint -- --update
+# An empty file below this header means the limit is met everywhere.
+418 src/arc.zig
+769 src/chain.zig
+1698 src/main.zig
