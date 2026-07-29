@@ -1,7 +1,10 @@
-# Per-file line ceilings for files over the 400-line limit.
-# A ratchet: these may shrink, never grow. Regenerate with
+# Files currently over the 400-line goal, with the ceiling each
+# may not exceed. Ceilings tighten by themselves as files shrink; a
+# file that reaches the goal drops off this list entirely.
+#
+# Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
-# An empty file below this header means the limit is met everywhere.
+# An empty list below means every file meets the goal.
 418 src/arc.zig
 769 src/chain.zig
 1134 src/main.zig
