@@ -374,12 +374,17 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 
     const mode = modeFor(conn.listener_index);
 
+    // One snapshot for the whole message. In `both` mode this also means the
+    // verify and seal halves cannot disagree about the configuration because a
+    // reload landed between them.
+    const ctx = ChainCtx.current();
+
     const result = switch (mode) {
-        .verify_only => doVerify(conn),
-        .seal_only => doSeal(conn),
+        .verify_only => doVerify(conn, ctx),
+        .seal_only => doSeal(conn, ctx),
         .both => blk: {
-            _ = doVerify(conn);
-            break :blk doSeal(conn);
+            _ = doVerify(conn, ctx);
+            break :blk doSeal(conn, ctx);
         },
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
@@ -419,7 +424,53 @@ fn modeFor(listener_index: usize) Mode {
     return .verify_only;
 }
 
-fn doVerify(conn: *connection_mod.Connection) u8 {
+/// What chain validation needs: how to reach DNS, and the smallest key to accept.
+///
+/// Not a grouping invented to justify a struct. These three values appeared as the
+/// same triple in both `doVerify` and `doSeal` — build a resolver, then validate
+/// with a floor on key size — so `validate` below folds that duplication into one
+/// place and the struct is just its parameter list.
+///
+/// Passed in rather than read from the globals inside, which is the point: the
+/// AMS and ARC-Seal verification path is now reachable from a test without a
+/// running daemon, and `onEom` can hand the same snapshot to both halves of
+/// `both` mode instead of each re-reading state a reload could change between
+/// them.
+const ChainCtx = struct {
+    dns_config: dns_mod.ResolverConfig,
+    health_monitor: ?*dns_mod.HealthMonitor,
+    min_key_bits: u32,
+
+    /// Snapshot the daemon's current configuration. The one place that reads
+    /// these globals.
+    fn current() ChainCtx {
+        return .{
+            .dns_config = g_dns_config,
+            .health_monitor = g_health_monitor,
+            .min_key_bits = g_min_key_bits,
+        };
+    }
+
+    /// Validate `sets` against DNS, with a resolver that lives only for the call.
+    ///
+    /// Safe to destroy the resolver on return because every `failure_reason`
+    /// `chain.zig` can produce is a string literal — checked rather than assumed,
+    /// since a reason borrowed from resolver-owned memory would dangle here and
+    /// the callers below all read it after this returns.
+    fn validate(
+        self: ChainCtx,
+        allocator: Allocator,
+        sets: []const arc.ArcSet,
+        all_headers: []const arc.Header,
+        body_data: []const u8,
+    ) chain.ValidationResult {
+        var resolver = dns_mod.Resolver.initWithMonitor(allocator, self.dns_config, self.health_monitor);
+        defer resolver.deinit();
+        return chain.validateChain(allocator, &resolver, sets, all_headers, body_data, self.min_key_bits);
+    }
+};
+
+fn doVerify(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     // An incomplete copy cannot validate a chain: every AMS in it covers the
     // body, so a truncated body makes each one fail on content grounds rather
     // than on the chain's own merits. arc=fail would blame the sender for our
@@ -466,17 +517,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     // Validate chain. The truncation check at the top of doVerify established
     // the body is whole.
     const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
-    var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
-    defer resolver.deinit();
-
-    const result = chain.validateChain(
-        conn.allocator,
-        &resolver,
-        sets,
-        arc_headers.items,
-        body_data,
-        g_min_key_bits,
-    );
+    const result = ctx.validate(conn.allocator, sets, arc_headers.items, body_data);
 
     // A verifier reports what it found and never writes a permanent verdict
     // into the message, so an unevaluable chain is `arc=temperror`: honest,
@@ -506,7 +547,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     return @intFromEnum(responses.Code.@"continue");
 }
 
-fn doSeal(conn: *connection_mod.Connection) u8 {
+fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     // A seal is an attestation over content. Sealing a copy we know to be
     // incomplete would hand the next hop a chain that cannot validate and name
     // this ADMD as the one that broke it (audit X-4). Pass through unsealed.
@@ -556,9 +597,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     // §5.1.2, and indistinguishable to every later hop from a forged signature.
     const cv: arc.ChainValidation = if (sets.len == 0) .none else blk: {
         const body_data = conn.getBody() orelse break :blk arc.ChainValidation.fail;
-        var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
-        defer resolver.deinit();
-        const vr = chain.validateChain(conn.allocator, &resolver, sets, arc_headers.items, body_data, g_min_key_bits);
+        const vr = ctx.validate(conn.allocator, sets, arc_headers.items, body_data);
         switch (vr.evaluation) {
             .complete => break :blk vr.status,
             .internal_error => {
