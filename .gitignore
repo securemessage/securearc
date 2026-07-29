@@ -1,4 +1,12 @@
 .zig-cache/
 zig-out/
-build.core
 test/
+
+# Crash dumps. FreeBSD writes <progname>.core into the cwd, so the name follows
+# whichever binary died -- build.core, test.core, securearc.core. A single filename
+# only ever blocks the crash that has already happened: build.core was listed here
+# after one landed in a commit on 2026-07-26, and test.core walked straight past it
+# on 2026-07-29 because the failing binary had a different name. Cores are tens of
+# megabytes and can hold key material lifted from process memory, so match the
+# pattern.
+*.core
