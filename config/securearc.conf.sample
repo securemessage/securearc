@@ -124,10 +124,18 @@ LocalAuthMethods = spf, dkim, dmarc
 # apply daemon-wide: there is one seal key, so per-listener sealing identities
 # are not supported.
 
+# Both sockets are loopback. "inbound" and "relay" describe the mail, not the
+# connection: the client is always the local Postfix. The milter protocol has no
+# authentication, so reachability is authorization -- anything that can open the
+# verify port dictates the Authentication-Results this host stamps (finding X-1/M-1
+# without forging a header), and anything that can open the seal port gets an
+# unauthenticated ARC signing oracle for SealDomain below. Widen only if Postfix
+# genuinely runs on another machine, and then restrict it with pf.
+
 [listener:verify-inbound]
-Socket          = inet:8895@0.0.0.0
+Socket          = inet:8895@127.0.0.1
 Mode            = verify
 
 [listener:seal-relay]
-Socket          = inet:8896@0.0.0.0
+Socket          = inet:8896@127.0.0.1
 Mode            = seal

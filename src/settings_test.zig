@@ -41,6 +41,66 @@ test "parse config minimal" {
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.modes[0]);
 }
 
+// The implicit listener binds loopback, never 0.0.0.0.
+//
+// Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. On a seal listener a
+// reachable port is an unauthenticated signing oracle for the sealing domain; on a
+// verify listener it dictates the Authentication-Results this host stamps, which is
+// X-1/M-1 without needing to forge a header. The milter protocol authenticates
+// nobody, so reachability IS authorization.
+test "the implicit listener binds loopback, not every interface" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.modes);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+    try std.testing.expectEqual(@as(usize, 1), arc_cfg.listen_addresses.len);
+    switch (arc_cfg.listen_addresses[0]) {
+        .tcp => |tcp| {
+            try std.testing.expectEqualStrings("127.0.0.1", tcp.host);
+            try std.testing.expectEqual(@as(u16, 8895), tcp.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// A safe default, not a policy override: an operator whose Postfix lives in another
+// jail must still be able to ask for a routable socket. `parse config minimal`
+// above already uses 0.0.0.0 explicitly, so that path stays covered too.
+test "an explicit 0.0.0.0 socket is still honoured" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:wide]
+        \\Socket = inet:8895@0.0.0.0
+        \\Mode = verify
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(arc_cfg.listen_addresses);
+    defer std.testing.allocator.free(arc_cfg.modes);
+    defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+    defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+    switch (arc_cfg.listen_addresses[0]) {
+        .tcp => |tcp| try std.testing.expectEqualStrings("0.0.0.0", tcp.host),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "local auth methods default to none" {
     const ini_text =
         \\[global]

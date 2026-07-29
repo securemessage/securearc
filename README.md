@@ -49,11 +49,11 @@ PidFile         = /var/run/securearc/securearc.pid
 DnsNameserver   = 127.0.0.1
 
 [listener:verify-inbound]
-Socket          = inet:8895@0.0.0.0
+Socket          = inet:8895@127.0.0.1
 Mode            = verify
 
 [listener:seal-relay]
-Socket          = inet:8896@0.0.0.0
+Socket          = inet:8896@127.0.0.1
 Mode            = seal
 SealDomain      = example.com
 SealSelector    = arc2026

@@ -180,8 +180,18 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         }
     }
 
+    // Loopback, NOT 0.0.0.0. The milter protocol has no authentication of any
+    // kind, so whoever reaches this socket is trusted completely: on a verify
+    // listener they dictate the Authentication-Results this host will stamp, which
+    // is finding X-1/M-1 handed over directly, and on a seal listener they get an
+    // unauthenticated signing oracle for the sealing domain. Postfix is the only
+    // thing that should ever connect, and it is local.
+    //
+    // Binding wide has to be a decision the operator writes down, not what happens
+    // when they write nothing. A-2 was re-rated High for exactly this class of
+    // mistake -- a securedkim instance had its public inbound socket in sign mode.
     if (addrs.items.len == 0) {
-        try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8895 } });
+        try addrs.append(allocator, .{ .tcp = .{ .host = "127.0.0.1", .port = 8895 } });
         try modes.append(allocator, default_mode);
     }
 

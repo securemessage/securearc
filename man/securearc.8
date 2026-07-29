@@ -316,8 +316,27 @@ listener alone: there is one seal key.
 Per-listener sealing identities are not supported.
 .Pp
 If no listener sections are defined, the default is
-.Dq inet:8895@0.0.0.0
-in verify mode.
+.Dq inet:8895@127.0.0.1
+in verify mode, loopback only.
+.Pp
+The milter protocol carries no authentication, so any client that can reach a
+listener is trusted completely.
+On a
+.Cm seal
+listener this is an unauthenticated sealing oracle: the caller obtains an ARC set
+signed under
+.Cm SealDomain
+and
+.Cm SealSelector .
+On a
+.Cm verify
+listener the caller dictates the
+.Va Authentication-Results
+field this host records, which a subsequent seal then vouches for.
+Only the local MTA should ever connect.
+Bind a routable address only when the MTA runs on a different machine, and
+restrict access to it with
+.Xr pf 4 .
 .Sh SIGNALS
 .Bl -tag -width "SIGTERM" -compact
 .It Dv SIGHUP
