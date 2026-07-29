@@ -248,14 +248,27 @@ fn verifyAms(
         return classifyDataError(err);
     defer allocator.free(key_der);
 
+    // The AMS has the same syntax and semantics as a DKIM-Signature (RFC 8617
+    // §4.1.2), so its c= tag governs both halves of canonicalization and an
+    // absent c= means simple/simple (RFC 6376 §3.5) -- not relaxed/relaxed.
+    //
+    // A c= this daemon cannot parse names an algorithm it cannot perform, so the
+    // signature cannot be checked and cannot be honoured. That is a property of
+    // the signature rather than of this host, so it is the signer's failure and
+    // `fail` is the honest verdict -- not `internal_error`, which A-12 reserves
+    // for our own faults, and not a silent guess at relaxed/relaxed, which used
+    // to compute a hash against an algorithm the signer never used (audit A-5).
+    const canon_pair = canon.parseCanonicalization(set.ams_canonicalization) catch {
+        reason.* = "AMS c= names an unknown canonicalization";
+        return .fail;
+    };
+
     // Build signing input: canonicalize headers per h= tag + AMS header with empty b=
-    const signing_input = buildAmsSigningInput(allocator, set, all_headers) catch |err|
+    const signing_input = buildAmsSigningInput(allocator, set, all_headers, canon_pair.header) catch |err|
         return classifyDataError(err);
     defer allocator.free(signing_input);
 
     // Canonicalize body and compute SHA-256 hash, then compare against claimed bh=
-    const canon_pair = canon.parseCanonicalization(set.ams_canonicalization) catch
-        canon.CanonicalizationPair{ .header = .relaxed, .body = .relaxed };
     var body_canon = canon.BodyCanonicalizer.init(allocator, canon_pair.body);
     defer body_canon.deinit();
     // Canonicalizing our own accumulated body can only fail on allocation.
@@ -292,12 +305,20 @@ fn verifyAms(
 }
 
 /// Build the signing input for AMS verification.
-/// Canonicalizes headers listed in h= tag (relaxed), then appends the AMS
-/// header itself with the b= value removed (same as DKIM signing input).
+///
+/// Canonicalizes the headers listed in the h= tag under `header_canon` -- which
+/// comes from the AMS's own c= tag, not a fixed choice -- then appends the AMS
+/// header itself with the b= value removed, under the same algorithm.
+///
+/// `header_canon` is a parameter rather than read from `set` here so that the
+/// one place that interprets c= is the caller, next to where the body half of
+/// the same tag is applied. Splitting the two halves across two functions is how
+/// they came to disagree in the first place (audit A-5).
 fn buildAmsSigningInput(
     allocator: Allocator,
     set: *const arc.ArcSet,
     all_headers: []const arc.Header,
+    header_canon: canon.Algorithm,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -311,7 +332,7 @@ fn buildAmsSigningInput(
     while (walk.next()) |hdr| {
         const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value });
         defer allocator.free(full);
-        const canonicalized = try canon.canonicalizeHeader(allocator, .relaxed, full);
+        const canonicalized = try canon.canonicalizeHeader(allocator, header_canon, full);
         defer allocator.free(canonicalized);
         try buf.appendSlice(allocator, canonicalized);
         try buf.appendSlice(allocator, "\r\n");
@@ -326,7 +347,9 @@ fn buildAmsSigningInput(
     const stripped = stripBValue(allocator, ams_full) catch ams_full;
     defer if (stripped.ptr != ams_full.ptr) allocator.free(stripped);
 
-    const canon_ams = canon.canonicalizeHeader(allocator, .relaxed, stripped) catch
+    // The AMS header field is itself one of the fields the signature covers, so
+    // it takes the same canonicalization as the rest of them (audit A-5).
+    const canon_ams = canon.canonicalizeHeader(allocator, header_canon, stripped) catch
         return error.OutOfMemory;
     defer allocator.free(canon_ams);
     try buf.appendSlice(allocator, canon_ams);
@@ -459,6 +482,13 @@ fn verifySeal(
 /// Order: for each instance 1..i, canonicalize AAR, AMS, AS headers.
 /// For the current instance (last in prior_sets), include AAR + AMS but NOT AS
 /// (the seal signs over everything except itself).
+///
+/// **Always relaxed here, and deliberately so.** The seal is not DKIM-like in
+/// this respect: RFC 8617 §4.1.3 says that for the ARC-Seal "only 'relaxed'
+/// header field canonicalization is used", and the AS carries no c= tag to say
+/// otherwise. So the fixed algorithm below is correct, unlike the fixed
+/// algorithm the AMS path used to have, which A-5 removed. Do not make this
+/// configurable to match the AMS.
 fn buildSealSigningInput(
     allocator: Allocator,
     set: *const arc.ArcSet,
@@ -572,6 +602,11 @@ test "validateChain cv=pass required for i>1" {
 
 /// An ArcSet carrying only what `buildAmsSigningInput` reads.
 fn amsSetWithSignedHeaders(h: []const u8) arc.ArcSet {
+    return amsSetWith(h, "relaxed/relaxed");
+}
+
+/// As above, with an explicit c= value.
+fn amsSetWith(h: []const u8, c: []const u8) arc.ArcSet {
     return .{
         .instance = 1,
         .aar_value = "i=1; test",
@@ -587,7 +622,7 @@ fn amsSetWithSignedHeaders(h: []const u8) arc.ArcSet {
         .ams_selector = "s1",
         .ams_signature = "x",
         .ams_body_hash = "y",
-        .ams_canonicalization = "relaxed/relaxed",
+        .ams_canonicalization = c,
         .ams_signed_headers = h,
     };
 }
@@ -603,7 +638,7 @@ test "AMS h= repeated: successive instances bottom upward, not the same one twic
         .{ .name = "From", .value = "bottom@example.com" },
     };
 
-    const input = try buildAmsSigningInput(allocator, &set, &headers);
+    const input = try buildAmsSigningInput(allocator, &set, &headers, .relaxed);
     defer allocator.free(input);
 
     try std.testing.expectEqualStrings(
@@ -624,12 +659,82 @@ test "AMS h= oversigned: the surplus mention contributes nothing" {
         .{ .name = "From", .value = "only@example.com" },
     };
 
-    const input = try buildAmsSigningInput(allocator, &set, &headers);
+    const input = try buildAmsSigningInput(allocator, &set, &headers, .relaxed);
     defer allocator.free(input);
 
     try std.testing.expectEqualStrings(
         "from:only@example.com\r\narc-message-signature:i=1; h=x; b=",
         input,
+    );
+}
+
+// --- A-5: the AMS c= tag governs header canonicalization -----------------------
+
+test "simple header canonicalization is preserved exactly, not lowercased" {
+    // The whole difference: relaxed lowercases the field name and strips the
+    // space after the colon, simple changes nothing at all (RFC 6376 §3.4.1).
+    // Forcing relaxed on a signature that said simple hashes bytes the signer
+    // never hashed, so a legitimate AMS could not verify (audit A-5).
+    const allocator = std.testing.allocator;
+    const set = amsSetWith("from", "simple/simple");
+    const headers = [_]arc.Header{
+        .{ .name = "From", .value = "User@Example.COM" },
+    };
+
+    const input = try buildAmsSigningInput(allocator, &set, &headers, .simple);
+    defer allocator.free(input);
+
+    // Field name case kept, single space after the colon kept, and the AMS
+    // header itself takes the same treatment rather than being relaxed.
+    try std.testing.expectEqualStrings(
+        "From: User@Example.COM\r\nARC-Message-Signature: i=1; h=x; b=",
+        input,
+    );
+}
+
+test "relaxed and simple produce different bytes for the same message" {
+    // Guards against the two algorithms being wired to the same implementation:
+    // if these ever match, honouring c= has stopped meaning anything.
+    const allocator = std.testing.allocator;
+    const set = amsSetWith("from", "simple/simple");
+    const headers = [_]arc.Header{
+        .{ .name = "From", .value = "User@Example.COM" },
+    };
+
+    const as_simple = try buildAmsSigningInput(allocator, &set, &headers, .simple);
+    defer allocator.free(as_simple);
+    const as_relaxed = try buildAmsSigningInput(allocator, &set, &headers, .relaxed);
+    defer allocator.free(as_relaxed);
+
+    try std.testing.expect(!std.mem.eql(u8, as_simple, as_relaxed));
+}
+
+test "an absent c= means simple/simple, not relaxed/relaxed" {
+    // RFC 6376 §3.5: c= defaults to simple/simple. A sealer that omits the tag
+    // entirely is legal and common, and used to false-fail here because the body
+    // half honoured the default while the header half was forced to relaxed.
+    const pair = try canon.parseCanonicalization("");
+    try std.testing.expectEqual(canon.Algorithm.simple, pair.header);
+    try std.testing.expectEqual(canon.Algorithm.simple, pair.body);
+}
+
+test "a c= naming only the header algorithm leaves the body simple" {
+    const pair = try canon.parseCanonicalization("relaxed");
+    try std.testing.expectEqual(canon.Algorithm.relaxed, pair.header);
+    try std.testing.expectEqual(canon.Algorithm.simple, pair.body);
+}
+
+test "an unparseable c= is the signer's failure, not ours" {
+    // It names an algorithm this daemon cannot perform, so the signature cannot
+    // be checked. Guessing relaxed/relaxed and hashing against an algorithm the
+    // signer never used is what A-5 removed.
+    try std.testing.expectError(
+        error.InvalidCanonicalization,
+        canon.parseCanonicalization("relaxed/wobbly"),
+    );
+    try std.testing.expectError(
+        error.InvalidCanonicalization,
+        canon.parseCanonicalization("wobbly"),
     );
 }
 
