@@ -9,6 +9,7 @@ const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
 const header_select = securemilter_crypto.header_select;
+const sig_header = securemilter_crypto.sig_header;
 
 const arc = @import("arc.zig");
 
@@ -343,9 +344,13 @@ fn buildAmsSigningInput(
         return error.OutOfMemory;
     defer allocator.free(ams_full);
 
-    // Remove the b= value: replace "b=<sig>" with "b="
-    const stripped = stripBValue(allocator, ams_full) catch ams_full;
-    defer if (stripped.ptr != ams_full.ptr) allocator.free(stripped);
+    // Remove the b= value: replace "b=<sig>" with "b=". Allocation failure used
+    // to fall through to the header WITH its signature still in it, which does
+    // not fail -- it hashes different bytes, so a good signature reads as bad and
+    // the chain is sealed cv=fail, which RFC 8617 §5.1.2 makes permanent for the
+    // life of the message. Same class as X-10.
+    const stripped = try sig_header.emptyBValue(allocator, ams_full);
+    defer allocator.free(stripped);
 
     // The AMS header field is itself one of the fields the signature covers, so
     // it takes the same canonicalization as the rest of them (audit A-5).
@@ -355,50 +360,6 @@ fn buildAmsSigningInput(
     try buf.appendSlice(allocator, canon_ams);
 
     return buf.toOwnedSlice(allocator);
-}
-
-/// Strip the b= tag value from a DKIM/AMS header (set to empty for signing input).
-/// Correctly distinguishes "b=" from "bh=" even when whitespace/folding separates
-/// the preceding delimiter from the tag name.
-fn stripBValue(allocator: Allocator, header: []const u8) ![]u8 {
-    // Find "b=" that isn't "bh="
-    var i: usize = 0;
-    while (i < header.len) {
-        if (header[i] == 'b' and i + 1 < header.len and header[i + 1] == '=') {
-            // Look backward past any WSP/CRLF to find the real preceding non-WSP char.
-            // If that char is 'h', this is "bh=" not "b=".
-            var j: usize = i;
-            while (j > 0) {
-                j -= 1;
-                if (header[j] != ' ' and header[j] != '\t' and header[j] != '\r' and header[j] != '\n') {
-                    break;
-                }
-            }
-            // If preceding non-WSP is a letter (not ';' or ':'), this b is part of a larger tag name
-            if (j < i and j > 0 and header[j] >= 'a' and header[j] <= 'z') {
-                i += 1;
-                continue;
-            }
-            if (j < i and j > 0 and header[j] >= 'A' and header[j] <= 'Z') {
-                i += 1;
-                continue;
-            }
-
-            // Found standalone "b=" — strip everything after = until next ;
-            const val_start = i + 2;
-            const semi = mem.indexOfScalar(u8, header[val_start..], ';');
-            const val_end = if (semi) |s| val_start + s else header.len;
-
-            var result: std.ArrayListUnmanaged(u8) = .{};
-            try result.appendSlice(allocator, header[0..val_start]);
-            if (val_end < header.len) {
-                try result.appendSlice(allocator, header[val_end..]);
-            }
-            return result.toOwnedSlice(allocator);
-        }
-        i += 1;
-    }
-    return allocator.dupe(u8, header);
 }
 
 /// Verify an ARC-Seal signature.
@@ -512,8 +473,8 @@ fn buildSealSigningInput(
     // Append AS header with empty b= (self-referencing)
     const as_full = try std.fmt.allocPrint(allocator, "ARC-Seal: {s}", .{set.as_value});
     defer allocator.free(as_full);
-    const stripped = stripBValue(allocator, as_full) catch as_full;
-    defer if (stripped.ptr != as_full.ptr) allocator.free(stripped);
+    const stripped = try sig_header.emptyBValue(allocator, as_full);
+    defer allocator.free(stripped);
 
     const canon_as = try canon.canonicalizeHeader(allocator, .relaxed, stripped);
     defer allocator.free(canon_as);
