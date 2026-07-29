@@ -133,6 +133,18 @@ fn parseMessage(allocator: Allocator, raw: []const u8) !Message {
 /// A field with no colon is skipped rather than guessed at: it is not a header
 /// field, and inventing a name for it would put a fabricated entry into the list
 /// the signature covers.
+///
+/// **The space after the colon is dropped, on purpose.** A milter receives header
+/// values from the MTA with leading whitespace already removed unless it
+/// negotiates `SMFIP_HDR_LEADSPC`, which no daemon in this suite does — see the
+/// sendmail `xxfi_header` documentation, and `ProtocolFlags.header_leading_space`
+/// in `securemilter-lib`, which is defined and never requested. Keeping the space
+/// here would hand the verifier a byte sequence production never produces, and
+/// `simple` header canonicalization — which hashes the field verbatim — would
+/// disagree for every case.
+///
+/// Continuation lines keep their own leading whitespace, which is also what the
+/// MTA delivers.
 fn appendField(
     a: Allocator,
     headers: *std.ArrayListUnmanaged(arc.Header),
@@ -141,9 +153,11 @@ fn appendField(
     const field = mem.trimRight(u8, field_raw, "\r\n");
     if (field.len == 0) return;
     const colon = mem.indexOfScalar(u8, field, ':') orelse return;
+    var value = field[colon + 1 ..];
+    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
     try headers.append(a, .{
         .name = field[0..colon],
-        .value = field[colon + 1 ..],
+        .value = value,
     });
 }
 

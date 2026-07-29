@@ -210,6 +210,26 @@ fn verifyAms(
     min_key_bits: u32,
     reason: *?[]const u8,
 ) CheckOutcome {
+    // RFC 6376 §3.5 makes a= REQUIRED, and this daemon implements exactly one
+    // algorithm, so anything else names something it cannot compute. Checked
+    // before the DNS lookup so a signature we could never verify does not cost a
+    // query -- and reported as `fail`, not `internal_error`, because the
+    // unsupported algorithm is the signer's choice and not our fault (A-12a).
+    if (!isSupportedAlgorithm(set.ams_algorithm)) {
+        reason.* = if (set.ams_algorithm.len == 0)
+            "AMS has no a= algorithm tag"
+        else
+            "AMS a= names an unsupported algorithm";
+        return .fail;
+    }
+
+    // RFC 8617 §4.1.2 forbids an AMS from covering ARC header fields. Only
+    // ARC-Seal is enforced -- see `signsArcSeal` for why the other two are not.
+    if (signsArcSeal(set.ams_signed_headers)) {
+        reason.* = "AMS h= covers ARC-Seal";
+        return .fail;
+    }
+
     // Fetch public key from DNS
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
         set.ams_selector,
@@ -376,6 +396,16 @@ fn verifySeal(
     min_key_bits: u32,
     reason: *?[]const u8,
 ) CheckOutcome {
+    // Same requirement as the AMS: RFC 8617 §4.1.3 gives the AS a DKIM-style a=
+    // tag, and an algorithm this daemon does not implement cannot be checked.
+    if (!isSupportedAlgorithm(set.seal_algorithm)) {
+        reason.* = if (set.seal_algorithm.len == 0)
+            "ARC-Seal has no a= algorithm tag"
+        else
+            "ARC-Seal a= names an unsupported algorithm";
+        return .fail;
+    }
+
     // Fetch public key
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
         set.seal_selector,
@@ -496,6 +526,52 @@ fn appendCanonHeader(
     defer allocator.free(canonicalized);
     try buf.appendSlice(allocator, canonicalized);
     try buf.appendSlice(allocator, "\r\n");
+}
+
+/// Is `a=` an algorithm this daemon can actually verify?
+///
+/// Exactly `rsa-sha256`. The verification path is `loadRsaPublicKeyDer` plus
+/// `rsaVerify` over a SHA-256 digest, so RSA-SHA256 is the only thing it can
+/// compute -- there is no Ed25519 path here to fall through to. `rsa-sha1` is
+/// deliberately absent even though RFC 6376 §3.5 lists it: RFC 8301 §3.1 says
+/// signers must not use it and verifiers must treat it as a failure.
+///
+/// Compared case sensitively, because RFC 6376 §3.2 says "Values MUST be
+/// processed as case sensitive unless the specific tag description of semantics
+/// specifies otherwise", and §3.5's a= description says no such thing.
+fn isSupportedAlgorithm(a: []const u8) bool {
+    return mem.eql(u8, a, "rsa-sha256");
+}
+
+/// Does an AMS `h=` list cover ARC-Seal?
+///
+/// RFC 8617 §4.1.2 names all three ARC header fields as MUST NOT appear in an
+/// AMS's covered-header list. **Only ARC-Seal is enforced here.** That paragraph
+/// sits under "To reduce the chances of accidental invalidation of AMS
+/// signatures", beside a SHOULD about attachment order, so it reads as guidance
+/// to a *signer*; the normative validator algorithm is §5.2 and none of its steps
+/// rejects a chain over the contents of `h=`.
+///
+/// The boundary was settled by measurement rather than by choosing a reading.
+/// Enforcing all three took the ValiMail suite from 162/171 to **118/171**: the
+/// suite's own base messages sign `arc-authentication-results` and expect `pass`,
+/// so signing the AAR is normal practice and refusing it fails ordinary mail.
+/// Enforcing ARC-Message-Signature as well still failed `ams_fields_h_includes_ams`,
+/// which also expects `pass`. Only `ams_fields_h_includes_as` expects `fail`.
+///
+/// The asymmetry is not arbitrary. The AS is the one ARC field written *after*
+/// the AMS in the same set, so an AMS covering ARC-Seal either reaches forward to
+/// a field that did not exist when it was computed, or -- for i>1 -- pins a prior
+/// hop's seal into this hop's message signature. Neither is reproducible by a
+/// verifier rebuilding the signing input. Covering an earlier AMS or AAR is
+/// merely inadvisable, and implementations accept it.
+fn signsArcSeal(h_list: []const u8) bool {
+    var it = mem.splitScalar(u8, h_list, ':');
+    while (it.next()) |raw| {
+        const name = mem.trim(u8, raw, &std.ascii.whitespace);
+        if (arc.eqlLower(name, "ARC-Seal")) return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -766,4 +842,50 @@ test "validateChain reports unknown/dns_temp_error when the key lookup fails tra
     // check it. The caller decides what to do about that.
     try std.testing.expectEqual(arc.ChainValidation.unknown, result.status);
     try std.testing.expect(result.failure_reason != null);
+}
+
+// --- ValiMail conformance: a= validation and the AMS h= rule ------------------
+
+test "isSupportedAlgorithm accepts only rsa-sha256" {
+    try std.testing.expect(isSupportedAlgorithm("rsa-sha256"));
+
+    // An absent a= and an unrecognised one are both unusable: the verifier can
+    // only compute RSA over SHA-256, so anything else names an algorithm it
+    // cannot perform. Previously neither was checked and the signature was
+    // verified as though it had said rsa-sha256 -- so a signature claiming
+    // `a=rsa-poptart` was honoured. Suite cases: ams_fields_a_empty,
+    // ams_fields_a_unknown, as_fields_a_empty, as_fields_a_unknown.
+    try std.testing.expect(!isSupportedAlgorithm(""));
+    try std.testing.expect(!isSupportedAlgorithm("rsa-poptart"));
+    try std.testing.expect(!isSupportedAlgorithm("rsa-sha42"));
+    try std.testing.expect(!isSupportedAlgorithm("ed25519-sha256"));
+
+    // RFC 8301 3.1: signers MUST NOT use rsa-sha1 and verifiers MUST treat it as
+    // a failure, even though RFC 6376 3.5 still lists it.
+    try std.testing.expect(!isSupportedAlgorithm("rsa-sha1"));
+
+    // Case sensitive, per RFC 6376 3.2 on tag values.
+    try std.testing.expect(!isSupportedAlgorithm("RSA-SHA256"));
+    try std.testing.expect(!isSupportedAlgorithm("rsa-SHA256"));
+}
+
+test "AMS h= may cover AAR and AMS but not ARC-Seal" {
+    // Only ARC-Seal is refused. The other two are accepted deliberately: the
+    // suite's own base messages sign arc-authentication-results and expect pass,
+    // and ams_fields_h_includes_ams expects pass as well. Enforcing the whole of
+    // RFC 8617 4.1.2 as a verifier rule scored 118/171.
+    try std.testing.expect(!signsArcSeal("from:to:date:subject:mime-version"));
+    try std.testing.expect(!signsArcSeal("from:to:arc-authentication-results"));
+    try std.testing.expect(!signsArcSeal("from:arc-message-signature"));
+
+    // ams_fields_h_includes_as expects fail.
+    try std.testing.expect(signsArcSeal("from:to:arc-seal"));
+    // Header field names are case insensitive (RFC 5322), unlike tag names.
+    try std.testing.expect(signsArcSeal("from:ARC-Seal"));
+    try std.testing.expect(signsArcSeal("ARC-SEAL"));
+    // Whitespace around a name in the list is permitted by RFC 6376 3.5's h=.
+    try std.testing.expect(signsArcSeal("from : arc-seal : to"));
+
+    // A name that merely starts the same must not match.
+    try std.testing.expect(!signsArcSeal("from:arc-sealed-with-a-kiss"));
 }

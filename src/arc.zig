@@ -2,6 +2,9 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const securemilter_crypto = @import("securemilter_crypto");
+const sig_header = securemilter_crypto.sig_header;
+
 /// Maximum ARC chain length per RFC 8617 §5.1.1
 pub const MAX_INSTANCES: u8 = 50;
 
@@ -82,6 +85,10 @@ pub const ChainError = error{
     IncompleteSet,
     /// An ARC header whose i= tag is absent, zero or unparseable.
     MalformedInstance,
+    /// An AMS or AS whose tag list violates RFC 6376 §3.2 -- a tag name that is
+    /// not `ALPHA *ALNUMPUNC`, a duplicated tag name, an interior empty
+    /// tag-spec, or a spec with no `=`.
+    MalformedTagList,
 };
 
 /// Human-readable reason for an A-R header.
@@ -92,6 +99,7 @@ pub fn describeChainError(err: anyerror) []const u8 {
         error.ChainTooLong => "broken ARC chain: too many instances",
         error.IncompleteSet => "broken ARC chain: incomplete instance",
         error.MalformedInstance => "broken ARC chain: malformed i= tag",
+        error.MalformedTagList => "broken ARC chain: malformed tag list",
         else => "broken ARC chain",
     };
 }
@@ -150,12 +158,24 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
 
         var set = &sets[idx].?;
         switch (htype) {
+            // The AAR is NOT validated as a tag list. Its ABNF is
+            // `instance [CFWS] ";" authserv-id ... resinfo` (RFC 8617 §4.1.1) --
+            // an Authentication-Results field behind an i= tag, not a
+            // `tag=value` list -- so RFC 6376 §3.2 does not apply to it and
+            // applying it anyway would reject every real chain.
             .aar => set.aar_value = hdr.value,
             .ams => {
+                // RFC 8617 §4.1.2: the AMS "has the same syntax and semantics as
+                // the DKIM-Signature field", so its tag list must satisfy
+                // RFC 6376 §3.2. A list that does not is a broken chain rather
+                // than an absent one, the same reasoning as a missing instance.
+                sig_header.validateTagList(hdr.value) catch return error.MalformedTagList;
                 set.ams_value = hdr.value;
                 parseAmsTags(set, hdr.value);
             },
             .as => {
+                // RFC 8617 §4.1.3 gives the AS the same tag-list syntax.
+                sig_header.validateTagList(hdr.value) catch return error.MalformedTagList;
                 set.as_value = hdr.value;
                 parseSealTags(set, hdr.value);
             },
@@ -241,6 +261,18 @@ fn stripFws(value: []const u8) []const u8 {
 
 /// Find a tag value by name in a semicolon-separated tag-list.
 /// Handles "tag=value" pairs separated by ';', with optional whitespace.
+///
+/// **Tag names are matched case sensitively.** RFC 6376 §3.2: "Tags MUST be
+/// interpreted in a case-sensitive manner." This differs from DMARC, whose
+/// RFC 9989 §4.7 tag names are case *insensitive*, so the two must not share a
+/// tag scanner.
+///
+/// The difference is load-bearing rather than pedantic. Matching case
+/// insensitively made `S=dummy` satisfy a lookup for `s`, so an ARC-Seal whose
+/// selector tag was mis-cased was read as carrying a selector and went on to
+/// verify — where the RFC has no `s=` tag at all and the seal cannot be checked.
+/// Applies equally to the `p=` lookup in a DKIM key record, which is the same
+/// kind of tag list.
 pub fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
     var rest = header_value;
     while (rest.len > 0) {
@@ -258,7 +290,7 @@ pub fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
         const value_end = if (semi_pos) |sp| value_start + sp else rest.len;
         const value = mem.trim(u8, rest[value_start..value_end], &std.ascii.whitespace);
 
-        if (eqlLower(name, tag_name)) {
+        if (mem.eql(u8, name, tag_name)) {
             return value;
         }
 
@@ -415,4 +447,82 @@ test "parseArcSets empty" {
     defer std.testing.allocator.free(sets);
 
     try std.testing.expectEqual(@as(usize, 0), sets.len);
+}
+
+test "findTag matches tag names case sensitively (RFC 6376 3.2)" {
+    // "Tags MUST be interpreted in a case-sensitive manner." A mis-cased tag is
+    // a DIFFERENT tag, not the same one written oddly, so the tag it was meant
+    // to be is absent.
+    const mis_cased = "i=1; cv=none; a=rsa-sha256; d=example.org; S=dummy; t=12345";
+    try std.testing.expect(findTag(mis_cased, "s") == null);
+    try std.testing.expectEqualStrings("dummy", findTag(mis_cased, "S").?);
+
+    // While this matched case insensitively, an ARC-Seal carrying `S=` was read
+    // as having a selector and went on to verify against a key it named by
+    // accident. The suite case is `as_format_tags_key_case`.
+    const correct = "i=1; cv=none; a=rsa-sha256; d=example.org; s=dummy";
+    try std.testing.expectEqualStrings("dummy", findTag(correct, "s").?);
+}
+
+test "parseArcSets rejects tag lists RFC 6376 3.2 forbids" {
+    const a = std.testing.allocator;
+    const good_ams = "i=1; a=rsa-sha256; c=relaxed/relaxed; d=e.org; s=d; bh=x; b=y; h=from";
+
+    // A duplicated tag anywhere in the set breaks the chain, rather than the set
+    // being silently accepted with one of the two values winning.
+    {
+        const headers = [_]Header{
+            .{ .name = "ARC-Authentication-Results", .value = "i=1; e.org; spf=pass" },
+            .{ .name = "ARC-Message-Signature", .value = good_ams },
+            .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=e.org; s=d; s=d; b=y" },
+        };
+        try std.testing.expectError(error.MalformedTagList, parseArcSets(a, &headers));
+    }
+
+    // A tag name that is not ALPHA *ALNUMPUNC.
+    {
+        const headers = [_]Header{
+            .{ .name = "ARC-Authentication-Results", .value = "i=1; e.org; spf=pass" },
+            .{ .name = "ARC-Message-Signature", .value = good_ams },
+            .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=e.org; s=d; _=; b=y" },
+        };
+        try std.testing.expectError(error.MalformedTagList, parseArcSets(a, &headers));
+    }
+
+    // An interior empty tag-spec.
+    {
+        const headers = [_]Header{
+            .{ .name = "ARC-Authentication-Results", .value = "i=1; e.org; spf=pass" },
+            .{ .name = "ARC-Message-Signature", .value = good_ams },
+            .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=e.org; s=d;; b=y" },
+        };
+        try std.testing.expectError(error.MalformedTagList, parseArcSets(a, &headers));
+    }
+
+    // A trailing ";" is explicitly allowed by the ABNF and must NOT break it --
+    // the suite case is `as_format_tags_trail_sc`, which expects pass.
+    {
+        const headers = [_]Header{
+            .{ .name = "ARC-Authentication-Results", .value = "i=1; e.org; spf=pass" },
+            .{ .name = "ARC-Message-Signature", .value = good_ams },
+            .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=e.org; s=d; b=y;" },
+        };
+        const sets = try parseArcSets(a, &headers);
+        defer a.free(sets);
+        try std.testing.expectEqual(@as(usize, 1), sets.len);
+    }
+
+    // The AAR is not a tag list and must not be validated as one: its ABNF is an
+    // Authentication-Results field behind an i= tag. Checking it would reject
+    // every real chain.
+    {
+        const headers = [_]Header{
+            .{ .name = "ARC-Authentication-Results", .value = "i=1; e.org; spf=pass smtp.mailfrom=a@e.org; dkim=pass (1024-bit key) header.i=@e.org" },
+            .{ .name = "ARC-Message-Signature", .value = good_ams },
+            .{ .name = "ARC-Seal", .value = "i=1; cv=none; a=rsa-sha256; d=e.org; s=d; b=y" },
+        };
+        const sets = try parseArcSets(a, &headers);
+        defer a.free(sets);
+        try std.testing.expectEqual(@as(usize, 1), sets.len);
+    }
 }
