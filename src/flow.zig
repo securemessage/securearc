@@ -357,7 +357,14 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     defer conn.allocator.free(ams_sig_b64);
 
     // Final AMS header value: same pre-folded template + signature (folded base64)
-    const folded_ams_sig = foldBase64(conn.allocator, ams_sig_b64) catch ams_sig_b64;
+    //
+    // No `catch ams_sig_b64` fallback here. `foldBase64` now always allocates, so
+    // falling back to its input would alias a buffer this scope frees separately, and
+    // an unfoldable signature is an allocation failure like any other on this path
+    // (audit X-10).
+    const folded_ams_sig = foldBase64(conn.allocator, ams_sig_b64) catch
+        return sealInternalError("folding the AMS signature");
+    defer conn.allocator.free(folded_ams_sig);
     const ams_value = std.fmt.allocPrint(
         conn.allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
@@ -388,10 +395,17 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     defer conn.allocator.free(seal_sig_b64);
 
     // Final AS header value (pre-folded)
+    //
+    // Folded into a named binding rather than inline in the argument list, because
+    // inline it had nowhere to be freed and leaked on every sealed message (X-10).
+    const folded_seal_sig = foldBase64(conn.allocator, seal_sig_b64) catch
+        return sealInternalError("folding the ARC-Seal signature");
+    defer conn.allocator.free(folded_seal_sig);
+
     const as_value = std.fmt.allocPrint(
         conn.allocator,
         "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
-        .{ new_instance, cv.toString(), domain, selector, foldBase64(conn.allocator, seal_sig_b64) catch seal_sig_b64 },
+        .{ new_instance, cv.toString(), domain, selector, folded_seal_sig },
     ) catch return sealInternalError("formatting the ARC-Seal header");
     defer conn.allocator.free(as_value);
 

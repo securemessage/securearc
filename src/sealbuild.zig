@@ -161,11 +161,20 @@ pub fn resultsPart(header_value: []const u8) ?[]const u8 {
     return if (result.len == 0) null else result;
 }
 
-/// Fold a base64 string by inserting CRLF+TAB every 76 characters.
-/// Prevents Postfix from introducing mid-token folds at arbitrary positions.
+/// Fold a base64 string by inserting CRLF+TAB every 76 characters, so Postfix cannot
+/// introduce a mid-token fold at an arbitrary position.
+///
+/// Returns a NEW allocation the caller owns in every case.
+///
+/// It used to return `b64` itself when short enough to need no folding, so the result
+/// was sometimes borrowed and sometimes owned, with nothing in the type to say which.
+/// Both call sites did the only thing available to them and freed neither, which leaked
+/// a folded RSA signature on every sealed message (audit X-10). Duplicating the short
+/// case costs one copy of a value that is, by definition, at most 76 bytes, and makes
+/// `defer allocator.free(...)` correct unconditionally.
 pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
     const chunk_size = 76;
-    if (b64.len <= chunk_size) return b64;
+    if (b64.len <= chunk_size) return allocator.dupe(u8, b64);
 
     var result: std.ArrayListUnmanaged(u8) = .{};
     errdefer result.deinit(allocator);
