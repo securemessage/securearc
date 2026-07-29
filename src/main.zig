@@ -379,12 +379,14 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     // reload landed between them.
     const ctx = ChainCtx.current();
 
+    // `SealCtx.current` is only reached on a mode that seals, so a verify-only
+    // listener never acquires the signing key.
     const result = switch (mode) {
         .verify_only => doVerify(conn, ctx),
-        .seal_only => doSeal(conn, ctx),
+        .seal_only => doSeal(conn, SealCtx.current(ctx)),
         .both => blk: {
             _ = doVerify(conn, ctx);
-            break :blk doSeal(conn, ctx);
+            break :blk doSeal(conn, SealCtx.current(ctx));
         },
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
@@ -547,7 +549,53 @@ fn doVerify(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     return @intFromEnum(responses.Code.@"continue");
 }
 
-fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
+/// Everything sealing needs beyond chain validation: this ADMD's identity, the key,
+/// and the policy for a chain we could not evaluate.
+///
+/// Deliberately a second, larger struct rather than more fields on `ChainCtx`.
+/// `doVerify` needs three values and `doSeal` needs ten, so one combined context
+/// would hand the verify path a signing key it has no business holding. Composing
+/// them keeps that separation while stating the real relationship: sealing
+/// *includes* validating, because a chain is evaluated before it is extended.
+///
+/// `current` returns null when this daemon is not configured to seal, which is the
+/// three separate guards `doSeal` used to open with, consolidated into the one place
+/// that can answer the question.
+const SealCtx = struct {
+    chain: ChainCtx,
+    domain: []const u8,
+    selector: []const u8,
+    /// Acquired once per message and used for both the AMS and the ARC-Seal.
+    ///
+    /// Holding it here is what makes "one key for the whole set" structural instead
+    /// of a comment: there is no cell to re-read halfway through, so a reload cannot
+    /// sign the two halves of one set with different keys. Pointer lifetime is
+    /// unchanged from the previous code, which held it across the same span.
+    sign_key: *const crypto.SigningKey,
+    signed_headers: []const u8,
+    authserv_id: []const u8,
+    local_auth_methods: []const []const u8,
+    on_dns_error: OnDnsError,
+
+    /// Snapshot the seal configuration, or null if sealing is not configured.
+    fn current(chain_ctx: ChainCtx) ?SealCtx {
+        return .{
+            .chain = chain_ctx,
+            .domain = g_seal_domain orelse return null,
+            .selector = g_seal_selector orelse return null,
+            .sign_key = g_seal_key.get() orelse return null,
+            .signed_headers = g_signed_headers,
+            .authserv_id = g_authserv_id,
+            .local_auth_methods = g_local_auth_methods,
+            .on_dns_error = g_on_dns_error,
+        };
+    }
+};
+
+/// `maybe_ctx` is optional rather than the caller skipping the call, so the
+/// truncation warning below still happens on a listener that is not configured to
+/// seal — which is the order the guards ran in before.
+fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     // A seal is an attestation over content. Sealing a copy we know to be
     // incomplete would hand the next hop a chain that cannot validate and name
     // this ADMD as the one that broke it (audit X-4). Pass through unsealed.
@@ -560,13 +608,16 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
         return @intFromEnum(responses.Code.@"continue");
     }
 
-    const domain = g_seal_domain orelse return @intFromEnum(responses.Code.@"continue");
-    const selector = g_seal_selector orelse return @intFromEnum(responses.Code.@"continue");
+    // Not configured to seal: pass the message through untouched. Was three
+    // separate guards on domain, selector and key; `SealCtx.current` returns null
+    // for exactly those three reasons.
+    const ctx = maybe_ctx orelse return @intFromEnum(responses.Code.@"continue");
 
-    // One key for the whole set. Acquired once here and used for both the AMS
-    // and the AS below: a reload landing between the two signatures must not
-    // be able to sign the halves of one ARC set with different keys.
-    const sign_key = g_seal_key.get() orelse return @intFromEnum(responses.Code.@"continue");
+    // Bound to the names the rest of this function already used, so moving the
+    // source of these values does not touch the signing code below.
+    const domain = ctx.domain;
+    const selector = ctx.selector;
+    const sign_key = ctx.sign_key;
 
     // Determine instance number: count existing ARC sets + 1
     var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
@@ -597,7 +648,7 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     // §5.1.2, and indistinguishable to every later hop from a forged signature.
     const cv: arc.ChainValidation = if (sets.len == 0) .none else blk: {
         const body_data = conn.getBody() orelse break :blk arc.ChainValidation.fail;
-        const vr = ctx.validate(conn.allocator, sets, arc_headers.items, body_data);
+        const vr = ctx.chain.validate(conn.allocator, sets, arc_headers.items, body_data);
         switch (vr.evaluation) {
             .complete => break :blk vr.status,
             .internal_error => {
@@ -606,7 +657,7 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
                 log.err("not sealing: internal error validating the chain: {s}", .{vr.failure_reason orelse "unknown"});
                 return @intFromEnum(responses.Code.tempfail);
             },
-            .dns_temp_error => switch (g_on_dns_error) {
+            .dns_temp_error => switch (ctx.on_dns_error) {
                 .tempfail => {
                     // ASCII only: syslog rendered an em dash here as escaped
                     // bytes, which is noise in the one log line an operator
@@ -649,7 +700,7 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     // the next hop reads it as a broken chain and makes that permanent (X-8).
 
     // Build AAR content from the results this ADMD produced
-    const ar_content = buildAarContent(conn, g_authserv_id, g_local_auth_methods) orelse
+    const ar_content = buildAarContent(conn, ctx.authserv_id, ctx.local_auth_methods) orelse
         return sealInternalError("building the ARC-Authentication-Results content");
     defer conn.allocator.free(ar_content);
 
@@ -678,14 +729,14 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     const ams_template = std.fmt.allocPrint(
         conn.allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
-        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64 },
+        .{ new_instance, domain, selector, ctx.signed_headers, body_hash_b64 },
     ) catch return sealInternalError("formatting the AMS template");
     defer conn.allocator.free(ams_template);
 
     // Canonicalize selected headers for AMS signing input
     var ams_input: std.ArrayListUnmanaged(u8) = .{};
     defer ams_input.deinit(conn.allocator);
-    buildSigningHeaders(conn, &ams_input, g_signed_headers) catch return sealInternalError("canonicalizing the signed headers");
+    buildSigningHeaders(conn, &ams_input, ctx.signed_headers) catch return sealInternalError("canonicalizing the signed headers");
 
     // Append AMS header template (with empty b=) as final line (no trailing CRLF)
     const ams_full_template = std.fmt.allocPrint(conn.allocator, "ARC-Message-Signature: {s}", .{ams_template}) catch
@@ -710,7 +761,7 @@ fn doSeal(conn: *connection_mod.Connection, ctx: ChainCtx) u8 {
     const ams_value = std.fmt.allocPrint(
         conn.allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
-        .{ new_instance, domain, selector, g_signed_headers, body_hash_b64, folded_ams_sig },
+        .{ new_instance, domain, selector, ctx.signed_headers, body_hash_b64, folded_ams_sig },
     ) catch return sealInternalError("formatting the AMS header");
     defer conn.allocator.free(ams_value);
 

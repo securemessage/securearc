@@ -7,4 +7,4 @@
 # An empty list below means every file meets the goal.
 418 src/arc.zig
 769 src/chain.zig
-1012 src/main.zig
+1063 src/main.zig
