@@ -38,6 +38,16 @@ pub const seal = @import("seal.zig");
 pub const settings = @import("settings.zig");
 const settings_test = @import("settings_test.zig");
 
+/// Construction of the ARC set's header bytes. Aliased for the same reason as
+/// `settings` above: the move should not show up as a rename at every call site.
+pub const sealbuild = @import("sealbuild.zig");
+const sealbuild_test = @import("sealbuild_test.zig");
+
+const buildSigningHeaders = sealbuild.buildSigningHeaders;
+const buildSealInput = sealbuild.buildSealInput;
+const buildAarContent = sealbuild.buildAarContent;
+const foldBase64 = sealbuild.foldBase64;
+
 pub const Mode = settings.Mode;
 pub const OnDnsError = settings.OnDnsError;
 pub const ArcConfig = settings.ArcConfig;
@@ -600,7 +610,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     // the next hop reads it as a broken chain and makes that permanent (X-8).
 
     // Build AAR content from the results this ADMD produced
-    const ar_content = buildAarContent(conn) orelse
+    const ar_content = buildAarContent(conn, g_authserv_id, g_local_auth_methods) orelse
         return sealInternalError("building the ARC-Authentication-Results content");
     defer conn.allocator.free(ar_content);
 
@@ -636,7 +646,7 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     // Canonicalize selected headers for AMS signing input
     var ams_input: std.ArrayListUnmanaged(u8) = .{};
     defer ams_input.deinit(conn.allocator);
-    buildSigningHeaders(conn, &ams_input) catch return sealInternalError("canonicalizing the signed headers");
+    buildSigningHeaders(conn, &ams_input, g_signed_headers) catch return sealInternalError("canonicalizing the signed headers");
 
     // Append AMS header template (with empty b=) as final line (no trailing CRLF)
     const ams_full_template = std.fmt.allocPrint(conn.allocator, "ARC-Message-Signature: {s}", .{ams_template}) catch
@@ -702,153 +712,6 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
 
     publishEvent(conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
-}
-
-/// Field name of a connection header, for `header_select`.
-fn connHeaderName(hdr: connection_mod.Header) []const u8 {
-    return hdr.name;
-}
-
-/// Canonicalize headers listed in g_signed_headers and append to buf.
-///
-/// The AMS we sign has to select header instances by the same rule a verifier
-/// will use to check it (RFC 8617 via RFC 6376 §5.4.2), so this shares the
-/// selector with validation rather than repeating the walk. Taking the last
-/// match for every mention, as this did, would make any oversigned AMS we
-/// produced unverifiable everywhere else (audit A-6).
-fn buildSigningHeaders(conn: *connection_mod.Connection, buf: *std.ArrayListUnmanaged(u8)) !void {
-    const canon_mod = securemilter_crypto.canon;
-    var walk = header_select.walker(
-        connection_mod.Header,
-        connHeaderName,
-        g_signed_headers,
-        conn.headers.items,
-    );
-    while (walk.next()) |hdr| {
-        // The message's own field name, not the `h=` spelling of it: relaxed
-        // canonicalization lowercases both, but simple preserves what the
-        // message carried, and that is what a verifier hashes.
-        const full = try std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value });
-        defer conn.allocator.free(full);
-        const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
-        defer conn.allocator.free(canonicalized);
-        try buf.appendSlice(conn.allocator, canonicalized);
-        try buf.appendSlice(conn.allocator, "\r\n");
-    }
-}
-
-/// Build the seal signing input: prior ARC headers + current AAR + AMS + AS template.
-fn buildSealInput(
-    conn: *connection_mod.Connection,
-    buf: *std.ArrayListUnmanaged(u8),
-    prior_sets: []const arc.ArcSet,
-    current_aar: []const u8,
-    current_ams_value: []const u8,
-    as_template: []const u8,
-) !void {
-    const canon_mod = securemilter_crypto.canon;
-
-    // Prior sets: canonicalize all 3 headers for each
-    for (prior_sets) |prior| {
-        try appendCanonHdr(conn.allocator, buf, "ARC-Authentication-Results", prior.aar_value);
-        try appendCanonHdr(conn.allocator, buf, "ARC-Message-Signature", prior.ams_value);
-        try appendCanonHdr(conn.allocator, buf, "ARC-Seal", prior.as_value);
-    }
-
-    // Current instance: AAR + AMS
-    try appendCanonHdr(conn.allocator, buf, "ARC-Authentication-Results", current_aar);
-    try appendCanonHdr(conn.allocator, buf, "ARC-Message-Signature", current_ams_value);
-
-    // AS header with empty b= (no trailing CRLF — last header in signing input)
-    const as_full = try std.fmt.allocPrint(conn.allocator, "ARC-Seal: {s}", .{as_template});
-    defer conn.allocator.free(as_full);
-    const canon_as = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, as_full);
-    defer conn.allocator.free(canon_as);
-    try buf.appendSlice(conn.allocator, canon_as);
-}
-
-fn appendCanonHdr(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8, value: []const u8) !void {
-    const canon_mod = securemilter_crypto.canon;
-    const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, value });
-    defer allocator.free(full);
-    const canonicalized = try canon_mod.canonicalizeHeader(allocator, .relaxed, full);
-    defer allocator.free(canonicalized);
-    try buf.appendSlice(allocator, canonicalized);
-    try buf.appendSlice(allocator, "\r\n");
-}
-
-/// Assemble the ARC-Authentication-Results content from results this ADMD
-/// actually produced (RFC 8617 §5.1.1).
-///
-/// An A-R header qualifies only if it claims our authserv-id *and* every
-/// method it asserts is listed in `LocalAuthMethods`. Anything else is a
-/// sender-supplied claim: copying it here would have this host cryptographically
-/// vouch for authentication it never performed. A host that lists no local
-/// methods therefore seals an honest `none`.
-///
-/// Caller owns the returned slice. Returns null only on allocation failure.
-fn buildAarContent(conn: *connection_mod.Connection) ?[]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    errdefer buf.deinit(conn.allocator);
-
-    var found = false;
-    for (conn.headers.items) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
-        if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
-        if (!auth_results.assertsAnyMethod(hdr.value, g_local_auth_methods)) continue;
-        if (auth_results.assertsMethodOutside(hdr.value, g_local_auth_methods)) {
-            log.warn("ignoring Authentication-Results claiming our authserv-id with non-local methods", .{});
-            continue;
-        }
-
-        // Keep the raw result text (properties included); drop the repeated
-        // authserv-id, which the AAR states once up front.
-        const results = resultsPart(hdr.value) orelse continue;
-        if (!found) {
-            buf.appendSlice(conn.allocator, g_authserv_id) catch return null;
-            found = true;
-        }
-        buf.appendSlice(conn.allocator, "; ") catch return null;
-        buf.appendSlice(conn.allocator, results) catch return null;
-    }
-
-    if (!found) {
-        buf.deinit(conn.allocator);
-        return std.fmt.allocPrint(conn.allocator, "{s}; none", .{g_authserv_id}) catch null;
-    }
-    return buf.toOwnedSlice(conn.allocator) catch null;
-}
-
-/// The portion of an A-R value after the authserv-id, trimmed of surrounding
-/// whitespace and trailing separators.
-fn resultsPart(header_value: []const u8) ?[]const u8 {
-    const trimmed = mem.trimLeft(u8, header_value, &std.ascii.whitespace);
-    const semi = mem.indexOfScalar(u8, trimmed, ';') orelse return null;
-    const rest = mem.trim(u8, trimmed[semi + 1 ..], &std.ascii.whitespace);
-    const cleaned = mem.trim(u8, rest, ";");
-    const result = mem.trim(u8, cleaned, &std.ascii.whitespace);
-    return if (result.len == 0) null else result;
-}
-
-/// Fold a base64 string by inserting CRLF+TAB every 76 characters.
-/// Prevents Postfix from introducing mid-token folds at arbitrary positions.
-fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
-    const chunk_size = 76;
-    if (b64.len <= chunk_size) return b64;
-
-    var result: std.ArrayListUnmanaged(u8) = .{};
-    errdefer result.deinit(allocator);
-
-    var offset: usize = 0;
-    while (offset < b64.len) {
-        const end = @min(offset + chunk_size, b64.len);
-        try result.appendSlice(allocator, b64[offset..end]);
-        if (end < b64.len) {
-            try result.appendSlice(allocator, "\r\n\t");
-        }
-        offset = end;
-    }
-    return result.toOwnedSlice(allocator);
 }
 
 /// Emit the three headers of one ARC set as a unit.
@@ -944,19 +807,6 @@ fn publishEvent(allocator: Allocator, action: []const u8, result_str: []const u8
     getPublisher().publish(json);
 }
 
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
-}
-
 // =============================================================================
 // Reload
 // =============================================================================
@@ -1030,19 +880,8 @@ test {
     _ = seal;
     _ = settings;
     _ = settings_test;
-}
-
-test "results part drops the authserv-id" {
-    try std.testing.expectEqualStrings(
-        "spf=pass smtp.mailfrom=a.test",
-        resultsPart("mail.example.org; spf=pass smtp.mailfrom=a.test").?,
-    );
-    try std.testing.expectEqualStrings(
-        "dkim=pass header.d=a.test",
-        resultsPart("  mail.example.org;  dkim=pass header.d=a.test;  ").?,
-    );
-    try std.testing.expect(resultsPart("mail.example.org") == null);
-    try std.testing.expect(resultsPart("mail.example.org;   ") == null);
+    _ = sealbuild;
+    _ = sealbuild_test;
 }
 
 // --- X-8: a partial ARC set must never reach the wire ------------------------
