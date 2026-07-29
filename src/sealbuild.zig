@@ -305,9 +305,12 @@ pub fn buildSet(
         return fail(failed_step, "encoding the body hash");
     defer allocator.free(body_hash_b64);
 
-    // Pre-folded, and the same layout is used for the signing input and for the
-    // header placed on the message, so what a verifier canonicalizes is
-    // byte-identical to what we hashed.
+    // Pre-folded, and written once. The final header value below is this template
+    // with the signature appended, so the bytes a verifier canonicalizes are the
+    // bytes we hashed by construction. Spelling the layout out twice and keeping
+    // the two in sync by hand is a silent break waiting for the first person to add
+    // a tag to one of them: the signature would cover a header the message does not
+    // carry, and every verifier everywhere would report a failure.
     const ams_template = std.fmt.allocPrint(
         allocator,
         "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
@@ -344,11 +347,10 @@ pub fn buildSet(
         return fail(failed_step, "folding the AMS signature");
     defer allocator.free(folded_ams_sig);
 
-    const ams_value = std.fmt.allocPrint(
-        allocator,
-        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s};\r\n\th={s};\r\n\tbh={s};\r\n\tb={s}",
-        .{ p.instance, p.domain, p.selector, p.signed_headers, body_hash_b64, folded_ams_sig },
-    ) catch return fail(failed_step, "formatting the AMS header");
+    // The template ends at `b=`, so appending the signature yields exactly what was
+    // signed. No second copy of the layout to drift.
+    const ams_value = std.fmt.allocPrint(allocator, "{s}{s}", .{ ams_template, folded_ams_sig }) catch
+        return fail(failed_step, "formatting the AMS header");
     errdefer allocator.free(ams_value);
 
     // ARC-Seal: signs every prior ARC header plus this set's AAR and AMS.
@@ -374,11 +376,9 @@ pub fn buildSet(
         return fail(failed_step, "folding the ARC-Seal signature");
     defer allocator.free(folded_seal_sig);
 
-    const as_value = std.fmt.allocPrint(
-        allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s};\r\n\tb={s}",
-        .{ p.instance, p.cv.toString(), p.domain, p.selector, folded_seal_sig },
-    ) catch return fail(failed_step, "formatting the ARC-Seal header");
+    // Same construction as the AMS: the signed template plus the signature.
+    const as_value = std.fmt.allocPrint(allocator, "{s}{s}", .{ as_template, folded_seal_sig }) catch
+        return fail(failed_step, "formatting the ARC-Seal header");
 
     return .{ .aar = aar, .ams = ams_value, .seal = as_value, .allocator = allocator };
 }
