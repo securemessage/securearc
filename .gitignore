@@ -1,6 +1,18 @@
 .zig-cache/
 zig-out/
-test/
+
+# Test *keys*, not the whole test directory. `test/` was ignored wholesale, which
+# protected test/keys/arc.key -- a real private key -- but also silently excluded
+# anything else placed under test/. That became a live problem when the RFC
+# conformance harness needed to live there: a harness that is not committed is a
+# claim rather than a test, and a .gitignore quietly dropping it is exactly how
+# that happens without anyone noticing. Ignore the hazard, not its parent.
+test/keys/
+
+# Python bytecode from the conformance harness. Committed once already, in
+# securespf, for want of this line.
+__pycache__/
+*.pyc
 
 # Crash dumps. FreeBSD writes <progname>.core into the cwd, so the name follows
 # whichever binary died -- build.core, test.core, securearc.core. A single filename
