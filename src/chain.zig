@@ -8,8 +8,14 @@ const dns_mod = securemilter.dns;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
+const header_select = securemilter_crypto.header_select;
 
 const arc = @import("arc.zig");
+
+/// Field name of an ARC header, for `header_select`.
+fn amsHeaderName(hdr: arc.Header) []const u8 {
+    return hdr.name;
+}
 
 /// Whether chain validation actually reached a verdict.
 ///
@@ -296,32 +302,19 @@ fn buildAmsSigningInput(
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
 
-    // Canonicalize headers listed in h= tag
-    var h_rest = set.ams_signed_headers;
-    while (h_rest.len > 0) {
-        const colon_pos = mem.indexOfScalar(u8, h_rest, ':');
-        const hdr_name = if (colon_pos) |cp| h_rest[0..cp] else h_rest;
-        h_rest = if (colon_pos) |cp| h_rest[cp + 1 ..] else "";
-
-        const trimmed_name = mem.trim(u8, hdr_name, &std.ascii.whitespace);
-        if (trimmed_name.len == 0) continue;
-
-        // Find this header in the message (last occurrence, per DKIM spec)
-        var found: ?[]const u8 = null;
-        for (all_headers) |hdr| {
-            if (arc.eqlLower(hdr.name, trimmed_name)) {
-                const full = std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
-                if (found) |f| allocator.free(f);
-                found = full;
-            }
-        }
-        if (found) |full| {
-            defer allocator.free(full);
-            const canonicalized = canon.canonicalizeHeader(allocator, .relaxed, full) catch continue;
-            defer allocator.free(canonicalized);
-            try buf.appendSlice(allocator, canonicalized);
-            try buf.appendSlice(allocator, "\r\n");
-        }
+    // RFC 8617 inherits DKIM's signing rules, so the AMS `h=` tag selects header
+    // instances exactly as a DKIM `h=` does: a repeated name walks up from the
+    // bottom, and a mention with no instance left contributes nothing. This loop
+    // used to take the last match for every mention, which is the same defect as
+    // D-1 and made an oversigned AMS impossible to validate (audit A-6).
+    var walk = header_select.walker(arc.Header, amsHeaderName, set.ams_signed_headers, all_headers);
+    while (walk.next()) |hdr| {
+        const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        defer allocator.free(full);
+        const canonicalized = try canon.canonicalizeHeader(allocator, .relaxed, full);
+        defer allocator.free(canonicalized);
+        try buf.appendSlice(allocator, canonicalized);
+        try buf.appendSlice(allocator, "\r\n");
     }
 
     // Append AMS header with b= value emptied (for self-referencing signature)
@@ -573,6 +566,71 @@ test "validateChain cv=pass required for i>1" {
     try std.testing.expectEqualStrings("ARC-Seal cv must be pass for i>1", result.failure_reason.?);
     // A structural verdict is a real determination, not a placeholder.
     try std.testing.expectEqual(Evaluation.complete, result.evaluation);
+}
+
+// --- A-6: duplicate h= names select successive instances ---------------------
+
+/// An ArcSet carrying only what `buildAmsSigningInput` reads.
+fn amsSetWithSignedHeaders(h: []const u8) arc.ArcSet {
+    return .{
+        .instance = 1,
+        .aar_value = "i=1; test",
+        .ams_value = "i=1; h=x; b=",
+        .as_value = "i=1; cv=none",
+        .seal_cv = .none,
+        .seal_algorithm = "rsa-sha256",
+        .seal_domain = "a.com",
+        .seal_selector = "s1",
+        .seal_signature = "x",
+        .ams_algorithm = "rsa-sha256",
+        .ams_domain = "a.com",
+        .ams_selector = "s1",
+        .ams_signature = "x",
+        .ams_body_hash = "y",
+        .ams_canonicalization = "relaxed/relaxed",
+        .ams_signed_headers = h,
+    };
+}
+
+test "AMS h= repeated: successive instances bottom upward, not the same one twice" {
+    // RFC 8617 inherits RFC 6376 §5.4.2. Asserted on the exact octet string,
+    // because that is what gets hashed -- a substring check cannot see a header
+    // counted twice (audit A-6).
+    const allocator = std.testing.allocator;
+    const set = amsSetWithSignedHeaders("from:from");
+    const headers = [_]arc.Header{
+        .{ .name = "From", .value = "top@example.com" },
+        .{ .name = "From", .value = "bottom@example.com" },
+    };
+
+    const input = try buildAmsSigningInput(allocator, &set, &headers);
+    defer allocator.free(input);
+
+    try std.testing.expectEqualStrings(
+        "from:bottom@example.com\r\n" ++
+            "from:top@example.com\r\n" ++
+            "arc-message-signature:i=1; h=x; b=",
+        input,
+    );
+}
+
+test "AMS h= oversigned: the surplus mention contributes nothing" {
+    // One From, named twice. The second mention is the null input of RFC 6376
+    // §3.7, so the field is hashed once. Hashing it twice, as this used to,
+    // makes every oversigned AMS fail validation.
+    const allocator = std.testing.allocator;
+    const set = amsSetWithSignedHeaders("from:from");
+    const headers = [_]arc.Header{
+        .{ .name = "From", .value = "only@example.com" },
+    };
+
+    const input = try buildAmsSigningInput(allocator, &set, &headers);
+    defer allocator.free(input);
+
+    try std.testing.expectEqualStrings(
+        "from:only@example.com\r\narc-message-signature:i=1; h=x; b=",
+        input,
+    );
 }
 
 // --- A-12 / A-12a: an unevaluable chain is not a failed chain -----------------

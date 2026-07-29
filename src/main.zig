@@ -22,6 +22,7 @@ const log = securemilter.log;
 const header_scrub = securemilter.header_scrub;
 
 const securemilter_crypto = @import("securemilter_crypto");
+const header_select = securemilter_crypto.header_select;
 const crypto = securemilter_crypto.crypto;
 
 pub const arc = @import("arc.zig");
@@ -944,33 +945,36 @@ fn doSeal(conn: *connection_mod.Connection) u8 {
     return @intFromEnum(responses.Code.accept);
 }
 
+/// Field name of a connection header, for `header_select`.
+fn connHeaderName(hdr: connection_mod.Header) []const u8 {
+    return hdr.name;
+}
+
 /// Canonicalize headers listed in g_signed_headers and append to buf.
+///
+/// The AMS we sign has to select header instances by the same rule a verifier
+/// will use to check it (RFC 8617 via RFC 6376 §5.4.2), so this shares the
+/// selector with validation rather than repeating the walk. Taking the last
+/// match for every mention, as this did, would make any oversigned AMS we
+/// produced unverifiable everywhere else (audit A-6).
 fn buildSigningHeaders(conn: *connection_mod.Connection, buf: *std.ArrayListUnmanaged(u8)) !void {
     const canon_mod = securemilter_crypto.canon;
-    var h_rest: []const u8 = g_signed_headers;
-    while (h_rest.len > 0) {
-        const colon_pos = mem.indexOfScalar(u8, h_rest, ':');
-        const hdr_name = if (colon_pos) |cp| h_rest[0..cp] else h_rest;
-        h_rest = if (colon_pos) |cp| h_rest[cp + 1 ..] else "";
-
-        const trimmed = mem.trim(u8, hdr_name, &std.ascii.whitespace);
-        if (trimmed.len == 0) continue;
-
-        // Find last occurrence of this header
-        var found: ?[]const u8 = null;
-        for (conn.headers.items) |hdr| {
-            if (eqlIgnoreCase(hdr.name, trimmed)) {
-                found = hdr.value;
-            }
-        }
-        if (found) |value| {
-            const full = try std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ trimmed, value });
-            defer conn.allocator.free(full);
-            const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
-            defer conn.allocator.free(canonicalized);
-            try buf.appendSlice(conn.allocator, canonicalized);
-            try buf.appendSlice(conn.allocator, "\r\n");
-        }
+    var walk = header_select.walker(
+        connection_mod.Header,
+        connHeaderName,
+        g_signed_headers,
+        conn.headers.items,
+    );
+    while (walk.next()) |hdr| {
+        // The message's own field name, not the `h=` spelling of it: relaxed
+        // canonicalization lowercases both, but simple preserves what the
+        // message carried, and that is what a verifier hashes.
+        const full = try std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        defer conn.allocator.free(full);
+        const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
+        defer conn.allocator.free(canonicalized);
+        try buf.appendSlice(conn.allocator, canonicalized);
+        try buf.appendSlice(conn.allocator, "\r\n");
     }
 }
 
