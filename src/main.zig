@@ -9,6 +9,7 @@ const listener_mod = securemilter.listener;
 const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
+const bootstrap_mod = securemilter.bootstrap;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
 const escape = securemilter.escape;
@@ -99,6 +100,22 @@ var g_zmq_topic: []const u8 = "arc";
 var g_allocator: Allocator = undefined;
 var g_config_path: []const u8 = "/usr/local/etc/securearc/securearc.conf";
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
+
+/// Nameservers for the health monitor.
+///
+/// The other three daemons keep a `g_dns_config` their hook can read. This one keeps
+/// its resolver settings inside the RCU snapshot instead, and the snapshot is not yet
+/// readable at the point the monitor starts — so `main` parks them here first.
+var g_monitor_nameservers: []const []const u8 = &.{};
+
+/// `daemon.Options.spawn_threads`: start the DNS health monitor.
+///
+/// Context-free because that is what `daemon.Options` takes, and deliberately so — the
+/// hook runs at the one point in the bootstrap where creating a thread is safe, after
+/// the fork and after the managed signals are blocked.
+fn spawnHealthMonitor() void {
+    g_health_monitor = dns_mod.startMonitor(g_allocator, g_monitor_nameservers);
+}
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 /// Seal key behind an RCU container.
@@ -267,49 +284,24 @@ pub fn main() !void {
         };
     }
 
-    // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
-    if (!arc_cfg.foreground) {
-        daemon_mod.daemonize() catch |err| {
-            log.err("daemonize failed: {}", .{err});
-            return err;
-        };
-        log.initThread(); // re-init after fork (PID changed)
-    }
+    // Unlike the other three daemons this one keeps its resolver settings inside the
+    // RCU snapshot rather than in a global, so the nameservers are parked here for the
+    // context-free `spawn_threads` hook to find.
+    g_monitor_nameservers = arc_cfg.dns_nameservers;
 
-    // Block the managed signals BEFORE spawning any thread, so every thread
-    // inherits the mask and SIGHUP/SIGTERM can only be taken by sigwait in the
-    // main thread. Ordering matters: this used to sit just above the worker
-    // pool, leaving the health monitor thread below with SIGHUP unblocked and
-    // able to take a reload signal and terminate the daemon (audit X-7).
-    daemon_mod.ManagedSignals.blockForKqueue();
-
-    // Start proactive DNS health monitor AFTER daemonize
-    if (dns_mod.HealthMonitor.init(allocator, arc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
-        monitor.start() catch |err| {
-            log.warn("DNS health monitor thread failed: {}", .{err});
-        };
-        g_health_monitor = monitor;
-    } else |err| {
-        log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
-    }
-
-    daemon_mod.writePidFile(arc_cfg.pid_file) catch |err| {
-        log.err("pid file write failed: {}", .{err});
-    };
-    defer daemon_mod.removePidFile(arc_cfg.pid_file);
-
-    // Raise fd limit to calculated budget before dropping privileges
-    const num_workers = if (arc_cfg.worker_threads == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else arc_cfg.worker_threads;
-    const fd_need = daemon_mod.calculateFdNeed(num_workers, worker_mod.DEFAULT_MAX_CONNECTIONS, @intCast(arc_cfg.listen_addresses.len));
-    daemon_mod.raiseFileLimit(fd_need);
-
-    // Drop privileges after PID file is written, before workers spawn
-    if (arc_cfg.user) |user| {
-        daemon_mod.dropPrivileges(user) catch |err| {
-            log.err("privilege drop to '{s}' failed: {}", .{ user, err });
-            return err;
-        };
-    }
+    // Daemonize, block signals, start the monitor thread, claim the PID file, raise the
+    // fd budget, drop privileges — in that order, for reasons recorded once in
+    // `daemon.bootstrap` and enforced by its ordering tests.
+    const boot = try bootstrap_mod.run(.{
+        .foreground = arc_cfg.foreground,
+        .pid_file = arc_cfg.pid_file,
+        .user = arc_cfg.user,
+        .worker_threads = arc_cfg.worker_threads,
+        .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
+        .num_listeners = @intCast(arc_cfg.listen_addresses.len),
+        .spawn_threads = spawnHealthMonitor,
+    });
+    defer boot.deinit();
 
     log.info("SecureARC starting, AuthservID={s}, MinimumKeyBits={d}, listeners={d}", .{
         arc_cfg.authserv_id,
