@@ -298,7 +298,7 @@ fn runDaemon() !void {
     // Daemonize, block signals, start the monitor thread, claim the PID file, raise the
     // fd budget, drop privileges — in that order, for reasons recorded once in
     // `daemon.bootstrap` and enforced by its ordering tests.
-    const boot = try bootstrap_mod.run(.{
+    var boot = try bootstrap_mod.run(.{
         .foreground = arc_cfg.foreground,
         .pid_file = arc_cfg.pid_file,
         .user = arc_cfg.user,
@@ -345,6 +345,9 @@ fn runDaemon() !void {
         worker_mod.DEFAULT_MAX_CONNECTIONS,
     );
     defer threads.deinit(allocator);
+
+    // Bound and serving: release the parent blocked in `daemonize` (X-16).
+    boot.notifyReady();
 
     daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();

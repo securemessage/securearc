@@ -122,6 +122,27 @@
 #   noise, and this ceiling should be overtaken by that work rather than by a separate
 #   tidy-up.
 
+# 2026-07-30, X-16(a): main.zig +3, RAISED DELIBERATELY. Same change in all four daemons.
+#
+#   The readiness handshake. `daemonize` now returns the write end of a pipe and the
+#   ORIGINAL process blocks on the read end instead of exiting 0 immediately, so
+#   `service start` finally reports what happened. Measured before: an unbindable
+#   listener gave parent exit 0, nothing listening, no process, and rc.d announcing a
+#   started service. After: exit 1.
+#
+#   The daemon has to say when it is actually serving, and only the daemon knows --
+#   everything that makes it useful (binding, the worker pool) happens AFTER
+#   bootstrap.run returns. So one line lands here, after the pool spawns:
+#
+#       boot.notifyReady();
+#
+#   +3 is comment, call, blank. The reasoning is in Bootstrap.notifyReady's doc
+#   comment, not repeated here -- the first attempt carried a four-line rationale in
+#   all four daemons and the gate objected, correctly, for the second time in one day.
+#
+#   NOT PAID DOWN HERE ON PURPOSE, same as the X-16(b) note above: these files are the
+#   roadmap's settings.zig extraction target and should be cut there, not nibbled here.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -136,5 +157,5 @@
 # An empty list below means every file meets the goal.
 604 src/chain.zig
 487 src/flow.zig
-586 src/main.zig
+589 src/main.zig
 408 src/sealbuild.zig
