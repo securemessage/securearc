@@ -44,5 +44,5 @@
 # under it are regenerated every time a ceiling moves.
 628 src/chain.zig
 433 src/flow.zig
-604 src/main.zig
-420 src/sealbuild.zig
+581 src/main.zig
+408 src/sealbuild.zig
