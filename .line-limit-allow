@@ -95,6 +95,33 @@
 #   Also corrected reloadConfig's own doc comment, which still said "re-reads seal key"
 #   -- accurate when written, and the entirety of what A-10/A-14 was about.
 #
+# 2026-07-30, X-16(b): main.zig +6, RAISED DELIBERATELY. Same change in all four daemons.
+#
+#   Every fatal startup failure used to be invisible. `daemonize` points stderr at
+#   /dev/null, so the error Zig's start code prints for an error returned from `main`
+#   goes to a descriptor nobody reads, and syslog -- the only channel still open after
+#   the fork -- never received it. Measured: a daemon told to bind an unusable address
+#   exited 0, left nothing listening, and logged "starting" as its last word.
+#
+#   The fix is the SHAPE of `main`, not a line inside it. The body moved to `runDaemon`
+#   and `main` became one line:
+#
+#       runDaemon() catch |e| return bootstrap_mod.fatal(e);
+#
+#   so every error converges on one report -- including from a `try` added later.
+#   Per-site catch blocks were the alternative, and are how X-7 came to be fixed in one
+#   of four copies.
+#
+#   +6 is the entire cost: three lines of `main`, one blank, and a two-line comment
+#   pointing at `bootstrap.fatal` where the reasoning is written once. It was +10 until
+#   the gate objected to the same six-line rationale appearing in four files, which was
+#   a fair objection and is why it now lives in the library.
+#
+#   NOT PAID DOWN HERE ON PURPOSE. These four main.zig files are already the roadmap's
+#   next extraction target; +6 against a planned several-hundred-line reduction is
+#   noise, and this ceiling should be overtaken by that work rather than by a separate
+#   tidy-up.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -109,5 +136,5 @@
 # An empty list below means every file meets the goal.
 604 src/chain.zig
 487 src/flow.zig
-580 src/main.zig
+586 src/main.zig
 408 src/sealbuild.zig

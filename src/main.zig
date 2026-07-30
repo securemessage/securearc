@@ -197,7 +197,13 @@ fn usageError() error{InvalidArgument} {
     return error.InvalidArgument;
 }
 
+/// Every failure below is reported by `bootstrap.fatal`, which explains why: after
+/// `daemonize` stderr is /dev/null and syslog is the only channel left (X-16).
 pub fn main() !void {
+    runDaemon() catch |e| return bootstrap_mod.fatal(e);
+}
+
+fn runDaemon() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
