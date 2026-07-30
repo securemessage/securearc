@@ -27,7 +27,6 @@ const crypto = securemilter_crypto.crypto;
 
 pub const arc = @import("arc.zig");
 pub const chain = @import("chain.zig");
-pub const seal = @import("seal.zig");
 
 /// Listener modes, DNS-failure policy and the config parser.
 ///
@@ -606,7 +605,6 @@ fn onWorkerReload() void {
 test {
     _ = arc;
     _ = chain;
-    _ = seal;
     _ = settings;
     _ = settings_test;
     _ = sealbuild;

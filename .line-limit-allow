@@ -1,4 +1,4 @@
-# 2026-07-29, the ARC signing-half work (audit 11.28). All three growths are the
+# 2026-07-29, the ARC signing-half work (audit 11.29). All three growths are the
 #   RFC 8617 5.1.2 and 5.1.3 fixes plus their reasoning, and seal_cli.zig at 325 is a
 #   new conformance tool that is already under the goal:
 #     arc.zig   528 -> 552  chainAlreadyBroken, and why "already recorded as broken"
@@ -9,6 +9,28 @@
 #     main.zig  603 -> 617  msgfile wired in, plus the note that an unreferenced
 #                           @import is never analyzed, so its tests silently do not
 #                           run -- which is how msgfile's three tests went missing.
+#
+#   THIS BLOCK WAS DELETED ONCE BY THE LINT TOOL ITSELF and recovered from git. The
+#   allowlist writer regenerated the file from scratch, discarding every comment it
+#   had not emitted -- on the ordinary self-tightening path, not just --update. Fixed
+#   in securemilter-lib/tools/check-line-limit.sh: comments above the generated
+#   header are now carried across a rewrite.
+#
+# 2026-07-29, A-1 CLOSED: main.zig 617 -> 615, src/seal.zig deleted outright.
+#   It held a placeholder AMS signing-input builder that signed the synthetic string
+#   "ams:{i}:{d}:{h}:{bh}" instead of canonicalized headers, so any seal made through
+#   it failed every compliant verifier including securearc itself. Dormant --
+#   constructSeal had no callers -- but a loaded trap for the next refactor.
+#
+#   Deleted rather than repaired because A-1's other option ("move the proven
+#   builders into it and use them") had already happened under a different name:
+#   sealbuild.zig holds them, production and securearc-seal both call it, and it is
+#   verified 17/17 against an external signer. Keeping seal.zig bought nothing.
+#
+#   Its two tests asserted a struct literal holds the values just assigned to it, and
+#   that dupe-then-free does not crash. Neither touched the placeholder, so the file
+#   read as covered while its Critical defect was untested. Test total 67 -> 65.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -16,8 +38,12 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
+#
+# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
+# preserved when the list is rewritten; this header and the entries
+# under it are regenerated every time a ceiling moves.
 552 src/arc.zig
 891 src/chain.zig
 433 src/flow.zig
-617 src/main.zig
+615 src/main.zig
 420 src/sealbuild.zig
