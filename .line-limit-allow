@@ -71,6 +71,30 @@
 #   three branches were only reachable by standing up a resolver that fails
 #   transiently, which is why they had never been tested.
 #
+# 2026-07-29, refactor plan stage 3.3: main.zig 581 -> 597, also deliberate.
+#
+#   reloadConfig ended in FOUR NESTED LEVELS of `if (x) |y| ... else |err|` to reload
+#   the seal key, which put the success case -- a single log.info -- at the deepest
+#   point in the function, and put each failure's recovery in an `else` branch further
+#   from its cause than the code it was recovering from. Now `reloadSealKey` with three
+#   guards, each with its cleanup beside it. reloadConfig 72 -> ~50 lines and off the
+#   depth>=4 list entirely; the file's maximum depth 6 -> 5, the remainder being main()
+#   itself, which is stage 2's job.
+#
+#   The ownership contract is subtle and is now stated where it applies rather than
+#   implied by nesting: boxSealKey only copies into heap storage, so on ITS failure the
+#   key is still the caller's to deinit, while after a successful box the cleanup path
+#   is freeSealKey. Getting that backwards leaks a key or double-frees one, and the old
+#   shape expressed it only through which `else` branch you were standing in.
+#
+#   +16 net: a signature, its doc, and two ownership comments, against 21 lines of
+#   pyramid removed. EXPECT THIS CEILING TO FALL SHARPLY at stage 4, when the config
+#   parser and the flow move out of main.zig the way securedkim's will; raising it by
+#   16 now is not an argument that 597 is a reasonable size for this file.
+#
+#   Also corrected reloadConfig's own doc comment, which still said "re-reads seal key"
+#   -- accurate when written, and the entirety of what A-10/A-14 was about.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -84,5 +108,5 @@
 # under it are regenerated every time a ceiling moves.
 628 src/chain.zig
 501 src/flow.zig
-581 src/main.zig
+597 src/main.zig
 408 src/sealbuild.zig

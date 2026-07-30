@@ -493,9 +493,46 @@ fn modeFor(listener_index: usize) Mode {
 // Reload
 // =============================================================================
 
-/// Main-thread reload callback: re-reads seal key on SIGHUP.
+/// Adopt a new seal key, or leave the previous one live.
+///
+/// Best-effort by design: a key that cannot be loaded leaves the running key in place
+/// rather than failing the reload, because the alternative is a daemon that stops
+/// sealing over a typo in a path it is not yet using.
+fn reloadSealKey(key_path: []const u8) void {
+    var key = crypto.loadRsaKeyFile(key_path, crypto.RFC8301_MIN_RSA_BITS) catch {
+        log.warn("reload: failed to reload seal key {s}", .{key_path});
+        return;
+    };
+
+    // `boxSealKey` only copies into heap storage, so on failure the key is still ours
+    // to release -- which is why `key` is `var`.
+    const boxed = boxSealKey(g_allocator, key) catch |err| {
+        key.deinit();
+        log.warn("reload: failed to store seal key ({}), keeping previous", .{err});
+        return;
+    };
+
+    // Past this point the box owns the key, so cleanup goes through `freeSealKey`.
+    g_seal_key.publish(&g_config_gen, boxed) catch |err| {
+        freeSealKey(g_allocator, boxed);
+        log.warn("reload: failed to publish seal key ({}), keeping previous", .{err});
+        return;
+    };
+
+    log.info("seal key reloaded from {s} ({d} awaiting reclamation)", .{
+        key_path,
+        g_seal_key.retiredCount(),
+    });
+}
+
+/// Main-thread reload callback: re-read the configuration on SIGHUP.
+///
+/// Said "re-reads seal key" until 2026-07-29, which was the whole of A-10/A-14 -- the
+/// man page promised the configuration and this adopted one value out of it.
+///
+/// Every failure path keeps the previous configuration live and still advances the
+/// generation: a half-applied reload is the outcome worth avoiding.
 fn reloadConfig() void {
-    // Re-read seal key file
     var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
         log.warn("reload: failed to re-read config file, keeping previous", .{});
         _ = g_config_gen.increment();
@@ -537,28 +574,7 @@ fn reloadConfig() void {
         g_reloadable.retiredCount(),
     });
 
-    if (arc_cfg.seal_key_file) |key_path| {
-        const min_bits = crypto.RFC8301_MIN_RSA_BITS;
-        if (crypto.loadRsaKeyFile(key_path, min_bits)) |new_key| {
-            var key = new_key;
-            if (boxSealKey(g_allocator, new_key)) |boxed| {
-                if (g_seal_key.publish(&g_config_gen, boxed)) {
-                    log.info("seal key reloaded from {s} ({d} awaiting reclamation)", .{
-                        key_path,
-                        g_seal_key.retiredCount(),
-                    });
-                } else |err| {
-                    freeSealKey(g_allocator, boxed);
-                    log.warn("reload: failed to publish seal key ({}), keeping previous", .{err});
-                }
-            } else |err| {
-                key.deinit();
-                log.warn("reload: failed to store seal key ({}), keeping previous", .{err});
-            }
-        } else |_| {
-            log.warn("reload: failed to reload seal key {s}", .{key_path});
-        }
-    }
+    if (arc_cfg.seal_key_file) |key_path| reloadSealKey(key_path);
 
     _ = g_config_gen.increment();
     // Wake the workers so they reach a quiescent point and any superseded key
