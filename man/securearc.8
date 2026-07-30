@@ -263,9 +263,15 @@ section defines a socket and its operating mode.
 .It Cm Socket
 Listen address.
 Format:
-.Dq inet:port@host
+.Dq inet:port@ip
 or
 .Dq unix:/path .
+The
+.Ar ip
+must be a numeric IPv4 or IPv6 address; no name resolution is performed.
+A value that cannot be parsed is a fatal configuration error and is reported
+with the section that contains it \(em it is never ignored, and never falls
+back to the default listener.
 .It Cm Mode
 Operating mode for
 .Em this listener :

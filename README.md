@@ -93,7 +93,7 @@ securearc -c /usr/local/etc/securearc/securearc.conf
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `Socket` | — | `inet:port@host` or `unix:/path` |
+| `Socket` | — | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
 | `Mode` | `verify` | `seal`, `verify`, or `both` |
 | `SealDomain` | *(none)* | Domain for ARC sealing (required for seal mode) |
 | `SealSelector` | *(none)* | DNS selector for seal key (required for seal mode) |

@@ -133,6 +133,10 @@ LocalAuthMethods = spf, dkim, dmarc
 # genuinely runs on another machine, and then restrict it with pf.
 
 [listener:verify-inbound]
+# The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
+# configuration ERROR, not a synonym for 127.0.0.1. A Socket value that cannot be
+# parsed stops startup and names this section (X-14); it is never silently ignored
+# and never falls back to the default listener.
 Socket          = inet:8895@127.0.0.1
 Mode            = verify
 

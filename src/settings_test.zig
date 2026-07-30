@@ -41,6 +41,66 @@ test "parse config minimal" {
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.modes[0]);
 }
 
+// X-14. A malformed Socket must be refused rather than skipped, and must not
+// fall through to the loopback default below.
+test "a malformed listener Socket is refused, not replaced by the default" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:typo]
+        \\Socket = inet6:8895@::1
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.InvalidListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
+}
+
+test "a hostname in Socket is refused at config time" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:main]
+        \\Socket = inet:8895@localhost
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.InvalidListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
+}
+
+test "a listener section with no Socket is refused" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:empty]
+        \\Mode = verify
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.MissingListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
+}
+
+// Same hazard as securedkim's, with sealing in place of signing: the loopback
+// fallback took `default_mode` from `[global] Mode`, so a typo in the only
+// listener's Socket could bring a listener written as `verify` up as a sealer --
+// an unauthenticated sealing oracle for SealDomain, reachable locally.
+test "a typo cannot silently invert a verify listener into a sealing one" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\Mode = seal
+        \\
+        \\[listener:verify]
+        \\Socket = inet6:8895@::1
+        \\Mode = verify
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.InvalidListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
+}
+
 // The implicit listener binds loopback, never 0.0.0.0.
 //
 // Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. On a seal listener a

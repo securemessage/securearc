@@ -155,8 +155,9 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     for (cfg.section_order.items) |section_name| {
         if (mem.startsWith(u8, section_name, "listener:")) {
             const section = cfg.getSection(section_name) orelse continue;
-            const socket_str = section.get("Socket") orelse continue;
-            const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
+
+            // X-14: a malformed or missing Socket is refused, not skipped.
+            const addr = try listener_mod.parseListenerSocket(section_name, section.get("Socket"));
             try addrs.append(allocator, addr);
 
             // Appended in lockstep with `addrs`, so the index the worker hands
