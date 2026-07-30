@@ -335,7 +335,7 @@ fn runDaemon() !void {
     const shutdown_pipe = try posix.pipe();
     defer posix.close(shutdown_pipe[0]);
 
-    var threads = try worker_mod.spawnPoolWithReload(
+    var threads = try securemilter.pool.spawnPoolWithReload(
         allocator,
         arc_cfg.worker_threads,
         arc_cfg.listen_addresses,
