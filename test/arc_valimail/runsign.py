@@ -272,6 +272,15 @@ def main():
               f"Build it first:  cd ../.. && zig build", file=sys.stderr)
         return 2
 
+    # Fetched rather than committed, because it carries ValiMail's published RSA test
+    # key inline and the pre-receive hook rejects it. See README, "This file cannot be
+    # pushed". Checked here so its absence reads as a setup step rather than a
+    # traceback out of yaml.
+    if not os.path.isfile(SUITE):
+        print(f"{os.path.basename(SUITE)} not found.\n"
+              f"Fetch it first:  ./fetch-vectors.sh", file=sys.stderr)
+        return 2
+
     scenarios = list(yaml.safe_load_all(open(SUITE, "rb")))
 
     cases = []

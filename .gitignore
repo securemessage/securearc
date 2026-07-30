@@ -1,6 +1,19 @@
 .zig-cache/
 zig-out/
 
+# The ARC *signing* vector, which the pre-receive hook will not accept: it carries
+# ValiMail's published RSA test key inline, and gitleaks cannot tell a published vector
+# from a live credential. Its sibling `arc-draft-validation-tests.yml` IS committed,
+# because it has no key -- the asymmetry is deliberate, not an oversight.
+#
+# This is the one exception to the rule stated below, and it is bought back with a
+# checksum: `test/arc_valimail/fetch-vectors.sh` pins the upstream commit and refuses
+# any file whose SHA256 differs from the copy that used to be committed here. Pinned
+# bytes verified on every run is a stronger guarantee than a vendored file that nobody
+# re-checks. The key cannot be substituted with a generated one -- the fixture messages
+# already contain sets signed by it. See that suite's README.
+test/arc_valimail/arc-draft-sign-tests.yml
+
 # Test *keys*, not the whole test directory. `test/` was ignored wholesale, which
 # protected test/keys/arc.key -- a real private key -- but also silently excluded
 # anything else placed under test/. That became a live problem when the RFC

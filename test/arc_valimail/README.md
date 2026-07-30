@@ -294,12 +294,30 @@ as the validation half, under the same `LICENSE-valimail.txt`. Comparison semant
 follow the upstream runner `testarc.py` rather than a stricter rule of our own, with
 the single documented departure for `b=` above.
 
-### This file cannot be pushed, and its key cannot be substituted
+### This file is fetched, not committed — and its key cannot be substituted
 
-**It carries an RSA private key inline**, so the Forgejo `pre-receive` hook runs
+Run this once after cloning:
+
+```sh
+./fetch-vectors.sh          # downloads and checksum-verifies
+./fetch-vectors.sh --check  # verifies only; for CI
+```
+
+**The file carries an RSA private key inline**, so the Forgejo `pre-receive` hook runs
 gitleaks and rejects any push containing it. The hook does **not** honour a repository
-`.gitleaksignore` — tried and confirmed. `securearc` has therefore been unpushable
-since the commit that vendored this file.
+`.gitleaksignore` — tried and confirmed. `securearc` was unpushable for ten commits
+because of it.
+
+**The checksum is what makes fetching equivalent to vendoring**, and it is the reason
+this is not a retreat from the rule that a harness which is not committed is a claim
+rather than a test. `fetch-vectors.sh` pins upstream commit
+`f137dcb9d6d5baeef1310024ce9ccca94a9a92c8` and refuses any file whose SHA256 is not
+`d56f156b8833939e4ad8a3a4b270e497a5a440eef8fb5aaf7a9a1b655869aeb8` — verified equal to
+the copy that was previously committed here, byte for byte. That is a stronger
+guarantee than the vendored copy gave, since a committed file can be edited and nothing
+would notice; a wrong checksum stops the run.
+
+The validation half stays committed, because it contains no key.
 
 The obvious fix does not work, and the reason is worth recording so nobody spends the
 afternoon on it again. **Generating a fresh keypair at run time and substituting both
@@ -319,23 +337,13 @@ Replace the key and the sealer can no longer validate the chain it is being aske
 extend, so it correctly seals `cv=fail` where the suite expects `cv=pass`.
 
 So the key is load-bearing for the **input**, not for comparing our output. It has to
-be the published one.
+be the published one, which is why it is fetched rather than replaced.
 
-That leaves two ways forward, and they trade off two of this project's own rules
-against each other — *a harness that is not committed is a claim rather than a test*
-(the reason this file was vendored out of `/tmp` at all, and the reason the provenance
-note above says "committed rather than downloaded"), against *no key material in the
-repository*:
+**Storing the key in a form gitleaks does not pattern-match was rejected outright** —
+stripping the PEM armour, or base64-wrapping the whole block, would have been a
+two-line change and would have pushed cleanly. It defeats the control rather than
+satisfying it, and it would teach the next *real* key to hide the same way.
 
-- **Allowlist the finding server-side.** Keeps the vector committed, verbatim and
-  reviewable, and keeps a conformance run reproducible from a clone alone. Needs
-  operator access to the hook's configuration.
-- **Fetch it at setup time**, pinned to the upstream commit above and verified against
-  `sha256 d56f156b8833939e4ad8a3a4b270e497a5a440eef8fb5aaf7a9a1b655869aeb8`. Removes
-  the key from the repository and pins the exact bytes — arguably stronger provenance
-  than a hand-vendored copy, which can be edited — at the cost of one network fetch
-  before the signing half can run, and of reversing the decision recorded above.
-
-**Storing the key in a form gitleaks does not pattern-match was rejected outright.**
-It defeats the control rather than satisfying it, and it would teach the next real key
-to hide the same way.
+The cost of the path taken is stated plainly: **the signing half no longer runs from a
+bare clone**, and needs one network fetch first. `runsign.py` checks for the file and
+prints the command instead of raising out of the YAML parser.
