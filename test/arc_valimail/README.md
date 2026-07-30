@@ -293,3 +293,49 @@ now fixed — which is the second thing pointing a suite at `/usr/bin/true` is f
 as the validation half, under the same `LICENSE-valimail.txt`. Comparison semantics
 follow the upstream runner `testarc.py` rather than a stricter rule of our own, with
 the single documented departure for `b=` above.
+
+### This file cannot be pushed, and its key cannot be substituted
+
+**It carries an RSA private key inline**, so the Forgejo `pre-receive` hook runs
+gitleaks and rejects any push containing it. The hook does **not** honour a repository
+`.gitleaksignore` — tried and confirmed. `securearc` has therefore been unpushable
+since the commit that vendored this file.
+
+The obvious fix does not work, and the reason is worth recording so nobody spends the
+afternoon on it again. **Generating a fresh keypair at run time and substituting both
+halves fails `i=2 basic test`:**
+
+```
+AS: missing tag: cv=pass
+AS: unexpected tag: cv=fail
+dkimpy rejected the chain we sealed: cv=none reason=ARC-Seal[3] reported failure
+```
+
+`compare()` drops `b=` from both sides, so no *expected* value depends on which key
+signs — that part of the reasoning is sound. What it misses is that **the fixture
+messages already contain ARC sets signed by ValiMail's key**, and those resolve through
+the same `dummy._domainkey.example.org` record our own seal uses. One record, two jobs.
+Replace the key and the sealer can no longer validate the chain it is being asked to
+extend, so it correctly seals `cv=fail` where the suite expects `cv=pass`.
+
+So the key is load-bearing for the **input**, not for comparing our output. It has to
+be the published one.
+
+That leaves two ways forward, and they trade off two of this project's own rules
+against each other — *a harness that is not committed is a claim rather than a test*
+(the reason this file was vendored out of `/tmp` at all, and the reason the provenance
+note above says "committed rather than downloaded"), against *no key material in the
+repository*:
+
+- **Allowlist the finding server-side.** Keeps the vector committed, verbatim and
+  reviewable, and keeps a conformance run reproducible from a clone alone. Needs
+  operator access to the hook's configuration.
+- **Fetch it at setup time**, pinned to the upstream commit above and verified against
+  `sha256 d56f156b8833939e4ad8a3a4b270e497a5a440eef8fb5aaf7a9a1b655869aeb8`. Removes
+  the key from the repository and pins the exact bytes — arguably stronger provenance
+  than a hand-vendored copy, which can be edited — at the cost of one network fetch
+  before the signing half can run, and of reversing the decision recorded above.
+
+**Storing the key in a form gitleaks does not pattern-match was rejected outright.**
+It defeats the control rather than satisfying it, and it would teach the next real key
+to hide the same way.
