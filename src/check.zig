@@ -19,26 +19,12 @@ const process = std.process;
 const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securearc-check");
 const dns_mod = securemilter.dns;
 
 const arc = @import("arc.zig");
 const chain = @import("chain.zig");
 const msgfile = @import("msgfile.zig");
-
-fn writeOut(data: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
-}
-
-fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
-}
-
-fn fatal(msg: []const u8) void {
-    writeErr("securearc-check: ");
-    writeErr(msg);
-    writeErr("\n");
-    process.exit(2);
-}
 
 const Usage =
     \\Usage: securearc-check [options] <message-file>
@@ -90,44 +76,44 @@ pub fn main() !void {
 
     while (args.next()) |a| {
         if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             return;
         } else if (mem.eql(u8, a, "-f")) {
-            path = args.next() orelse return fatal("missing argument for -f");
+            path = args.next() orelse return cli.fatal("missing argument for -f");
         } else if (mem.eql(u8, a, "-n")) {
-            nameserver = args.next() orelse return fatal("missing argument for -n");
+            nameserver = args.next() orelse return cli.fatal("missing argument for -n");
         } else if (mem.eql(u8, a, "-p")) {
-            const raw = args.next() orelse return fatal("missing argument for -p");
-            port = std.fmt.parseInt(u16, raw, 10) catch return fatal("-p must be a port number");
+            const raw = args.next() orelse return cli.fatal("missing argument for -p");
+            port = std.fmt.parseInt(u16, raw, 10) catch return cli.fatal("-p must be a port number");
         } else if (mem.eql(u8, a, "-b")) {
-            const raw = args.next() orelse return fatal("missing argument for -b");
-            min_key_bits = std.fmt.parseInt(u32, raw, 10) catch return fatal("-b must be a number");
+            const raw = args.next() orelse return cli.fatal("missing argument for -b");
+            min_key_bits = std.fmt.parseInt(u32, raw, 10) catch return cli.fatal("-b must be a number");
         } else if (mem.eql(u8, a, "-v")) {
             verbose = true;
         } else if (a.len > 0 and a[0] == '-') {
-            return fatal("unknown option (use -h for help)");
+            return cli.fatal("unknown option (use -h for help)");
         } else {
             path = a;
         }
     }
 
-    const msg_path = path orelse return fatal("a message file is required (use -h for help)");
+    const msg_path = path orelse return cli.fatal("a message file is required (use -h for help)");
 
     const raw = std.fs.cwd().readFileAlloc(allocator, msg_path, MAX_MESSAGE_BYTES) catch |err| {
-        writeErr("securearc-check: cannot read ");
-        writeErr(msg_path);
-        writeErr(": ");
-        writeErr(@errorName(err));
-        writeErr("\n");
+        cli.err("securearc-check: cannot read ");
+        cli.err(msg_path);
+        cli.err(": ");
+        cli.err(@errorName(err));
+        cli.err("\n");
         process.exit(2);
     };
     defer allocator.free(raw);
 
-    var msg = msgfile.parseMessage(allocator, raw) catch return fatal("out of memory parsing message");
+    var msg = msgfile.parseMessage(allocator, raw) catch return cli.fatal("out of memory parsing message");
     defer msg.deinit();
 
     const headers = toArcHeaders(msg.arena.allocator(), msg.fields) catch
-        return fatal("out of memory converting headers");
+        return cli.fatal("out of memory converting headers");
 
     const ns_slice: []const []const u8 = &.{nameserver};
     var resolver = dns_mod.Resolver.init(allocator, .{
@@ -145,19 +131,19 @@ pub fn main() !void {
     // would defeat the point of the chain. The conformance suite tests that
     // distinction directly, which is why the check tool must not simplify it.
     const sets = arc.parseArcSets(allocator, headers) catch |err| {
-        if (err == error.OutOfMemory) return fatal("out of memory parsing ARC sets");
-        writeOut("fail");
+        if (err == error.OutOfMemory) return cli.fatal("out of memory parsing ARC sets");
+        cli.out("fail");
         if (verbose) {
-            writeOut(" reason=");
-            writeOut(arc.describeChainError(err));
+            cli.out(" reason=");
+            cli.out(arc.describeChainError(err));
         }
-        writeOut("\n");
+        cli.out("\n");
         return;
     };
     defer allocator.free(sets);
 
     if (sets.len == 0) {
-        writeOut("none\n");
+        cli.out("none\n");
         return;
     }
 
@@ -175,9 +161,9 @@ pub fn main() !void {
     // run that silently accepted `fail` for a DNS outage would be scoring the
     // wrong thing.
     switch (result.evaluation) {
-        .complete => writeOut(chainToString(result.status)),
-        .dns_temp_error => writeOut("temperror"),
-        .internal_error => writeOut("internalerror"),
+        .complete => cli.out(chainToString(result.status)),
+        .dns_temp_error => cli.out("temperror"),
+        .internal_error => cli.out("internalerror"),
     }
     if (verbose) {
         var buf: [256]u8 = undefined;
@@ -185,9 +171,9 @@ pub fn main() !void {
             result.highest_instance,
             result.failure_reason orelse "-",
         }) catch " (detail unavailable)";
-        writeOut(extra);
+        cli.out(extra);
     }
-    writeOut("\n");
+    cli.out("\n");
 }
 
 /// `unknown` is deliberately given its own token rather than being folded into

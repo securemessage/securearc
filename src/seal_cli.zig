@@ -32,6 +32,7 @@ const process = std.process;
 const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securearc-seal");
 const dns_mod = securemilter.dns;
 const connection_mod = securemilter.connection;
 
@@ -44,24 +45,6 @@ const sealbuild = @import("sealbuild.zig");
 const msgfile = @import("msgfile.zig");
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
-
-fn writeOut(data: []const u8) void {
-    var written: usize = 0;
-    while (written < data.len) {
-        written += posix.write(posix.STDOUT_FILENO, data[written..]) catch return;
-    }
-}
-
-fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
-}
-
-fn fatal(msg: []const u8) noreturn {
-    writeErr("securearc-seal: ");
-    writeErr(msg);
-    writeErr("\n");
-    process.exit(2);
-}
 
 const Usage =
     \\Usage: securearc-seal [options] <message-file>
@@ -124,42 +107,42 @@ fn parseArgs() Args {
 
     while (it.next()) |a| {
         if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             process.exit(0);
         } else if (mem.eql(u8, a, "-d")) {
-            r.domain = it.next() orelse fatal("-d needs a value");
+            r.domain = it.next() orelse cli.fatal("-d needs a value");
         } else if (mem.eql(u8, a, "-s")) {
-            r.selector = it.next() orelse fatal("-s needs a value");
+            r.selector = it.next() orelse cli.fatal("-s needs a value");
         } else if (mem.eql(u8, a, "-k")) {
-            r.key_file = it.next() orelse fatal("-k needs a value");
+            r.key_file = it.next() orelse cli.fatal("-k needs a value");
         } else if (mem.eql(u8, a, "-a")) {
-            r.authserv_id = it.next() orelse fatal("-a needs a value");
+            r.authserv_id = it.next() orelse cli.fatal("-a needs a value");
         } else if (mem.eql(u8, a, "--headers")) {
-            r.signed_headers = it.next() orelse fatal("--headers needs a value");
+            r.signed_headers = it.next() orelse cli.fatal("--headers needs a value");
         } else if (mem.eql(u8, a, "--methods")) {
-            r.methods_raw = it.next() orelse fatal("--methods needs a value");
+            r.methods_raw = it.next() orelse cli.fatal("--methods needs a value");
         } else if (mem.eql(u8, a, "-t")) {
-            const raw = it.next() orelse fatal("-t needs a value");
-            r.timestamp = std.fmt.parseInt(u64, raw, 10) catch fatal("-t must be a number");
+            const raw = it.next() orelse cli.fatal("-t needs a value");
+            r.timestamp = std.fmt.parseInt(u64, raw, 10) catch cli.fatal("-t must be a number");
         } else if (mem.eql(u8, a, "-n")) {
-            r.nameserver = it.next() orelse fatal("-n needs a value");
+            r.nameserver = it.next() orelse cli.fatal("-n needs a value");
         } else if (mem.eql(u8, a, "-p")) {
-            const raw = it.next() orelse fatal("-p needs a value");
-            r.port = std.fmt.parseInt(u16, raw, 10) catch fatal("-p must be a port number");
+            const raw = it.next() orelse cli.fatal("-p needs a value");
+            r.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("-p must be a port number");
         } else if (mem.eql(u8, a, "-b")) {
-            const raw = it.next() orelse fatal("-b needs a value");
-            r.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch fatal("-b must be a number");
+            const raw = it.next() orelse cli.fatal("-b needs a value");
+            r.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("-b must be a number");
         } else if (a.len > 0 and a[0] == '-') {
-            fatal("unknown option (use -h for help)");
+            cli.fatal("unknown option (use -h for help)");
         } else {
             r.file = a;
         }
     }
 
-    if (r.file == null) fatal("a message file is required (use -h for help)");
-    if (r.domain == null) fatal("-d <domain> is required");
-    if (r.selector == null) fatal("-s <selector> is required");
-    if (r.key_file == null) fatal("-k <keyfile> is required");
+    if (r.file == null) cli.fatal("a message file is required (use -h for help)");
+    if (r.domain == null) cli.fatal("-d <domain> is required");
+    if (r.selector == null) cli.fatal("-s <selector> is required");
+    if (r.key_file == null) cli.fatal("-k <keyfile> is required");
     return r;
 }
 
@@ -218,18 +201,18 @@ pub fn main() !void {
     const args = parseArgs();
 
     const raw = std.fs.cwd().readFileAlloc(allocator, args.file.?, MAX_MESSAGE_BYTES) catch
-        fatal("cannot read the message file");
+        cli.fatal("cannot read the message file");
     defer allocator.free(raw);
 
-    var msg = msgfile.parseMessage(allocator, raw) catch fatal("out of memory parsing the message");
+    var msg = msgfile.parseMessage(allocator, raw) catch cli.fatal("out of memory parsing the message");
     defer msg.deinit();
     const a = msg.arena.allocator();
 
-    const headers = toArcHeaders(a, msg.fields) catch fatal("out of memory");
-    const local_methods = parseMethods(a, args.methods_raw) catch fatal("out of memory");
+    const headers = toArcHeaders(a, msg.fields) catch cli.fatal("out of memory");
+    const local_methods = parseMethods(a, args.methods_raw) catch cli.fatal("out of memory");
 
     var key = crypto.loadRsaKeyFile(args.key_file.?, args.min_key_bits) catch
-        fatal("cannot load the RSA private key");
+        cli.fatal("cannot load the RSA private key");
     defer key.deinit();
 
     // The chain already present decides our cv=, so it is validated first. Mirrors
@@ -238,7 +221,7 @@ pub fn main() !void {
     // broken chain to "unsealed" by malforming it.
     var parse_failed = false;
     const sets = arc.parseArcSets(allocator, headers) catch |err| blk: {
-        if (err == error.OutOfMemory) fatal("out of memory parsing ARC sets");
+        if (err == error.OutOfMemory) cli.fatal("out of memory parsing ARC sets");
         parse_failed = true;
         break :blk &[_]arc.ArcSet{};
     };
@@ -251,7 +234,7 @@ pub fn main() !void {
     if (arc.chainAlreadyBroken(sets)) return;
 
     const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
-    if (new_instance > arc.MAX_INSTANCES) fatal("the chain is already at the maximum instance");
+    if (new_instance > arc.MAX_INSTANCES) cli.fatal("the chain is already at the maximum instance");
 
     var resolver = dns_mod.Resolver.init(allocator, .{
         .nameservers = &.{args.nameserver},
@@ -277,17 +260,17 @@ pub fn main() !void {
             // forgery to every later hop -- audit A-12. The daemon makes this an
             // operator policy; a conformance tool has no operator, so it refuses
             // rather than inventing one and scoring the result.
-            .dns_temp_error => fatal("cannot determine cv=: transient DNS failure while " ++
+            .dns_temp_error => cli.fatal("cannot determine cv=: transient DNS failure while " ++
                 "validating the existing chain (sealing cv=fail would be permanent)"),
-            .internal_error => fatal("cannot determine cv=: internal error validating the chain"),
+            .internal_error => cli.fatal("cannot determine cv=: internal error validating the chain"),
         }
     };
 
-    const fds = posix.pipe2(.{ .NONBLOCK = true }) catch fatal("cannot create a pipe");
+    const fds = posix.pipe2(.{ .NONBLOCK = true }) catch cli.fatal("cannot create a pipe");
     defer posix.close(fds[0]);
 
     var conn = connectionFor(allocator, fds[1], msg.fields, msg.body) catch
-        fatal("out of memory building the connection");
+        cli.fatal("out of memory building the connection");
     defer conn.deinit();
 
     var failed_step: ?[]const u8 = null;
@@ -303,9 +286,9 @@ pub fn main() !void {
         .prior_sets = sets,
         .timestamp = args.timestamp orelse @intCast(std.time.timestamp()),
     }, &failed_step) catch {
-        writeErr("securearc-seal: sealing failed: ");
-        writeErr(failed_step orelse "building the ARC set");
-        writeErr("\n");
+        cli.err("securearc-seal: sealing failed: ");
+        cli.err(failed_step orelse "building the ARC set");
+        cli.err("\n");
         process.exit(1);
     };
     defer set.deinit();
@@ -313,13 +296,13 @@ pub fn main() !void {
     // Blank-line separated, which is the interface the ValiMail signing runner
     // expects. Values may contain CRLF+TAB folds; none contains a blank line, so
     // splitting on one recovers exactly three fields.
-    writeOut("ARC-Authentication-Results: ");
-    writeOut(set.aar);
-    writeOut("\n\n");
-    writeOut("ARC-Seal: ");
-    writeOut(set.seal);
-    writeOut("\n\n");
-    writeOut("ARC-Message-Signature: ");
-    writeOut(set.ams);
-    writeOut("\n");
+    cli.out("ARC-Authentication-Results: ");
+    cli.out(set.aar);
+    cli.out("\n\n");
+    cli.out("ARC-Seal: ");
+    cli.out(set.seal);
+    cli.out("\n\n");
+    cli.out("ARC-Message-Signature: ");
+    cli.out(set.ams);
+    cli.out("\n");
 }
