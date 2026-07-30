@@ -192,6 +192,169 @@ pub const SealCtx = struct {
     on_dns_error: OnDnsError,
 };
 
+/// What sealing should do about the chain already on the message.
+///
+/// `stamp_temperror` is a variant rather than something the decision writes itself,
+/// so every write to the message stays in `doSeal`. That is X-8 as a rule: a partial
+/// ARC set is worse than none, so one function emits and emits nothing until there is
+/// a complete set to emit.
+const ChainOutcome = union(enum) {
+    /// Extend the chain, sealing with this `cv=`.
+    seal: arc.ChainValidation,
+    /// Do not seal; return this milter code. The reason is already logged.
+    stop: u8,
+    /// Do not seal; stamp `arc=temperror` first, then continue.
+    ///
+    /// Carries the instance to report rather than letting the caller recompute it:
+    /// `chain.zig` sets `highest_instance` to the loop index, the offending set's
+    /// instance, the newest set's instance, or a literal 1 or 0 depending on where it
+    /// gave up, so it is **not** `sets[sets.len - 1].instance`.
+    stamp_temperror: struct {
+        reason: ?[]const u8,
+        instance: u8,
+    },
+};
+
+/// Decide the `cv=` value for the set we are about to add, or that we should add none.
+///
+/// Writes nothing to the message; logs, because the reason a chain was refused is the
+/// operator's only view of it.
+fn chainOutcome(
+    conn: *connection_mod.Connection,
+    ctx: SealCtx,
+    sets: []const arc.ArcSet,
+    all_headers: []const arc.Header,
+) ChainOutcome {
+    // No prior chain: we are the first hop, so there is nothing to validate and
+    // cv=none is the RFC 8617 §5.1.1 value for an initial seal.
+    if (sets.len == 0) return .{ .seal = .none };
+
+    // No body means no AMS can be checked, so the chain cannot be shown intact.
+    const body_data = conn.getBody() orelse return .{ .seal = .fail };
+
+    // This is where A-12 lived: `vr.status` was taken as the cv= value whatever
+    // produced it, so a nameserver blip while fetching a previous hop's key sealed
+    // cv=fail — permanent for the life of the message under RFC 8617 §5.1.2, and
+    // indistinguishable to every later hop from a forged signature.
+    const vr = ctx.msg.validate(conn.allocator, sets, all_headers, body_data);
+    switch (vr.evaluation) {
+        .complete => return .{ .seal = vr.status },
+
+        // Ours, not theirs. Defer unconditionally rather than record it against the
+        // chain (audit A-12a).
+        .internal_error => {
+            log.err("not sealing: internal error validating the chain: {s}", .{vr.failure_reason orelse "unknown"});
+            return .{ .stop = @intFromEnum(responses.Code.tempfail) };
+        },
+
+        .dns_temp_error => return dnsTempOutcome(ctx.on_dns_error, vr),
+    }
+}
+
+// The three `On-DNSError` policies, checked here rather than in `flow_test.zig`
+// because `dnsTempOutcome` is private and publishing it to reach a test is the trade
+// this suite has refused before (audit 11.21, treewalk.zig). Test blocks no longer
+// count against the file's ceiling (11.31), so beside the code is also the cheap
+// place.
+//
+// Testable at all only because the extraction left this a pure function: policy plus
+// a `ValidationResult` in, a decision out, no DNS and no daemon. That is the part of
+// the refactor worth the lines it cost.
+
+test "On-DNSError=tempfail defers rather than recording a permanent cv=fail" {
+    const out = dnsTempOutcome(.tempfail, .{
+        .status = .unknown,
+        .highest_instance = 3,
+        .failure_reason = "SERVFAIL from 192.0.2.1",
+        .evaluation = .dns_temp_error,
+    });
+    // A-12: the whole point is that a nameserver blip must not become a verdict.
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(responses.Code.tempfail)),
+        out.stop,
+    );
+}
+
+test "On-DNSError=seal-fail records the failure the operator asked for" {
+    const out = dnsTempOutcome(.seal_fail, .{
+        .status = .unknown,
+        .highest_instance = 2,
+        .failure_reason = "timeout",
+        .evaluation = .dns_temp_error,
+    });
+    try std.testing.expectEqual(arc.ChainValidation.fail, out.seal);
+}
+
+test "On-DNSError=skip-seal reports the instance validation gave up on, not the last set's" {
+    // The regression this pins: an earlier draft of the extraction recomputed the
+    // instance as `sets[sets.len - 1].instance`. `chain.zig` sets `highest_instance`
+    // to the loop index, the offending set's instance, the newest set's instance, or
+    // a literal 1 or 0 depending on where it stopped, so the two are different
+    // numbers whenever the chain broke anywhere but its newest set. 3 here stands for
+    // "gave up at instance 3", which no property of the set list would recover.
+    const out = dnsTempOutcome(.skip_seal, .{
+        .status = .unknown,
+        .highest_instance = 3,
+        .failure_reason = "SERVFAIL fetching i=3 key",
+        .evaluation = .dns_temp_error,
+    });
+    try std.testing.expectEqual(@as(u8, 3), out.stamp_temperror.instance);
+    try std.testing.expectEqualStrings(
+        "SERVFAIL fetching i=3 key",
+        out.stamp_temperror.reason.?,
+    );
+}
+
+test "a null failure_reason survives to the stamp" {
+    // `addArHeaderSimple` takes `?[]const u8`, so null must pass through as null
+    // rather than becoming the "transient DNS failure" placeholder used for logging.
+    // Those are two different strings for two different audiences.
+    const out = dnsTempOutcome(.skip_seal, .{
+        .status = .unknown,
+        .highest_instance = 1,
+        .failure_reason = null,
+        .evaluation = .dns_temp_error,
+    });
+    try std.testing.expect(out.stamp_temperror.reason == null);
+}
+
+/// Apply the operator's `On-DNSError` policy to a chain we could not evaluate.
+fn dnsTempOutcome(policy: OnDnsError, vr: chain.ValidationResult) ChainOutcome {
+    const reason = vr.failure_reason orelse "transient DNS failure";
+    switch (policy) {
+        // ASCII only: syslog rendered an em dash here as escaped bytes, which is
+        // noise in the one log line an operator reads when mail starts deferring.
+        .tempfail => {
+            log.warn(
+                "deferring: {s}; sealing cv=fail would be permanent (On-DNSError=tempfail)",
+                .{reason},
+            );
+            return .{ .stop = @intFromEnum(responses.Code.tempfail) };
+        },
+
+        // Pass through with no ARC set of ours. Safe for a hop that does not modify
+        // the message; if this hop does modify it, the previous hop's AMS now covers
+        // content we changed and the next hop computes cv=fail — so this moves who
+        // breaks the chain rather than saving it. That is the operator's call to
+        // make, because only they know whether this path rewrites mail.
+        .skip_seal => {
+            log.warn("not sealing: {s} (On-DNSError=skip-seal)", .{reason});
+            return .{ .stamp_temperror = .{
+                .reason = vr.failure_reason,
+                .instance = vr.highest_instance,
+            } };
+        },
+
+        .seal_fail => {
+            log.warn(
+                "sealing cv=fail after a transient DNS failure ({s}) because On-DNSError=seal-fail",
+                .{reason},
+            );
+            return .{ .seal = .fail };
+        },
+    }
+}
+
 /// `maybe_ctx` is optional rather than the caller skipping the call, so the
 /// truncation warning below still happens on a listener that is not configured to
 /// seal — which is the order the guards ran in before.
@@ -244,59 +407,17 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
     if (new_instance > arc.MAX_INSTANCES) return @intFromEnum(responses.Code.@"continue");
 
-    // Determine chain status for our seal.
-    //
-    // This is where A-12 lived: `vr.status` was taken as the cv= value whatever
-    // produced it, so a nameserver blip while fetching a previous hop's key
-    // sealed cv=fail — permanent for the life of the message under RFC 8617
-    // §5.1.2, and indistinguishable to every later hop from a forged signature.
-    const cv: arc.ChainValidation = if (sets.len == 0) .none else blk: {
-        const body_data = conn.getBody() orelse break :blk arc.ChainValidation.fail;
-        const vr = ctx.msg.validate(conn.allocator, sets, arc_headers.items, body_data);
-        switch (vr.evaluation) {
-            .complete => break :blk vr.status,
-            .internal_error => {
-                // Ours, not theirs. Defer unconditionally rather than record it
-                // against the chain (audit A-12a).
-                log.err("not sealing: internal error validating the chain: {s}", .{vr.failure_reason orelse "unknown"});
-                return @intFromEnum(responses.Code.tempfail);
-            },
-            .dns_temp_error => switch (ctx.on_dns_error) {
-                .tempfail => {
-                    // ASCII only: syslog rendered an em dash here as escaped
-                    // bytes, which is noise in the one log line an operator
-                    // reads when mail starts deferring.
-                    log.warn(
-                        "deferring: {s}; sealing cv=fail would be permanent (On-DNSError=tempfail)",
-                        .{vr.failure_reason orelse "transient DNS failure"},
-                    );
-                    return @intFromEnum(responses.Code.tempfail);
-                },
-                // Pass through with no ARC set of ours. Safe for a hop that does
-                // not modify the message; if this hop does modify it, the
-                // previous hop's AMS now covers content we changed and the next
-                // hop computes cv=fail — so this moves who breaks the chain
-                // rather than saving it. That is the operator's call to make,
-                // because only they know whether this path rewrites mail.
-                .skip_seal => {
-                    log.warn(
-                        "not sealing: {s} (On-DNSError=skip-seal)",
-                        .{vr.failure_reason orelse "transient DNS failure"},
-                    );
-                    addArHeaderSimple(conn, ctx.msg.authserv_id, "arc", "temperror", vr.failure_reason) catch |err|
-                        return auth_stamp.deferCode(err, "arc");
-                    publishEvent(ctx.msg.publisher, conn.allocator, "seal", "temperror", vr.highest_instance);
-                    return @intFromEnum(responses.Code.@"continue");
-                },
-                .seal_fail => {
-                    log.warn(
-                        "sealing cv=fail after a transient DNS failure ({s}) because On-DNSError=seal-fail",
-                        .{vr.failure_reason orelse "transient DNS failure"},
-                    );
-                    break :blk arc.ChainValidation.fail;
-                },
-            },
-        }
+    // `chainOutcome` decides and logs; the two non-sealing answers are acted on here,
+    // because this function owns every write to the message.
+    const cv: arc.ChainValidation = switch (chainOutcome(conn, ctx, sets, arc_headers.items)) {
+        .seal => |status| status,
+        .stop => |code| return code,
+        .stamp_temperror => |t| {
+            addArHeaderSimple(conn, ctx.msg.authserv_id, "arc", "temperror", t.reason) catch |err|
+                return auth_stamp.deferCode(err, "arc");
+            publishEvent(ctx.msg.publisher, conn.allocator, "seal", "temperror", t.instance);
+            return @intFromEnum(responses.Code.@"continue");
+        },
     };
 
     // Nothing here writes to the message until every header of the set exists. A

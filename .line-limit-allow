@@ -31,6 +31,46 @@
 #   that dupe-then-free does not crash. Neither touched the placeholder, so the file
 #   read as covered while its Critical defect was untested. Test total 67 -> 65.
 #
+# 2026-07-29, refactor plan stage 3.2: flow.zig 433 -> 501, A CEILING RAISED ON
+#   PURPOSE, which is the one thing this file exists to make deliberate.
+#
+#   doSeal was 136 lines at NESTING DEPTH 6 -- the deepest function in the repository.
+#   48 of those lines were a single labelled `blk:` block containing a `switch` inside
+#   a `switch`, whose whole job was to decide one value: the `cv=` of the set we are
+#   about to add. One question, four answers, six levels of indentation.
+#
+#   Now `ChainOutcome` names the four answers, `chainOutcome` decides, and
+#   `dnsTempOutcome` applies the operator's On-DNSError policy. Measured: doSeal 136 ->
+#   95 lines and depth 6 -> 4; the file's maximum depth 6 -> 4.
+#
+#   THE FILE GOT LONGER AND THAT IS THE CORRECT TRADE. A union type with its variants
+#   documented, plus two function signatures, is more lines than the block it replaced
+#   and fewer things to hold in your head at once. Length is the symptom this gate can
+#   measure; depth is what actually made doSeal hard to read.
+#
+#   OF THE 68 LINES, 14 ARE THE COMMENT INTRODUCING THE NEW TESTS, which sits outside
+#   the `test` blocks and therefore counts as production -- the known limitation
+#   recorded in 11.31. The extraction itself is +54. Noted because the first draft of
+#   this note said 487, measured before those tests existed, and a ceiling rationale
+#   whose numbers do not match the ceiling is worse than none.
+#
+#   Two hazards found while doing it, both recorded in the code rather than here:
+#     - `stamp_temperror` is a variant rather than a write inside the decision, so
+#       every write to the message stays in doSeal. That keeps X-8's rule structural.
+#     - the reported instance is CARRIED, not recomputed. An earlier draft substituted
+#       sets[sets.len-1].instance for vr.highest_instance; chain.zig sets that field to
+#       the loop index, the offending set's instance, the newest set's instance, or a
+#       literal 1 or 0 depending on where it gave up, so the two are not the same
+#       number whenever a chain broke anywhere but its newest set. Caught by reading
+#       chain.zig -- no case covered it, which is why FOUR NOW DO. Test total 65 -> 69,
+#       and the skip-seal one was teeth-checked by reintroducing the substitution:
+#       "expected 3, found 0".
+#
+#   The tests exist because the extraction made `dnsTempOutcome` pure -- policy and a
+#   ValidationResult in, a decision out, no DNS and no daemon. Before it, the same
+#   three branches were only reachable by standing up a resolver that fails
+#   transiently, which is why they had never been tested.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -43,6 +83,6 @@
 # preserved when the list is rewritten; this header and the entries
 # under it are regenerated every time a ceiling moves.
 628 src/chain.zig
-433 src/flow.zig
+501 src/flow.zig
 581 src/main.zig
 408 src/sealbuild.zig
