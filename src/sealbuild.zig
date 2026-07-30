@@ -149,7 +149,7 @@ pub fn buildAarContent(
 
     var found = false;
     for (conn.headers.items) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
         if (!auth_results.matchesAuthservId(hdr.value, authserv_id)) continue;
         if (!auth_results.assertsAnyMethod(hdr.value, local_auth_methods)) continue;
         if (auth_results.assertsMethodOutside(hdr.value, local_auth_methods)) {
@@ -214,18 +214,6 @@ pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
         offset = end;
     }
     return result.toOwnedSlice(allocator);
-}
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 /// Failure to build the set. The step that failed is reported out-of-band rather
