@@ -42,8 +42,7 @@
 # WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
 # preserved when the list is rewritten; this header and the entries
 # under it are regenerated every time a ceiling moves.
-552 src/arc.zig
-891 src/chain.zig
+628 src/chain.zig
 433 src/flow.zig
-615 src/main.zig
+604 src/main.zig
 420 src/sealbuild.zig
