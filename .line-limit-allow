@@ -160,6 +160,25 @@
 #   the shared helper regardless, so a future `c=` reaching that path does not
 #   silently inherit the bug, and the comment says exactly that.
 #
+# 2026-07-31, A-13: chain.zig 606 -> 628, +22.
+#
+#   RFC 8617 4.1.3 says the DKIM `h` tag on an ARC-Seal "is NOT allowed and, if found,
+#   MUST result in a cv status of fail". Nothing read `h=` on an AS, so the MUST was
+#   unimplemented -- the verdict came out `fail` anyway, but only because the fixed
+#   5.1.1 scope was used regardless and the hash therefore disagreed.
+#
+#   Seven lines of code: `sealCarriesH` beside `signsArcSeal`, and the branch in
+#   `verifySeal` ahead of the DNS lookup. The rest is the note explaining why an
+#   accidentally-correct verdict was still worth fixing -- the accident points the
+#   wrong way, since honouring `h=` on a seal would let a sealer choose which ARC
+#   headers its own seal covers.
+#
+#   THE VALIMAIL SUITE DOES NOT COVER THIS, which is why the unit test does. Its
+#   `as_fields_h_present` case looks like it should: the mock resolver NXDOMAINs
+#   test._domainkey.example.com, so the AMS fails at its key lookup and `verifySeal` is
+#   never reached. Established by making the new branch return `internal_error` (which
+#   maps to cv=unknown, not cv=fail) and watching the suite still score 171/171.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -172,7 +191,7 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-606 src/chain.zig
+628 src/chain.zig
 491 src/flow.zig
 626 src/main.zig
 412 src/sealbuild.zig

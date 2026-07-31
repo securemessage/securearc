@@ -176,8 +176,15 @@ fn extractRsaPublicKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn extractEd25519PublicKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    // This tool exists to print the PUBLIC key, but the file it is pointed at is a
+    // PRIVATE one, so the seed transits four buffers on the way to the answer: the
+    // file text, its base64 decoding, a fixed-size copy, and the expanded secret
+    // inside the derived keypair. None of them were wiped (audit C-1).
     const content = try std.fs.cwd().readFileAlloc(allocator, path, 4096);
-    defer allocator.free(content);
+    defer {
+        std.crypto.secureZero(u8, content);
+        allocator.free(content);
+    }
 
     // Find base64 content between PEM markers
     const begin_end = mem.indexOf(u8, content, "-----\n") orelse return error.InvalidPem;
@@ -186,16 +193,21 @@ fn extractEd25519PublicKey(allocator: std.mem.Allocator, path: []const u8) ![]u8
     const seed_b64 = content[data_start..][0..end_marker];
 
     const seed_bytes = try crypto.base64Decode(allocator, seed_b64);
-    defer allocator.free(seed_bytes);
+    defer {
+        std.crypto.secureZero(u8, seed_bytes);
+        allocator.free(seed_bytes);
+    }
 
     if (seed_bytes.len != 32) return error.InvalidSeedLength;
 
-    const Ed25519 = std.crypto.sign.Ed25519;
     var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
     @memcpy(&seed, seed_bytes);
-    const kp = try Ed25519.KeyPair.generateDeterministic(seed);
 
-    return crypto.base64Encode(allocator, &kp.public_key.toBytes());
+    var key = try crypto.loadEd25519Seed(seed);
+    defer key.deinit();
+
+    return crypto.base64Encode(allocator, &key.ed25519_key_pair.?.public_key.toBytes());
 }
 
 /// Find a tag value in a semicolon-separated tag-list.

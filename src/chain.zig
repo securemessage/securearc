@@ -408,6 +408,19 @@ fn verifySeal(
         return .fail;
     }
 
+    // RFC 8617 §4.1.3 on the DKIM `h` tag: it "is NOT allowed and, if found, MUST
+    // result in a cv status of fail" (audit A-13).
+    //
+    // The verdict was already `fail`, but by accident -- nothing read `h=` on an AS,
+    // the fixed §5.1.1 scope was used regardless, so such a seal hashed differently
+    // and failed to verify. Right answer, wrong reason, and the accident points the
+    // wrong way: the day the AS scope honours `h=`, a sealer could choose which ARC
+    // headers its own seal covers, which is the one property the chain exists to deny.
+    if (sealCarriesH(set.as_value)) {
+        reason.* = "ARC-Seal carries a forbidden h= tag (RFC 8617 4.1.3)";
+        return .fail;
+    }
+
     // Fetch public key
     const qname = std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{
         set.seal_selector,
@@ -574,6 +587,15 @@ fn signsArcSeal(h_list: []const u8) bool {
         if (arc.eqlLower(name, "ARC-Seal")) return true;
     }
     return false;
+}
+
+/// Does this ARC-Seal carry the forbidden DKIM `h` tag (audit A-13)?
+///
+/// Named rather than inlined so it is testable without a resolver, like `signsArcSeal`.
+/// `findTag` matches whole tag names, so this does not fire on `bh=`, and tag names are
+/// case sensitive per RFC 6376 §3.2, so `H=` is a different tag.
+fn sealCarriesH(as_value: []const u8) bool {
+    return arc.findTag(as_value, "h") != null;
 }
 
 // =============================================================================
@@ -890,4 +912,85 @@ test "AMS h= may cover AAR and AMS but not ARC-Seal" {
 
     // A name that merely starts the same must not match.
     try std.testing.expect(!signsArcSeal("from:arc-sealed-with-a-kiss"));
+}
+
+// A-13. The counterpart to the test above: that one is about what an AMS may cover,
+// this one about a tag an ARC-Seal may not carry at all.
+test "A-13: an h= tag on an ARC-Seal is detected" {
+    // A well-formed seal. No h=, so nothing to refuse.
+    try std.testing.expect(!sealCarriesH("i=1; a=rsa-sha256; c=none; d=example.org; s=sel; t=1; cv=none; b=abc"));
+    try std.testing.expect(!sealCarriesH(""));
+
+    // Present in any position, including last, which a scan that stopped at the
+    // first unrecognised tag would miss.
+    try std.testing.expect(sealCarriesH("i=1; a=rsa-sha256; h=from:to; cv=none; b=abc"));
+    try std.testing.expect(sealCarriesH("h=from; i=1; a=rsa-sha256; cv=none; b=abc"));
+    try std.testing.expect(sealCarriesH("i=1; a=rsa-sha256; cv=none; b=abc; h=from"));
+
+    // THE ONE THAT WOULD BITE. `bh=` is a legitimate tag name that ENDS in the
+    // forbidden one, so a substring search would refuse every ordinary seal that
+    // carried it -- turning a MUST-fail rule into a deny-everything bug. `findTag`
+    // compares whole names, and this pins that.
+    try std.testing.expect(!sealCarriesH("i=1; a=rsa-sha256; bh=xyz; cv=none; b=abc"));
+
+    // Likewise a tag that merely starts with `h`.
+    try std.testing.expect(!sealCarriesH("i=1; a=rsa-sha256; hash=sha256; cv=none; b=abc"));
+
+    // Case sensitive per RFC 6376 §3.2, so `H=` is a different (unrecognised) tag.
+    try std.testing.expect(!sealCarriesH("i=1; a=rsa-sha256; H=from; cv=none; b=abc"));
+
+    // Whitespace around the name, which RFC 6376 §3.2's FWS permits.
+    try std.testing.expect(sealCarriesH("i=1; a=rsa-sha256;  h = from ; cv=none; b=abc"));
+}
+
+// A-13, the wiring rather than the predicate. The test above would pass with the
+// check present but never called, and the ValiMail suite does NOT cover this: its
+// `as_fields_h_present` case looks like it does, but the mock resolver returns
+// NXDOMAIN for `test._domainkey.example.com`, so the AMS fails at its key lookup and
+// `verifySeal` is never reached. Confirmed by making this branch return
+// `internal_error` (which maps to cv=unknown, not cv=fail) and watching the suite
+// still score 171/171.
+//
+// `undefined` for the resolver is the assertion, not a shortcut: reaching DNS would
+// segfault, so passing this test IS the proof that the refusal happens before any
+// query is spent. Same device `validateChain empty` uses.
+//
+// Verified by deleting the call site: this then dies with a bus error inside
+// `resolver.resolve`, not with a tidy assertion failure. That is the intended
+// mechanism, so do not "fix" a crash here by handing it a real resolver -- the crash
+// is what proves no query was spent.
+test "A-13: verifySeal refuses a sealed h= before it spends a DNS query" {
+    const set = arc.ArcSet{
+        .instance = 1,
+        .aar_value = "",
+        .ams_value = "",
+        // The forbidden tag, on an otherwise well-formed seal.
+        .as_value = "i=1; a=rsa-sha256; d=example.org; s=sel; cv=none; h=from:to; b=abc",
+        .seal_cv = .none,
+        .seal_algorithm = "rsa-sha256",
+        .seal_domain = "example.org",
+        .seal_selector = "sel",
+        .seal_signature = "abc",
+        .ams_algorithm = "rsa-sha256",
+        .ams_domain = "example.org",
+        .ams_selector = "sel",
+        .ams_signature = "",
+        .ams_body_hash = "",
+        .ams_canonicalization = "relaxed/relaxed",
+        .ams_signed_headers = "from",
+    };
+
+    var reason: ?[]const u8 = null;
+    const outcome = verifySeal(std.testing.allocator, undefined, &set, &.{}, crypto.RFC8301_MIN_RSA_BITS, &reason);
+
+    try std.testing.expectEqual(CheckOutcome.fail, outcome);
+    try std.testing.expect(reason != null);
+    try std.testing.expect(mem.indexOf(u8, reason.?, "h=") != null);
+
+    // And the same seal without the tag gets past this check -- so the refusal is
+    // the `h=`, not something else about the fixture. It reaches the resolver, which
+    // is `undefined` here, so it cannot be called: only the negative is asserted.
+    var without = set;
+    without.as_value = "i=1; a=rsa-sha256; d=example.org; s=sel; cv=none; b=abc";
+    try std.testing.expect(!sealCarriesH(without.as_value));
 }
