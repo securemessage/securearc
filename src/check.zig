@@ -54,7 +54,7 @@ const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 /// are structurally identical and `msgfile` sits below both.
 fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header {
     const out = try a.alloc(arc.Header, fields.len);
-    for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value };
+    for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value, .had_space = f.had_space };
     return out;
 }
 

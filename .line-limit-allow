@@ -143,6 +143,23 @@
 #   NOT PAID DOWN HERE ON PURPOSE, same as the X-16(b) note above: these files are the
 #   roadmap's settings.zig extraction target and should be cut there, not nibbled here.
 
+# 2026-07-31, D-23: chain.zig 604 -> 606, main.zig 623 -> 626, sealbuild.zig 408 -> 412.
+#
+#   +9 across three files so an inbound AMS can be validated under the `c=` its
+#   sender chose. A milter is handed a header name and value, never the field's
+#   original octets, so the separator was fabricated as `name + ": " + value`;
+#   `c=simple` hashes the field verbatim, and an AMS whose field carried no space
+#   after the colon could not verify. See `securemilter-lib` `header.zig` for the
+#   measurement and the rule.
+#
+#   Where it went: `arc.Header.had_space` and `ArcSet.ams_had_space` (the AMS is
+#   part of its own signing input, so its own separator is hashed too), plus the
+#   `protocol_flags` entry and short comments. `sealbuild.zig` is the odd one --
+#   its four lines buy nothing today, because that path is hardcoded `.relaxed`
+#   and relaxed deletes whitespace around the colon either way. It renders through
+#   the shared helper regardless, so a future `c=` reaching that path does not
+#   silently inherit the bug, and the comment says exactly that.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -155,7 +172,7 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-604 src/chain.zig
+606 src/chain.zig
 491 src/flow.zig
-623 src/main.zig
-408 src/sealbuild.zig
+626 src/main.zig
+412 src/sealbuild.zig

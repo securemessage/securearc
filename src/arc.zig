@@ -28,6 +28,11 @@ pub const ArcSet = struct {
     aar_value: []const u8, // Raw AAR header value (the A-R content after "i=N;")
     ams_value: []const u8, // Raw AMS header value (DKIM-like signature tags)
     as_value: []const u8, // Raw AS header value (seal signature tags)
+    /// Whether a space followed the colon on the AMS header field itself.
+    /// The AMS is part of its own signing input, so validating it under
+    /// `c=simple` hashes this field verbatim and the separator has to be the
+    /// real one (audit D-23).
+    ams_had_space: bool = true,
     // Parsed seal fields (from AS header)
     seal_cv: ChainValidation,
     seal_algorithm: []const u8,
@@ -165,6 +170,7 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
                 .aar_value = "",
                 .ams_value = "",
                 .as_value = "",
+                .ams_had_space = true,
                 .seal_cv = .unknown,
                 .seal_algorithm = "",
                 .seal_domain = "",
@@ -195,6 +201,7 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
                 // than an absent one, the same reasoning as a missing instance.
                 sig_header.validateTagList(hdr.value) catch return error.MalformedTagList;
                 set.ams_value = hdr.value;
+                set.ams_had_space = hdr.had_space;
                 parseAmsTags(set, hdr.value);
             },
             .as => {
@@ -328,6 +335,22 @@ pub fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+    /// Whether a space followed the colon on the wire. Mirrors
+    /// `Connection.Header.had_space`, and must keep mirroring it: this type
+    /// exists so `arc.zig` need not depend on the milter transport, but a field
+    /// the copy drops is a field the AMS hash gets wrong under `c=simple`
+    /// (audit D-23). Defaults to the classic MTA behaviour.
+    had_space: bool = true,
+
+    /// Rebuild the field as it appeared on the wire. See
+    /// `Connection.Header.render`.
+    pub fn render(self: Header, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}:{s}{s}", .{
+            self.name,
+            if (self.had_space) " " else "",
+            self.value,
+        });
+    }
 };
 
 pub fn eqlLower(a: []const u8, b: []const u8) bool {

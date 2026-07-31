@@ -162,7 +162,7 @@ fn parseMethods(a: Allocator, raw: ?[]const u8) ![]const []const u8 {
 /// Field-for-field copy into `arc.Header`, which is what the chain code takes.
 fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header {
     const out = try a.alloc(arc.Header, fields.len);
-    for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value };
+    for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value, .had_space = f.had_space };
     return out;
 }
 
@@ -188,6 +188,7 @@ fn connectionFor(
     for (fields) |f| try conn.headers.append(allocator, .{
         .name = try allocator.dupe(u8, f.name),
         .value = try allocator.dupe(u8, f.value),
+        .had_space = f.had_space,
     });
     try conn.appendBody(body);
     return conn;

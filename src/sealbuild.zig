@@ -56,7 +56,11 @@ pub fn buildSigningHeaders(
         // The message's own field name, not the `h=` spelling of it: relaxed
         // canonicalization lowercases both, but simple preserves what the
         // message carried, and that is what a verifier hashes.
-        const full = try std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        // Rendered rather than fabricated. Relaxed deletes the whitespace around
+        // the colon so it cannot matter here, but knowing that is not this
+        // function's job, and a future `c=` reaching this path would inherit the
+        // bug (audit D-23).
+        const full = try hdr.render(conn.allocator);
         defer conn.allocator.free(full);
         const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
         defer conn.allocator.free(canonicalized);

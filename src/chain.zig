@@ -351,7 +351,7 @@ fn buildAmsSigningInput(
     // D-1 and made an oversigned AMS impossible to validate (audit A-6).
     var walk = header_select.walker(arc.Header, amsHeaderName, set.ams_signed_headers, all_headers);
     while (walk.next()) |hdr| {
-        const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        const full = try hdr.render(allocator);
         defer allocator.free(full);
         const canonicalized = try canon.canonicalizeHeader(allocator, header_canon, full);
         defer allocator.free(canonicalized);
@@ -359,9 +359,11 @@ fn buildAmsSigningInput(
         try buf.appendSlice(allocator, "\r\n");
     }
 
-    // Append AMS header with b= value emptied (for self-referencing signature)
-    const ams_full = std.fmt.allocPrint(allocator, "ARC-Message-Signature: {s}", .{set.ams_value}) catch
-        return error.OutOfMemory;
+    // Append AMS header with b= value emptied (for self-referencing signature).
+    // Rendered as it arrived: the AMS covers itself, so under `c=simple` its own
+    // separator is hashed verbatim (audit D-23).
+    const ams_hdr = arc.Header{ .name = "ARC-Message-Signature", .value = set.ams_value, .had_space = set.ams_had_space };
+    const ams_full = ams_hdr.render(allocator) catch return error.OutOfMemory;
     defer allocator.free(ams_full);
 
     // Remove the b= value: replace "b=<sig>" with "b=". Allocation failure used

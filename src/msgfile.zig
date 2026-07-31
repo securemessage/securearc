@@ -16,16 +16,23 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+// The one definition of how an MTA splits a header value, shared with the
+// milter path rather than reimplemented. This module exists to predict the
+// daemon; a second copy of that rule is the exact way it would stop.
+const splitLeadingSpace = @import("securemilter").connection.splitLeadingSpace;
+
 /// One header field as the MTA hands it over: name, and value with the single
 /// separating space already removed.
 ///
 /// Structurally identical to both `arc.Header` and
 /// `securemilter.connection.Header`, and deliberately its own type: this module
 /// sits below both and should not have to pick one. Callers convert, which is a
-/// field-for-field copy.
+/// field-for-field copy -- including `had_space`, whose whole purpose is lost if
+/// a copy drops it.
 pub const Field = struct {
     name: []const u8,
     value: []const u8,
+    had_space: bool = true,
 };
 
 /// A parsed message: header fields in order, plus the body. Owns its storage.
@@ -100,19 +107,19 @@ pub fn parseMessage(allocator: Allocator, raw: []const u8) !Message {
 /// field, and inventing a name for it would put a fabricated entry into the list
 /// the signature covers.
 ///
-/// **The space after the colon is dropped, on purpose.** A milter receives header
-/// values from the MTA with leading whitespace already removed unless it negotiates
-/// `SMFIP_HDR_LEADSPC`, which no daemon in this suite does — see the sendmail
-/// `xxfi_header` documentation, and `ProtocolFlags.header_leading_space` in
-/// `securemilter-lib`, which is defined and never requested. Keeping the space here
-/// would hand the verifier a byte sequence production never produces, and `simple`
-/// header canonicalization — which hashes the field verbatim — would disagree for
-/// every case.
+/// **The space after the colon is split off, not discarded.** A milter receives
+/// header values with one leading space already removed by the MTA; the daemons
+/// now negotiate `SMFIP_HDR_LEADSPC` and recover the bit that says whether there
+/// was one, so this models both halves — `value` as the daemon sees it, and
+/// `had_space` so the field can be rebuilt verbatim for `simple`.
 ///
-/// Exactly *one* space is removed, which is what production models today. Whether
-/// the MTA removes one or all of the leading WSP is the unresolved half of audit
-/// D-23; if it removes all, this line and the six production sites it mirrors are
-/// all wrong together, which is the point of them being one rule in one place.
+/// **Exactly one SP, and never a TAB.** D-23's open question is answered: both
+/// Postfix 3.11.5 and FreeBSD base sendmail strip one leading SP if and only if
+/// one is present, and leave a TAB alone (§11.40, and
+/// `test/measurements/d23-header-wsp/`). This line used to strip a leading TAB
+/// as well, which no MTA does — so for `Name:<TAB>value` it handed the verifier
+/// a byte sequence production never produces, in the module whose one job is to
+/// predict production.
 ///
 /// Continuation lines keep their own leading whitespace, which is also what the MTA
 /// delivers.
@@ -124,11 +131,11 @@ fn appendField(
     const field = mem.trimRight(u8, field_raw, "\r\n");
     if (field.len == 0) return;
     const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    var value = field[colon + 1 ..];
-    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
+    const split = splitLeadingSpace(field[colon + 1 ..]);
     try fields.append(a, .{
         .name = field[0..colon],
-        .value = value,
+        .value = split.value,
+        .had_space = split.had_space,
     });
 }
 
@@ -160,12 +167,29 @@ test "one space after the colon is removed, further whitespace is data" {
 
     try std.testing.expectEqual(@as(usize, 3), msg.fields.len);
     try std.testing.expectEqualStrings("a@b.c", msg.fields[0].value);
-    // The second space survives. See appendField: whether that matches the MTA is
-    // audit D-23's open question, and this test pins what we currently model so a
-    // change to it has to be deliberate.
+    // The second space survives, and D-23's question is now answered by
+    // measurement rather than pinned as a guess: the MTA removes one, not all.
     try std.testing.expectEqualStrings(" two spaces", msg.fields[1].value);
     try std.testing.expectEqualStrings("none", msg.fields[2].value);
     try std.testing.expectEqualStrings("body\r\n", msg.body);
+
+    // And the bit that lets `simple` rebuild the field verbatim.
+    try std.testing.expect(msg.fields[0].had_space);
+    try std.testing.expect(msg.fields[1].had_space);
+    try std.testing.expect(!msg.fields[2].had_space);
+}
+
+test "a leading TAB is data, not a separator" {
+    // Measured: neither Postfix nor sendmail strips a TAB. This parser used to,
+    // which made `Name:<TAB>value` unhashable under c=simple in exactly the tool
+    // that exists to predict the daemon.
+    const a = std.testing.allocator;
+    var msg = try parseMessage(a, "X-Tab:\tvalue\r\n\r\n");
+    defer msg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), msg.fields.len);
+    try std.testing.expectEqualStrings("\tvalue", msg.fields[0].value);
+    try std.testing.expect(!msg.fields[0].had_space);
 }
 
 test "folding is preserved and bare LF is normalised" {

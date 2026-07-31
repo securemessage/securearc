@@ -351,6 +351,9 @@ fn runDaemon() !void {
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
+        // An inbound AMS carries its own `c=`, so a sender can ask us to validate
+        // under simple, which hashes the field verbatim (audit D-23).
+        .protocol_flags = .{ .header_leading_space = true },
         .limits = arc_cfg.limits,
     };
 

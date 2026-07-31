@@ -109,7 +109,7 @@ pub fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     defer arc_headers.deinit(conn.allocator);
 
     for (conn.headers.items) |hdr| {
-        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
+        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value, .had_space = hdr.had_space }) catch continue;
     }
 
     // Parse ARC sets from headers.
@@ -385,7 +385,7 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     defer arc_headers.deinit(conn.allocator);
 
     for (conn.headers.items) |hdr| {
-        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value }) catch continue;
+        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value, .had_space = hdr.had_space }) catch continue;
     }
 
     // A chain we cannot parse cannot be extended: sealing it would attest to a
