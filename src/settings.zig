@@ -209,18 +209,11 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     seal_selector = seal_selector orelse global.get("SealSelector");
     seal_key_file = seal_key_file orelse global.get("SealKeyFile");
 
-    const dns_ns_raw = global.getOrDefault("DnsNameserver", "127.0.0.1");
-    var ns_list: std.ArrayListUnmanaged([]const u8) = .{};
-    var ns_iter = mem.splitSequence(u8, dns_ns_raw, ",");
-    while (ns_iter.next()) |part| {
-        const trimmed = mem.trim(u8, part, " \t");
-        if (trimmed.len > 0) try ns_list.append(allocator, trimmed);
-    }
-    const dns_nameservers = try ns_list.toOwnedSlice(allocator);
-    // Owned from here on, so it needs unwinding of its own: everything above is
-    // still an ArrayList with an errdefer, but this slice is not. Without this,
-    // any `try` added below silently leaks it — which is exactly what the
-    // On-DNSError validation did until it was moved to the top of the function.
+    // Owned slice, borrowed contents. It needs unwinding of its own: everything
+    // above is still an ArrayList with an errdefer, but this slice is not.
+    // Without this, any `try` added below silently leaks it — which is exactly
+    // what the On-DNSError validation did until it was moved to the top.
+    const dns_nameservers = try global.getCsvList(allocator, "DnsNameserver", "127.0.0.1");
     errdefer allocator.free(dns_nameservers);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
     const dns_retries = global.getInt("DnsRetries", u8, 2);
@@ -234,15 +227,8 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     // Empty by default: a host that runs nothing but the sealer has performed
     // no authentication, so its AAR must say so rather than repeat whatever the
     // sender wrote (RFC 8617 §5.1.1).
-    var methods: std.ArrayListUnmanaged([]const u8) = .{};
-    errdefer methods.deinit(allocator);
-    if (global.get("LocalAuthMethods")) |raw| {
-        var it = mem.splitSequence(u8, raw, ",");
-        while (it.next()) |part| {
-            const trimmed = mem.trim(u8, part, " \t");
-            if (trimmed.len > 0) try methods.append(allocator, trimmed);
-        }
-    }
+    const local_auth_methods = try global.getCsvList(allocator, "LocalAuthMethods", "");
+    errdefer allocator.free(local_auth_methods);
 
     // Trust boundary: remove every A-R header claiming our authserv-id, not
     // just the arc= results this daemon replaces (RFC 8601 §5).
@@ -277,7 +263,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .seal_selector = seal_selector,
         .seal_key_file = seal_key_file,
         .signed_headers = signed_headers,
-        .local_auth_methods = try methods.toOwnedSlice(allocator),
+        .local_auth_methods = local_auth_methods,
         .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
