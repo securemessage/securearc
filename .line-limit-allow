@@ -156,6 +156,6 @@
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
 604 src/chain.zig
-487 src/flow.zig
-589 src/main.zig
+491 src/flow.zig
+623 src/main.zig
 408 src/sealbuild.zig

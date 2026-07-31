@@ -192,6 +192,28 @@ fn getPublisher() *zmq.Publisher {
     return &tl_publisher.?;
 }
 
+// Thread-local DNS resolver (audit X-3).
+//
+// Validating a chain costs one public-key lookup per ARC set, and the sets in a
+// chain are hops on a path mail takes repeatedly -- the same forwarders, the same
+// mailing lists -- so the names repeat both within a message and across them. A
+// resolver built per message threw that away every time.
+//
+// Unlike the other three daemons this one takes its resolver settings from the
+// RCU snapshot rather than a startup global, so the config has to be handed in
+// rather than read from a global here. Whichever snapshot is current on the
+// first message after a load is the one this worker's resolver is built from;
+// `onWorkerReload` drops it when the generation advances, so it can never serve
+// a message under settings the operator has since replaced.
+threadlocal var tl_resolver: ?dns_mod.Resolver = null;
+
+fn getResolver(dns_config: dns_mod.ResolverConfig) *dns_mod.Resolver {
+    if (tl_resolver == null) {
+        tl_resolver = dns_mod.Resolver.initWithMonitor(g_allocator, dns_config, g_health_monitor);
+    }
+    return &tl_resolver.?;
+}
+
 fn usageError() error{InvalidArgument} {
     log.err("usage: securearc -c <config-file>", .{});
     return error.InvalidArgument;
@@ -401,8 +423,7 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 /// definitions would make the two files import each other.
 fn msgCtx(cfg: *const settings.Reloadable) MsgCtx {
     return .{
-        .dns_config = cfg.dns_config,
-        .health_monitor = g_health_monitor,
+        .resolver = getResolver(cfg.dns_config),
         .min_key_bits = cfg.min_key_bits,
         .authserv_id = cfg.authserv_id,
         .publisher = getPublisher(),
@@ -585,6 +606,19 @@ fn reloadConfig() void {
 }
 
 fn onWorkerReload() void {
+    // Drop this worker's resolver: it was built from the nameservers and cache
+    // sizing of a snapshot that has now been superseded, and keeping it would
+    // mean serving answers fetched under configuration the operator replaced.
+    //
+    // The resolver copies those nameserver strings rather than borrowing them
+    // (see dns/resolver.zig), which is what makes this safe to do here at all:
+    // the worker announces quiescence just *above* this call, so the retired
+    // snapshot -- and the strings in it -- may already have been freed by the
+    // time we get here.
+    if (tl_resolver) |*r| {
+        r.deinit();
+        tl_resolver = null;
+    }
     log.debug("worker: config reload acknowledged", .{});
 }
 

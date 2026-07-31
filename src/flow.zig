@@ -58,8 +58,12 @@ const foldBase64 = sealbuild.foldBase64;
 ///
 /// Constructed by `main.zig`, never here — see this file's header for why.
 pub const MsgCtx = struct {
-    dns_config: dns_mod.ResolverConfig,
-    health_monitor: ?*dns_mod.HealthMonitor,
+    /// This worker's resolver, not a per-message one (audit X-3). Validating a
+    /// chain costs one key lookup per ARC set, and a long chain revisits the
+    /// same signing domains, so the TTL cache has to survive the message to be
+    /// worth having at all. Owned by `main.zig` as thread-local state and
+    /// dropped on reload; borrowed here for the length of one message.
+    resolver: *dns_mod.Resolver,
     min_key_bits: u32,
     /// Who this hop identifies as in `Authentication-Results`. Lives here rather
     /// than on `SealCtx` because the verify path stamps too.
@@ -68,12 +72,14 @@ pub const MsgCtx = struct {
     /// this module never learns that events travel over ZMQ.
     publisher: *zmq.Publisher,
 
-    /// Validate `sets` against DNS, with a resolver that lives only for the call.
+    /// Validate `sets` against DNS.
     ///
-    /// Safe to destroy the resolver on return because every `failure_reason`
-    /// `chain.zig` can produce is a string literal — checked rather than assumed,
-    /// since a reason borrowed from resolver-owned memory would dangle here and
-    /// the callers below all read it after this returns.
+    /// Every `failure_reason` `chain.zig` can produce is a string literal --
+    /// checked rather than assumed, because the callers below all read it after
+    /// this returns. That mattered when the resolver died here; it still does,
+    /// for a different reason. The resolver now outlives the call, but its cache
+    /// evicts, so a reason borrowed from a cached DNS answer would dangle as soon
+    /// as some later lookup pushed that entry out.
     pub fn validate(
         self: MsgCtx,
         allocator: Allocator,
@@ -81,9 +87,7 @@ pub const MsgCtx = struct {
         all_headers: []const arc.Header,
         body_data: []const u8,
     ) chain.ValidationResult {
-        var resolver = dns_mod.Resolver.initWithMonitor(allocator, self.dns_config, self.health_monitor);
-        defer resolver.deinit();
-        return chain.validateChain(allocator, &resolver, sets, all_headers, body_data, self.min_key_bits);
+        return chain.validateChain(allocator, self.resolver, sets, all_headers, body_data, self.min_key_bits);
     }
 };
 
