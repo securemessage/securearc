@@ -491,13 +491,28 @@ pub fn emitArcSet(
     const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr);
     defer allocator.free(p_seal);
 
-    // Nothing fallible between here and the final write. Each addHeader prepends,
-    // so writing AAR, AMS, AS leaves the message reading AS, AMS, AAR downward —
-    // the conventional order for the newest set, and byte-for-byte what the
-    // previous code produced.
-    try codec.writePacket(fd, p_aar);
-    try codec.writePacket(fd, p_ams);
+    // Nothing fallible between here and the final write.
+    //
+    // WRITTEN SEAL-FIRST BECAUSE `addHeader` APPENDS. It builds SMFIR_ADDHEADER,
+    // which adds to the end of the header block; `insertHeader` is the one that
+    // takes an index. The previous code wrote AAR, AMS, AS believing each call
+    // prepended, and its comment named the intended result — "the message reading
+    // AS, AMS, AAR downward, the conventional order for the newest set". The intent
+    // was right and the mechanism was not, so the delivered order came out reversed.
+    // Measured on the lab, comparing the run immediately before this change with the
+    // one after it: AAR/AMS/AS at lines 21/22/31 became AS/AMS/AAR at 21/27/36
+    // (audit A-8).
+    //
+    // AS, AMS, AAR downward is what OpenARC emits and what every sealed example
+    // message in RFC 8617's test corpus shows. Neither is a requirement — §5 says
+    // "relative ordering of different trace header fields ... is unimportant" and
+    // receivers MUST cope with any order — so this is convention, not conformance.
+    // The order that IS mandated is the one fed to the seal's hash, AAR then AMS
+    // then AS per §5.1.1, and that lives in `sealbuild.buildSealInput`, untouched
+    // here. Conflating the two is what made A-8 prescribe the wrong fix.
     try codec.writePacket(fd, p_seal);
+    try codec.writePacket(fd, p_ams);
+    try codec.writePacket(fd, p_aar);
 }
 
 /// Defer the message after an internal failure while sealing (audit X-8).

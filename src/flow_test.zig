@@ -51,16 +51,28 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
 
         if (res) |_| {
             saw_success = true;
-            // All three present, and in the order that makes the message read
-            // ARC-Seal, AMS, AAR downward once each prepend is applied.
+            // All three present, seal first on the wire.
+            //
+            // THIS ASSERTION USED TO BE REVERSED, and its comment explained why:
+            // "in the order that makes the message read ARC-Seal, AMS, AAR downward
+            // once each prepend is applied". `addHeader` builds SMFIR_ADDHEADER,
+            // which appends -- nothing prepends -- so writing AAR first delivered
+            // AAR first, the reverse of the stated intent. The test asserted the
+            // write order and agreed with the code, so both were wrong together and
+            // neither could catch the other (audit A-8).
+            //
+            // Wire order is now the delivered top-down order: AS, AMS, AAR, matching
+            // OpenARC and RFC 8617's example messages. Not a conformance property --
+            // §5 calls relative trace-field order "unimportant" -- so this pins a
+            // convention, and pins that the mechanism still matches the intent.
             const aar_at = mem.indexOf(u8, buf[0..n], "ARC-Authentication-Results") orelse
                 return error.TestUnexpectedResult;
             const ams_at = mem.indexOf(u8, buf[0..n], "ARC-Message-Signature") orelse
                 return error.TestUnexpectedResult;
             const seal_at = mem.indexOf(u8, buf[0..n], "ARC-Seal") orelse
                 return error.TestUnexpectedResult;
-            try std.testing.expect(aar_at < ams_at);
-            try std.testing.expect(ams_at < seal_at);
+            try std.testing.expect(seal_at < ams_at);
+            try std.testing.expect(ams_at < aar_at);
         } else |_| {
             saw_failure = true;
             // The message must be untouched. Before X-8 was fixed, headers were
