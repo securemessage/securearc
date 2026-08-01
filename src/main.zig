@@ -325,7 +325,7 @@ fn runDaemon() !void {
         .pid_file = arc_cfg.pid_file,
         .user = arc_cfg.user,
         .worker_threads = arc_cfg.worker_threads,
-        .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
+        .max_connections = arc_cfg.max_connections,
         .num_listeners = @intCast(arc_cfg.listen_addresses.len),
         .spawn_threads = spawnHealthMonitor,
     });
@@ -367,7 +367,7 @@ fn runDaemon() !void {
         callbacks,
         shutdown_pipe[0],
         &g_config_gen,
-        worker_mod.DEFAULT_MAX_CONNECTIONS,
+        arc_cfg.max_connections,
     );
     defer threads.deinit(allocator);
 

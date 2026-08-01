@@ -14,6 +14,7 @@ const securemilter = @import("securemilter");
 const config_mod = securemilter.config;
 const listener_mod = securemilter.listener;
 const connection_mod = securemilter.connection;
+const worker_mod = securemilter.worker;
 const dns_mod = securemilter.dns;
 const header_scrub = securemilter.header_scrub;
 
@@ -96,6 +97,15 @@ pub const ArcConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
+    /// Per-worker cap on simultaneous connections, enforced in the accept path.
+    ///
+    /// No default on this field on purpose. It reached the worker as a hard-coded
+    /// `DEFAULT_MAX_CONNECTIONS` while `MaxConnections` was already read by
+    /// `securespf`, so the same key was honoured by one daemon and silently ignored
+    /// by this one (audit L-2). A field that quietly supplies a constant when the
+    /// caller forgets to set it is how that happens, so every construction site
+    /// states it.
+    max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
     user: ?[]const u8,
@@ -127,6 +137,12 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
 
     const authserv_id = global.get("AuthservID") orelse "localhost";
     const workers = global.getInt("WorkerThreads", u32, 0);
+
+    // Read beside `WorkerThreads` because the two are multiplied: `calculateFdNeed`
+    // sizes the RLIMIT_NOFILE raise as workers x (max_connections + listeners + 3),
+    // so raising either one alone is not the whole change.
+    const max_connections = global.getInt("MaxConnections", u32, worker_mod.DEFAULT_MAX_CONNECTIONS);
+
     const pid_file = global.getOrDefault("PidFile", "/var/run/securearc/securearc.pid");
     const foreground_val = global.getBool("Foreground", false);
     const user = global.get("User");
@@ -250,6 +266,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
         .worker_threads = workers,
+        .max_connections = max_connections,
         .pid_file = pid_file,
         .foreground = foreground_val,
         .user = user,

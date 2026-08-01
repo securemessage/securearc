@@ -8,6 +8,7 @@ const std = @import("std");
 
 const securemilter = @import("securemilter");
 const config_mod = securemilter.config;
+const worker_mod = securemilter.worker;
 
 const settings = @import("settings.zig");
 const Mode = settings.Mode;
@@ -39,6 +40,47 @@ test "parse config minimal" {
     try std.testing.expectEqual(@as(usize, 1), arc_cfg.listen_addresses.len);
     try std.testing.expectEqual(@as(usize, 1), arc_cfg.modes.len);
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.modes[0]);
+}
+
+// L-2: `MaxConnections` was read by `securespf` and ignored here, so an operator
+// who set it on this daemon got 256 and no diagnostic. The value has two
+// consumers -- the accept-path cap in `worker.handleAccept` and the
+// RLIMIT_NOFILE calculation in `daemon.calculateFdNeed` -- and wiring only one of
+// them would raise the fd budget without raising the limit that budget was sized
+// for, or the reverse.
+test "L-2: MaxConnections is honoured, and defaults when absent" {
+    {
+        var cfg = try config_mod.parse(std.testing.allocator,
+            \\[global]
+            \\AuthservID = mail.test.com
+            \\MaxConnections = 32
+        );
+        defer cfg.deinit();
+
+        const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+        defer std.testing.allocator.free(arc_cfg.listen_addresses);
+        defer std.testing.allocator.free(arc_cfg.modes);
+        defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+        defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+        try std.testing.expectEqual(@as(u32, 32), arc_cfg.max_connections);
+    }
+
+    {
+        var cfg = try config_mod.parse(std.testing.allocator,
+            \\[global]
+            \\AuthservID = mail.test.com
+        );
+        defer cfg.deinit();
+
+        const arc_cfg = try parseArcConfig(std.testing.allocator, &cfg);
+        defer std.testing.allocator.free(arc_cfg.listen_addresses);
+        defer std.testing.allocator.free(arc_cfg.modes);
+        defer std.testing.allocator.free(arc_cfg.dns_nameservers);
+        defer std.testing.allocator.free(arc_cfg.local_auth_methods);
+
+        try std.testing.expectEqual(worker_mod.DEFAULT_MAX_CONNECTIONS, arc_cfg.max_connections);
+    }
 }
 
 // X-14. A malformed Socket must be refused rather than skipped, and must not
@@ -477,6 +519,7 @@ fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const
         .authserv_id = authserv,
         .listen_addresses = &.{},
         .worker_threads = 1,
+        .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
         .pid_file = "/nonexistent",
         .foreground = true,
         .user = null,
