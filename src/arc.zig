@@ -2,6 +2,9 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const securemilter = @import("securemilter");
+const cfws = securemilter.cfws;
+
 const securemilter_crypto = @import("securemilter_crypto");
 const sig_header = securemilter_crypto.sig_header;
 
@@ -229,20 +232,73 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
     return result.toOwnedSlice(allocator);
 }
 
-/// Extract instance number from a header value (first tag must be i=N).
+/// The instance number of an ARC header field (audit A-11).
+///
+/// RFC 8617 gives all three ARC header fields the same shape, with `instance`
+/// lifted **out** of the tag list and placed before the semicolon:
+///
+///     instance     = [CFWS] %s"i" [CFWS] "=" [CFWS] position
+///     position     = 1*2DIGIT                         ; 1 - 50
+///     arc-info     = instance [CFWS] ";" authres-payload
+///     arc-ams-info = instance [CFWS] ";" tag-list
+///     arc-as-info  = instance [CFWS] ";" tag-list
+///
+/// So `i=` is not a member of the tag list at all, and the grammar requires it
+/// first. The previous implementation approximated that with
+/// `startsWith("i=")`, which is not the same thing in either direction:
+///
+///   * **Too strict.** `[CFWS]` is permitted in three places, and CFWS includes
+///     parenthesised comments. A conformant `(set 1) i = 1 ; cv=none` failed the
+///     prefix test, and the by-name fallback then read the tag name as
+///     `(set 1) i`, so the whole set was rejected as malformed. We were refusing
+///     mail the RFC allows.
+///   * **Too lenient.** Anything the prefix test missed fell through to a scan
+///     for `i=` anywhere in the field.
+///
+/// This parses the production properly and *keeps* the fallback. The fallback is
+/// a deliberate interop concession, not an oversight: OpenARC never checks the
+/// position at all -- `arc_parse_header_field` does only RFC 5322 field-level
+/// syntax and the value is fetched by name with `arc_param_get(set, "i")` --
+/// so enforcing the grammar would make us reject chains the reference
+/// implementation accepts, on an Experimental protocol, for no security gain.
+/// The instance is range-checked by the caller either way, and duplicate tags
+/// are already refused (A-16, A-17), so a late `i=` is not more forgeable.
+///
+/// Note `%s"i"`: RFC 7405 makes that a case-*sensitive* match, so `I=1` is not an
+/// instance tag. `findTag` is case-sensitive too, since A-17.
 fn parseInstance(value: []const u8) ?u8 {
-    const trimmed = mem.trimLeft(u8, value, &std.ascii.whitespace);
-    // i= must be the first meaningful token
-    if (!mem.startsWith(u8, trimmed, "i=")) {
-        // May have whitespace before or tag order may differ — scan for i=
-        if (findTag(trimmed, "i")) |val| {
-            return std.fmt.parseInt(u8, val, 10) catch null;
-        }
-        return null;
-    }
-    const after_eq = trimmed[2..];
-    const end = mem.indexOfAny(u8, after_eq, &.{ ';', ' ', '\t', '\r', '\n' }) orelse after_eq.len;
-    return std.fmt.parseInt(u8, after_eq[0..end], 10) catch null;
+    if (parseInstanceProduction(value)) |n| return n;
+
+    // Not where the grammar puts it. Accepted anyway, to match OpenARC.
+    if (findTag(value, "i")) |val| return std.fmt.parseInt(u8, val, 10) catch null;
+    return null;
+}
+
+/// `instance [CFWS] ";"` exactly as the ABNF spells it, or null.
+fn parseInstanceProduction(value: []const u8) ?u8 {
+    var i = cfws.skip(value, 0);
+
+    if (i >= value.len or value[i] != 'i') return null;
+    i = cfws.skip(value, i + 1);
+
+    if (i >= value.len or value[i] != '=') return null;
+    i = cfws.skip(value, i + 1);
+
+    // 1*2DIGIT. Bounded at two so `i=100` does not silently read as 10 and then
+    // leave `0` dangling -- it fails here and takes the fallback, which reads
+    // 100 and lets the caller reject it as over-length.
+    const start = i;
+    while (i < value.len and i - start < 2 and std.ascii.isDigit(value[i])) i += 1;
+    if (i == start) return null;
+    const n = std.fmt.parseInt(u8, value[start..i], 10) catch return null;
+
+    // The production continues `[CFWS] ";"`. Requiring it is what rejects a
+    // third digit, and what keeps this from matching some other tag that merely
+    // happens to begin with `i`.
+    const after = cfws.skip(value, i);
+    if (after >= value.len or value[after] != ';') return null;
+
+    return n;
 }
 
 /// Parse DKIM-like tags from AMS header value.
@@ -371,6 +427,53 @@ test "parseInstance basic" {
     try std.testing.expectEqual(@as(?u8, 1), parseInstance("i=1; cv=none; a=rsa-sha256"));
     try std.testing.expectEqual(@as(?u8, 3), parseInstance("i=3;cv=pass;a=rsa-sha256"));
     try std.testing.expectEqual(@as(?u8, null), parseInstance("cv=pass; a=rsa-sha256"));
+}
+
+test "A-11: CFWS is allowed everywhere the instance production allows it" {
+    // `instance = [CFWS] %s\"i\" [CFWS] \"=\" [CFWS] position`. Each of these is a
+    // conformant ARC header field, and every one of them was REJECTED before:
+    // the old prefix test needed a literal `i=`, and the by-name fallback then
+    // read the tag name as `(set 1) i` and gave up. We were refusing chains the
+    // RFC permits, which is the opposite of what A-11 describes.
+    try std.testing.expectEqual(@as(?u8, 1), parseInstance("(set 1) i=1; cv=none"));
+    try std.testing.expectEqual(@as(?u8, 1), parseInstance("i = 1 ; cv=none"));
+    try std.testing.expectEqual(@as(?u8, 2), parseInstance("i (why not) = 2; cv=pass"));
+    try std.testing.expectEqual(@as(?u8, 7), parseInstance("  \t i=7;cv=pass"));
+    // Folding whitespace, which is what a real header carries once unfolded.
+    try std.testing.expectEqual(@as(?u8, 4), parseInstance("\r\n i=4; cv=none"));
+    // Nested comments are still one comment.
+    try std.testing.expectEqual(@as(?u8, 5), parseInstance("(a (b) c) i=5; cv=none"));
+}
+
+test "A-11: the instance tag is case-sensitive" {
+    // RFC 7405 %s makes `%s\"i\"` a case-sensitive literal, and findTag has been
+    // case-sensitive since A-17, so neither path may accept `I=`.
+    try std.testing.expectEqual(@as(?u8, null), parseInstance("I=1; cv=none"));
+}
+
+test "A-11: a tag merely beginning with i is not the instance" {
+    // The production requires `=` (modulo CFWS) straight after the `i`. Without
+    // the trailing-`;` and next-character checks this could latch onto the wrong
+    // tag entirely and report someone else's value as the instance.
+    try std.testing.expectEqual(@as(?u8, 1), parseInstance("instance=5; i=1; cv=none"));
+}
+
+test "A-11: position is 1*2DIGIT, and a longer number still reaches the caller" {
+    // `position` is at most two digits, so `i=100` does not match the production.
+    // It must not be truncated to 10 -- that would silently graft a header onto
+    // the wrong ARC set. It falls through to the fallback, which reads 100, and
+    // the caller rejects it with ChainTooLong against MAX_INSTANCES.
+    try std.testing.expectEqual(@as(?u8, 100), parseInstance("i=100; cv=none"));
+    try std.testing.expectEqual(@as(?u8, 50), parseInstance("i=50; cv=none"));
+}
+
+test "A-11: an instance outside the production is still accepted, matching OpenARC" {
+    // Deliberate, not an oversight. OpenARC fetches the instance by name with
+    // `arc_param_get(set, \"i\")` and never checks its position, so refusing this
+    // would cv=fail chains the reference implementation validates. If this ever
+    // flips to null, that is the strictness decision being taken on purpose.
+    try std.testing.expectEqual(@as(?u8, 2), parseInstance("a=rsa-sha256; i=2; cv=pass"));
+    try std.testing.expectEqual(@as(?u8, 3), parseInstance("cv=pass; a=rsa-sha256; i=3"));
 }
 
 test "findTag" {
