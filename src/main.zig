@@ -479,7 +479,11 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
-    const client_addr = conn.macros.client_addr orelse "unknown";
+    // Via the accessor, not the macro: {client_addr} is absent from Postfix's
+    // default milter_connect_macros, so reading it directly logs "unknown" for
+    // every connection on a stock MTA. The accessor falls back to the address
+    // SMFIC_CONNECT carried. Here the placeholder is display-only.
+    const client_addr = conn.clientAddr() orelse "unknown";
     const peer = conn.getPeerDisplay();
     // The queue id, peer name and client address are attacker-influenced -- the
     // peer name comes from rDNS the sender may control -- so each is rendered as
