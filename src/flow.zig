@@ -450,8 +450,14 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     defer set.deinit();
 
     // The whole set exists now, so it can go out as a unit.
-    emitArcSet(conn.allocator, conn.fd, set.aar, set.ams, set.seal) catch
-        return sealInternalError("writing the ARC set");
+    emitArcSet(
+        conn.allocator,
+        conn.fd,
+        conn.negotiated_protocol.header_leading_space,
+        set.aar,
+        set.ams,
+        set.seal,
+    ) catch return sealInternalError("writing the ARC set");
 
     publishEvent(ctx.msg.publisher, conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
@@ -480,26 +486,29 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
 pub fn emitArcSet(
     allocator: Allocator,
     fd: posix.fd_t,
+    leading_space: bool,
     aar: []const u8,
     ams: []const u8,
     seal_hdr: []const u8,
 ) !void {
-    // `false` on all three, deliberately, and for the same reason the signing
-    // path in `securedkim` passes it: these fields are hashed, so the bytes after
-    // the colon must be exactly the bytes that were canonicalized. The AMS covers
-    // itself with an empty `b=`, and a sender may ask for `c=simple`, which hashes
-    // the field verbatim; the AS covers AAR, AMS and AS. Introducing a separator
-    // here would transmit something other than what was sealed.
+    // These three are hashed, so the transmitted field has to be the octet string
+    // that was canonicalized: the AMS covers itself with an empty `b=`, and the AS
+    // covers AAR, AMS and AS. `sealbuild` builds all of them as `"Name: " ++ value`
+    // — with the separator — so that is what must arrive.
     //
-    // It is also why this function takes an fd rather than a `Connection` and does
-    // not consult `header_leading_space`: for a signed field there is no choice to
-    // make. Only the unsigned `Authentication-Results` below follows the
-    // negotiated flag.
-    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar, false);
+    // Which is why the negotiated flag belongs here rather than a fixed `false`.
+    // The separator is written by the milter when it owns it and by the MTA
+    // otherwise, and exactly one of them does, so the wire reads `"Name: " ++
+    // value` either way. Passing `false` transmits `"Name:" ++ value` whenever the
+    // flag is granted — one octet short of what was sealed. That is invisible today
+    // only because every ARC canonicalization here is `relaxed`, which deletes the
+    // whitespace around the colon before hashing; the first `c=simple` AMS to reach
+    // this path would have been sealed against bytes we never sent.
+    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar, leading_space);
     defer allocator.free(p_aar);
-    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams, false);
+    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams, leading_space);
     defer allocator.free(p_ams);
-    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr, false);
+    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr, leading_space);
     defer allocator.free(p_seal);
 
     // Nothing fallible between here and the final write.

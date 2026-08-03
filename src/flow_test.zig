@@ -38,6 +38,7 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
         const res = emitArcSet(
             failing.allocator(),
             fds[1],
+            true,
             "i=1; mail.test; spf=pass",
             "i=1; a=rsa-sha256; b=AAAA",
             "i=1; cv=none; a=rsa-sha256; b=BBBB",
