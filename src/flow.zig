@@ -484,11 +484,22 @@ pub fn emitArcSet(
     ams: []const u8,
     seal_hdr: []const u8,
 ) !void {
-    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar);
+    // `false` on all three, deliberately, and for the same reason the signing
+    // path in `securedkim` passes it: these fields are hashed, so the bytes after
+    // the colon must be exactly the bytes that were canonicalized. The AMS covers
+    // itself with an empty `b=`, and a sender may ask for `c=simple`, which hashes
+    // the field verbatim; the AS covers AAR, AMS and AS. Introducing a separator
+    // here would transmit something other than what was sealed.
+    //
+    // It is also why this function takes an fd rather than a `Connection` and does
+    // not consult `header_leading_space`: for a signed field there is no choice to
+    // make. Only the unsigned `Authentication-Results` below follows the
+    // negotiated flag.
+    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar, false);
     defer allocator.free(p_aar);
-    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams);
+    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams, false);
     defer allocator.free(p_ams);
-    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr);
+    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr, false);
     defer allocator.free(p_seal);
 
     // Nothing fallible between here and the final write.
@@ -547,7 +558,7 @@ pub fn addArHeaderSimple(
             .reason = reason,
             .properties = &.{},
         },
-    });
+    }, conn.negotiated_protocol.header_leading_space);
 }
 
 /// Publish a seal or verify event.
