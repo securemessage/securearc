@@ -246,6 +246,30 @@
 #
 #   Verified unchanged while recording these: unit 82/82, ValiMail 171/171.
 
+# 2026-08-04, LATER THE SAME DAY: main.zig 630 -> 647, the safe-key check.
+#
+#   SAID PLAINLY BECAUSE THE ENTRY ABOVE IS HOURS OLD. That note recorded 630,
+#   observed the file had grown four lines past 626, and named an extraction
+#   worth ~150 lines with a target of 484. This is the second growth since, and a
+#   ceiling that moves twice in a day is the pattern the note itself called out
+#   for `worker.zig` -- where a 121-line paydown was 94 lines spent. Recording it
+#   in the same terms rather than absorbing it quietly.
+#
+#   The seventeen lines are the two branches that report a refused seal key: one
+#   at startup where the load is fatal, one in `reloadSealKey` where it is not and
+#   the previous key stays live. Both were cut to a single `log` call each by
+#   moving the wording into `crypto.KEY_PERMISSIONS_ADVICE`, which is shared with
+#   securedkim so the three daemons cannot describe the same fault three ways.
+#   What remains is the branch itself, and it has to be a branch: the generic
+#   "failed to load" line sends an operator looking for a corrupt PEM, when the
+#   fault is a mode and the fix is one `chmod`.
+#
+#   The extraction target is unchanged at 484 and none of this lands in the RCU
+#   reload block that the target covers -- so the case for taking it is now
+#   stronger by seventeen lines, and no harder. If this file grows a third time
+#   before that extraction happens, the extraction should stop waiting for reload
+#   to be touched for its own sake and simply be scheduled.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -261,5 +285,5 @@
 420 src/arc.zig
 628 src/chain.zig
 526 src/flow.zig
-630 src/main.zig
+647 src/main.zig
 412 src/sealbuild.zig

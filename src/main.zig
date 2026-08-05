@@ -288,12 +288,18 @@ fn runDaemon() !void {
         // seal at all, because it claims a chain of custody that cannot be
         // checked.
         const min_bits = crypto.RFC8301_MIN_RSA_BITS;
-        var key = crypto.loadRsaKeyFile(key_path, min_bits) catch |err| {
+        var key = crypto.loadRsaKeyFile(key_path, min_bits, .require_safe) catch |err| {
             if (err == error.RsaKeyTooSmall) {
                 log.err(
                     "seal key {s} is below the RFC 8301 minimum of {d} bits: refusing to seal with it",
                     .{ key_path, min_bits },
                 );
+            } else if (err == error.KeyFilePermissionsTooOpen) {
+                log.err("seal key {s} is mode {o}, {s}", .{
+                    key_path,
+                    crypto.keyFileMode(key_path) catch 0,
+                    crypto.KEY_PERMISSIONS_ADVICE,
+                });
             } else {
                 log.err("failed to load seal key {s}: {}", .{ key_path, err });
             }
@@ -528,8 +534,19 @@ fn modeFor(listener_index: usize) Mode {
 /// rather than failing the reload, because the alternative is a daemon that stops
 /// sealing over a typo in a path it is not yet using.
 fn reloadSealKey(key_path: []const u8) void {
-    var key = crypto.loadRsaKeyFile(key_path, crypto.RFC8301_MIN_RSA_BITS) catch {
-        log.warn("reload: failed to reload seal key {s}", .{key_path});
+    var key = crypto.loadRsaKeyFile(key_path, crypto.RFC8301_MIN_RSA_BITS, .require_safe) catch |err| {
+        // Named separately from the generic failure: that line would send an
+        // operator looking for a corrupt PEM. Keeping the previous key is right
+        // either way -- it still works, and not adopting an exposed one is the point.
+        if (err == error.KeyFilePermissionsTooOpen) {
+            log.warn("reload: seal key {s} is mode {o}, {s} -- keeping previous key", .{
+                key_path,
+                crypto.keyFileMode(key_path) catch 0,
+                crypto.KEY_PERMISSIONS_ADVICE,
+            });
+        } else {
+            log.warn("reload: failed to reload seal key {s}", .{key_path});
+        }
         return;
     };
 

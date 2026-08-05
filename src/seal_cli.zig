@@ -212,8 +212,15 @@ pub fn main() !void {
     const headers = toArcHeaders(a, msg.fields) catch cli.fatal("out of memory");
     const local_methods = parseMethods(a, args.methods_raw) catch cli.fatal("out of memory");
 
-    var key = crypto.loadRsaKeyFile(args.key_file.?, args.min_key_bits) catch
+    // Same standard as the daemon: this command emits real seals with a real
+    // domain key, so a key anyone can read is refused here too rather than being
+    // a daemon-only rule that the CLI quietly undercuts.
+    var key = crypto.loadRsaKeyFile(args.key_file.?, args.min_key_bits, .require_safe) catch |err| {
+        if (err == error.KeyFilePermissionsTooOpen) {
+            cli.fatal("the RSA private key is readable beyond its owner; chmod 600 it");
+        }
         cli.fatal("cannot load the RSA private key");
+    };
     defer key.deinit();
 
     // The chain already present decides our cv=, so it is validated first. Mirrors
