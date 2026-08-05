@@ -314,6 +314,48 @@
 #   is duplicated in shape across all four daemons, which makes it a candidate
 #   for securemilter-lib rather than for a second file here.
 #
+# 2026-08-05, THE RELOCATED TESTS CAME HOME. sealbuild.zig 412 -> 490,
+# settings.zig 403 -> 443, main.zig 648 -> 645, flow.zig 526 unchanged.
+#
+#   `settings_test.zig`, `sealbuild_test.zig` and `flow_test.zig` are deleted and
+#   their tests are back beside the code they cover. Each of those files said in
+#   its own header that it existed "so neither the code nor its tests is counted
+#   against the other's length" -- which is the relocation loophole stated as a
+#   design note, three months after the gate closed it. THE STANDING RULE, now
+#   also in the gate's header: comments and tests never count, and a test lives
+#   beside the thing it tests. Both halves are needed. Only the first is a metric.
+#
+#   THIS IS WHAT THE SPLIT WAS HIDING, and it is the reason the raise is honest
+#   rather than a regression. A test BODY and the comment above it cost nothing
+#   wherever they sit -- `prod_lines` discards both -- so folding the tests back
+#   in was free for flow.zig (526, unchanged, still exactly on its ceiling) and
+#   free for securedmarc's dmarc.zig (511, unchanged, and it had had NO tests of
+#   its own left at all). What is NOT free is shared test SUPPORT, because a
+#   helper is a top-level declaration wherever it lives:
+#
+#     sealbuild.zig  +78   `connWith` (a Connection over a real pipe, since
+#                          `deinit` closes whatever fd it is handed), `our_id`,
+#                          `priorSets`, and the two comment blocks explaining
+#                          why the AAR trust rule and the A-20 seal scope are
+#                          pinned directly -- the second says plainly that the
+#                          ValiMail suite stays 17/17 with the fix reverted, so
+#                          the prose is the evidence, not decoration. +1 more
+#                          for `const posix`, used at fourteen call sites.
+#     settings.zig   +40   `scratchConfig` plus the A-14 snapshot note; the
+#                          helper is 29 lines because an `ArcConfig` has 24
+#                          fields and the test needs its strings in scratch
+#                          memory to prove the snapshot copied them.
+#
+#   That cost existed before today. The split billed it to two files with no
+#   ceiling and no reader, which is exactly the accounting error the gate exists
+#   to stop -- so the number going up here is the number becoming true.
+#
+#   NO OBLIGATION TO UNDO, and deliberately no attempt to dodge it. Moving the
+#   helpers to a third file to keep these two numbers down is the same trade
+#   again with an extra step. If sealbuild.zig is ever cut, the seam is the one
+#   its own header already names -- AAR content versus signing-input
+#   canonicalization -- and the tests go with whichever half they cover.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -329,6 +371,6 @@
 420 src/arc.zig
 628 src/chain.zig
 526 src/flow.zig
-648 src/main.zig
-412 src/sealbuild.zig
-403 src/settings.zig
+645 src/main.zig
+490 src/sealbuild.zig
+443 src/settings.zig

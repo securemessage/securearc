@@ -35,12 +35,10 @@ pub const chain = @import("chain.zig");
 /// to move the code — a mechanical rename across a 1698-line file is exactly the
 /// kind of large diff that hides a real change inside it.
 pub const settings = @import("settings.zig");
-const settings_test = @import("settings_test.zig");
 
 /// Construction of the ARC set's header bytes. Aliased for the same reason as
 /// `settings` above: the move should not show up as a rename at every call site.
 pub const sealbuild = @import("sealbuild.zig");
-const sealbuild_test = @import("sealbuild_test.zig");
 
 /// How a message *file* becomes the view of a message a milter receives. Shared by
 /// `securearc-check` and `securearc-seal` so the two conformance tools cannot model
@@ -57,7 +55,6 @@ pub const msgfile = @import("msgfile.zig");
 /// the two functions below that snapshot it, which is why the dependency runs one way
 /// only — `flow.zig` does not import this file.
 pub const flow = @import("flow.zig");
-const flow_test = @import("flow_test.zig");
 
 const MsgCtx = flow.MsgCtx;
 const SealCtx = flow.SealCtx;
@@ -659,10 +656,7 @@ test {
     _ = arc;
     _ = chain;
     _ = settings;
-    _ = settings_test;
     _ = sealbuild;
-    _ = sealbuild_test;
     _ = msgfile;
     _ = flow;
-    _ = flow_test;
 }

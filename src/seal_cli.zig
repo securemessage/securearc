@@ -171,7 +171,7 @@ fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header
 ///
 /// The pipe is not ceremony: `Connection.deinit` closes whatever descriptor it was
 /// given, so handing it a fabricated number would close an unrelated file. The same
-/// approach is used by `sealbuild_test.zig`, and going through a real `Connection`
+/// approach is used by `connWith` in `sealbuild.zig`, and going through a real `Connection`
 /// rather than a refactored seam is what keeps this tool on the daemon's exact path.
 ///
 /// Header names and values are duplicated because a `Connection` owns its headers
