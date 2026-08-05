@@ -22,9 +22,10 @@ const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securearc-check");
 const dns_mod = securemilter.dns;
 
+const msgfile = securemilter.msgfile;
+
 const arc = @import("arc.zig");
 const chain = @import("chain.zig");
-const msgfile = @import("msgfile.zig");
 
 const Usage =
     \\Usage: securearc-check [options] <message-file>
@@ -50,9 +51,10 @@ const Usage =
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
 /// Convert the shared parser's fields into `arc.Header`, which is what
-/// `parseArcSets` and `validateChain` take. A field-for-field copy; the two types
-/// are structurally identical and `msgfile` sits below both.
-fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header {
+/// `parseArcSets` and `validateChain` take. A field-for-field copy, `had_space`
+/// included -- the bit exists so `c=simple` can rebuild the field verbatim, and a
+/// copy that drops it fails silently.
+fn toArcHeaders(a: Allocator, fields: []const msgfile.Header) ![]const arc.Header {
     const out = try a.alloc(arc.Header, fields.len);
     for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value, .had_space = f.had_space };
     return out;
@@ -109,10 +111,10 @@ pub fn main() !void {
     };
     defer allocator.free(raw);
 
-    var msg = msgfile.parseMessage(allocator, raw) catch return cli.fatal("out of memory parsing message");
+    var msg = msgfile.parseMessage(allocator, raw, true) catch return cli.fatal("out of memory parsing message");
     defer msg.deinit();
 
-    const headers = toArcHeaders(msg.arena.allocator(), msg.fields) catch
+    const headers = toArcHeaders(msg.arena.allocator(), msg.headers) catch
         return cli.fatal("out of memory converting headers");
 
     const ns_slice: []const []const u8 = &.{nameserver};

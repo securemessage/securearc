@@ -40,15 +40,6 @@ pub const settings = @import("settings.zig");
 /// `settings` above: the move should not show up as a rename at every call site.
 pub const sealbuild = @import("sealbuild.zig");
 
-/// How a message *file* becomes the view of a message a milter receives. Shared by
-/// `securearc-check` and `securearc-seal` so the two conformance tools cannot model
-/// production differently and report scores that are not comparable.
-///
-/// Referenced here, unused by the daemon, so that `zig build test` reaches its tests:
-/// the test module's root is this file, and a file only imported by a CLI would
-/// otherwise never be compiled into the test binary.
-pub const msgfile = @import("msgfile.zig");
-
 /// The end-of-message flow: validate a chain, and extend it.
 ///
 /// `flow` reads no global state. What is left here is the daemon's configuration and
@@ -651,12 +642,13 @@ fn onWorkerReload() void {
 // Every module has to be named here, not merely imported above. An unreferenced
 // `@import` is not analyzed, so its tests are silently absent from the run -- and a
 // test that does not run looks exactly like a test that passes. `msgfile` was added
-// with three tests and the total did not move, which is how this was noticed.
+// with three tests and the total did not move, which is how this was noticed. It is
+// no longer listed because it is no longer here: the message-file parser moved to
+// securemilter-lib in stage 5.2, and its tests run there.
 test {
     _ = arc;
     _ = chain;
     _ = settings;
     _ = sealbuild;
-    _ = msgfile;
     _ = flow;
 }

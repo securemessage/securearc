@@ -371,6 +371,6 @@
 420 src/arc.zig
 628 src/chain.zig
 526 src/flow.zig
-645 src/main.zig
+636 src/main.zig
 490 src/sealbuild.zig
 443 src/settings.zig

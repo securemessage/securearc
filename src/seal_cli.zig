@@ -39,10 +39,11 @@ const connection_mod = securemilter.connection;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 
+const msgfile = securemilter.msgfile;
+
 const arc = @import("arc.zig");
 const chain = @import("chain.zig");
 const sealbuild = @import("sealbuild.zig");
-const msgfile = @import("msgfile.zig");
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
@@ -160,7 +161,7 @@ fn parseMethods(a: Allocator, raw: ?[]const u8) ![]const []const u8 {
 }
 
 /// Field-for-field copy into `arc.Header`, which is what the chain code takes.
-fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header {
+fn toArcHeaders(a: Allocator, fields: []const msgfile.Header) ![]const arc.Header {
     const out = try a.alloc(arc.Header, fields.len);
     for (fields, 0..) |f, i| out[i] = .{ .name = f.name, .value = f.value, .had_space = f.had_space };
     return out;
@@ -180,7 +181,7 @@ fn toArcHeaders(a: Allocator, fields: []const msgfile.Field) ![]const arc.Header
 fn connectionFor(
     allocator: Allocator,
     fd: posix.fd_t,
-    fields: []const msgfile.Field,
+    fields: []const msgfile.Header,
     body: []const u8,
 ) !connection_mod.Connection {
     var conn = connection_mod.Connection.init(allocator, fd, 0, .{});
@@ -205,11 +206,11 @@ pub fn main() !void {
         cli.fatal("cannot read the message file");
     defer allocator.free(raw);
 
-    var msg = msgfile.parseMessage(allocator, raw) catch cli.fatal("out of memory parsing the message");
+    var msg = msgfile.parseMessage(allocator, raw, true) catch cli.fatal("out of memory parsing the message");
     defer msg.deinit();
     const a = msg.arena.allocator();
 
-    const headers = toArcHeaders(a, msg.fields) catch cli.fatal("out of memory");
+    const headers = toArcHeaders(a, msg.headers) catch cli.fatal("out of memory");
     const local_methods = parseMethods(a, args.methods_raw) catch cli.fatal("out of memory");
 
     // Same standard as the daemon: this command emits real seals with a real
@@ -277,7 +278,7 @@ pub fn main() !void {
     const fds = posix.pipe2(.{ .NONBLOCK = true }) catch cli.fatal("cannot create a pipe");
     defer posix.close(fds[0]);
 
-    var conn = connectionFor(allocator, fds[1], msg.fields, msg.body) catch
+    var conn = connectionFor(allocator, fds[1], msg.headers, msg.body) catch
         cli.fatal("out of memory building the connection");
     defer conn.deinit();
 
