@@ -179,6 +179,73 @@
 #   never reached. Established by making the new branch return `internal_error` (which
 #   maps to cv=unknown, not cv=fail) and watching the suite still score 171/171.
 #
+# 2026-08-04, securearc: three ceilings recorded, nothing split. Reasoning per
+# file below, and the growth is measured from the history in each case rather
+# than assumed. This repo is already the most-divided in the suite --
+# settings.zig, flow.zig, sealbuild.zig and msgfile.zig have all been cut out of
+# main.zig -- so what remains is not undivided bulk.
+#
+# main.zig 630, ceiling 626. FOUR LINES OVER.
+#
+#   589 after the pool move, then 623 at `5f65b5f` (X-3, MsgCtx carrying the
+#   worker's resolver instead of building one per message), 626 at `04d1e2a`
+#   (D-23) and `98cd5bd` (L-2), and 630 at `51c7330` -- logging the client
+#   address the protocol gave us rather than only the macro. That last commit is
+#   the whole of this breach.
+#
+#   THE SEAM IS REAL AND IS NOT BEING TAKEN TODAY, on grounds of proportion.
+#   Eight functions here are one concern -- `freeReloadable`, `adoptReloadable`,
+#   `snapshot`, `freeSealKey`, `boxSealKey`, `reloadSealKey`, `reloadConfig`,
+#   `onWorkerReload`, plus the two `Rcu` cells they publish through -- roughly
+#   150 lines of live-configuration swapping. Extracting it would take this file
+#   to about 484.
+#
+#   Against that: this is the most lifetime-critical code in the daemon. X-2
+#   (a seal key replaced between the two signatures of one ARC set), X-11
+#   (ownership of a value whose publication failed) and A-14 (a message running
+#   against a half-swapped configuration) were all fixed *in these functions*,
+#   and `onWorkerReload` reaches back into `main.zig`'s threadlocal resolver, so
+#   the move is not the one-way dependency the `cache.zig` split was. Trading a
+#   use-after-free risk in reload for four lines is a bad trade, and "it is only
+#   a file move" is exactly what would make such a bug easy to introduce.
+#
+#   THE NUMBER TO HIT WHEN IT IS TAKEN: 484, with the RCU cells and all eight
+#   functions moving together -- they share `g_reloadable`, `g_seal_key`,
+#   `g_config_gen`, `g_config_path` and `g_allocator`, so a partial move would
+#   leave the globals split across two files, which is worse than either end
+#   state. Best done when reload is being touched for its own sake.
+#
+# flow.zig 526, ceiling 491. THIRTY-FIVE LINES, ALL ARC ORDERING CORRECTNESS.
+#
+#   491 through D-23 and X-3, then three commits that are each about the bytes
+#   that actually go on the wire: 506 at `575bd9c` (emit the ARC set seal-first,
+#   because `addHeader` appends), 517 at `5000e83` (space the A-R and keep the
+#   sealed set byte-exact), 526 at `5d168c7` (seal what is transmitted --
+#   `emitArcSet` takes the negotiated flag).
+#
+#   RFC 8617 requires the seal to cover the set as transmitted, so the ordering,
+#   the spacing and the negotiated-flag handling are one rule with one failure
+#   mode: a chain that validates here and breaks at the next hop. Splitting the
+#   emit path from the seal path would put that rule in two files. The ValiMail
+#   suite passes 171/171 and is what holds this honest.
+#
+# arc.zig 420, twenty lines over the goal and no previous ceiling.
+#
+#   246 -> 285 (A-4/A-9) -> 317 -> 341 (ValiMail signing) -> 364 (D-23) -> 420
+#   at `c02655b`, parsing the instance production properly instead of
+#   approximating it (A-11). That commit is +56 and it is the one that put the
+#   file over.
+#
+#   It is one header parser: `parseArcSets` at ~125 lines with
+#   `parseInstanceProduction`, `parseAmsTags`, `parseSealTags`, `stripFws` and
+#   `findTag` beneath it, plus the small types they fill in. A-11 is precisely a
+#   case where approximating the grammar was the bug, so the production is
+#   spelled out; that is the length being bought. Cutting the helpers away from
+#   the parser that is their only caller would gain a file and lose the ability
+#   to read the grammar in one place.
+#
+#   Verified unchanged while recording these: unit 82/82, ValiMail 171/171.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -191,7 +258,8 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
+420 src/arc.zig
 628 src/chain.zig
-491 src/flow.zig
-626 src/main.zig
+526 src/flow.zig
+630 src/main.zig
 412 src/sealbuild.zig
