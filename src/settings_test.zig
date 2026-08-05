@@ -523,6 +523,7 @@ fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const
         .pid_file = "/nonexistent",
         .foreground = true,
         .user = null,
+        .umask = null,
         .dns_nameservers = ns,
         .dns_timeout_ms = 1234,
         .dns_retries = 3,

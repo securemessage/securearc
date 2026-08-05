@@ -330,6 +330,7 @@ fn runDaemon() !void {
         .foreground = arc_cfg.foreground,
         .pid_file = arc_cfg.pid_file,
         .user = arc_cfg.user,
+        .umask = arc_cfg.umask,
         .worker_threads = arc_cfg.worker_threads,
         .max_connections = arc_cfg.max_connections,
         .num_listeners = @intCast(arc_cfg.listen_addresses.len),

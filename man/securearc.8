@@ -75,7 +75,31 @@ Default:
 Run in foreground without daemonizing.
 Default: no.
 .It Cm User
-Drop privileges to this user after binding sockets.
+Drop privileges to this user, written as
+.Ql user
+or
+.Ql user:group .
+The drop happens before the listeners are bound, so a unix-domain socket is
+created owned by this user and group, and the directory holding it must be
+writable by them.
+Naming a group is what allows the socket to be shared with the MTA and nothing
+else; see
+.Cm UMask .
+Refused if the name resolves to UID 0, which would be a privilege drop that
+drops nothing.
+.It Cm UMask
+File-creation mask for the PID file and any unix-domain listener, in octal.
+Unset inherits the mask the daemon was started with, which leaves a unix socket
+at 0755 and so reachable by every local account \(em an unauthenticated sealing
+oracle for anyone with a shell on the host.
+.Li 0117
+creates it at 0660, owner and group only.
+A socket takes its mode from the umask in force when it is bound and cannot be
+narrowed afterwards without a window at the wider mode, so this is the only
+control over its permissions.
+Has no effect on a TCP listener, which has no filesystem permissions.
+Read as octal whether or not a leading zero is written; a value that is not
+valid octal is an error rather than a silent fallback.
 .It Cm Syslog
 Enable syslog output.
 Default: yes.

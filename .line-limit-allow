@@ -270,6 +270,50 @@
 #   before that extraction happens, the extraction should stop waiting for reload
 #   to be touched for its own sake and simply be scheduled.
 #
+# main.zig 647 -> 648. ONE LINE: `.umask = arc_cfg.umask,` in the bootstrap call.
+#
+#   The socket-permission work (UMask, and User accepting user:group). The daemon
+#   side of it is a single field forwarded to `bootstrap.run`; everything with any
+#   substance to it went into securemilter-lib's new `credentials.zig`, and the
+#   operator-facing explanation went into the man page and the conf sample.
+#
+#   THIS IS THE THIRD GROWTH, WHICH THE 647 ENTRY BELOW SAID WOULD BE THE TRIGGER:
+#   "if this file grows a third time before that extraction happens, the extraction
+#   should stop waiting for reload to be touched for its own sake and simply be
+#   scheduled." So it is scheduled, and deliberately NOT taken in this commit.
+#
+#   Why not here. The change that pushed it over is one line of config forwarding
+#   in a security fix; the extraction is ~150 lines of the most lifetime-critical
+#   code in the daemon, the code where X-2, X-11 and A-14 were each fixed. Landing
+#   both together produces a diff in which a use-after-free in ARC sealing could
+#   hide behind a socket-permissions change, and neither half can be reviewed on
+#   its own terms. That is a worse outcome than a file one line longer.
+#
+#   WHAT WAS LEARNED THIS TIME, which the earlier entries did not record: the
+#   eight functions are not self-contained even within main.zig. `g_seal_key` is
+#   read on the MESSAGE PATH (`.sign_key = g_seal_key.get()`), initialised during
+#   startup, and torn down at shutdown -- so the extraction is not a file move
+#   plus an import. It needs an accessor boundary that keeps the hot read cheap
+#   and keeps `Rcu` ownership on one side. Budget it as real work, not a shuffle.
+#
+#   Target unchanged: 484, all eight functions and both RCU cells together.
+#
+# settings.zig 400 -> 403. THREE LINES: the `umask` field, its doc line, and the
+# `getMode("UMask")` call.
+#
+#   Newly over the goal, by the same change and for the same reason as main.zig
+#   above. There is nothing to split: this file is one parser producing one
+#   struct, and the three lines are one option threaded through it exactly as
+#   every other option in the file is. Splitting a config parser by option would
+#   be the worst available answer.
+#
+#   Worth stating because it will come up again: this file grows by roughly three
+#   lines per configuration option, so it is a slow ratchet with no natural stop.
+#   If it reaches ~460 the seam to take is the listener sections -- per-listener
+#   `Socket`/`Mode` parsing is a self-contained loop with its own validation and
+#   is duplicated in shape across all four daemons, which makes it a candidate
+#   for securemilter-lib rather than for a second file here.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -285,5 +329,6 @@
 420 src/arc.zig
 628 src/chain.zig
 526 src/flow.zig
-647 src/main.zig
+648 src/main.zig
 412 src/sealbuild.zig
+403 src/settings.zig

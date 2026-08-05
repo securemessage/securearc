@@ -4,7 +4,30 @@ WorkerThreads   = 0
 Syslog          = yes
 SyslogFacility  = mail
 PidFile         = /var/run/securearc/securearc.pid
+
+# Drop privileges to this user, as "user" or "user:group".
+#
+# The drop happens BEFORE the listeners are bound, so a unix socket is created
+# owned by this user and group, and the directory it lives in must be writable
+# by them.
+#
+# Name the group the MTA runs in and the socket can be shared with Postfix and
+# nothing else. A sealing socket will seal what it is given, so anything that
+# can connect to it can have mail sealed as your domain.
 User            = _arc
+
+# File-creation mask for the PID file and any unix-domain listener.
+#
+# Read as OCTAL whether or not you write the leading zero. Unset inherits the
+# supervisor's mask, which for a unix socket means 0755 -- connectable by every
+# local account, i.e. an unauthenticated sealing oracle for anyone with a shell.
+#
+# 0117 gives a socket at 0660: owner and group only. Pair it with a group in
+# User above. A socket takes its mode from the umask at bind time, so this is
+# the only control there is.
+#
+# Does not apply to a TCP listener, which has no filesystem permissions.
+# UMask         = 0117
 Foreground      = no
 DnsNameserver   = 127.0.0.1
 DnsTimeout      = 5

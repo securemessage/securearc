@@ -82,7 +82,14 @@ def seal(message, privatekey, *, domain, selector, authserv_id, headers, timesta
         # is responsible when a body hash disagrees.
         with open(msg_path, "w", newline="") as f:
             f.write(message)
-        with open(key_path, "w", newline="") as f:
+        # 0600, created that way rather than chmod'ed afterwards. securearc-seal
+        # refuses a private key with any group or other bit set, the same rule the
+        # daemon applies to its sealing key; a plain open() here produced 0644 and
+        # the harness could not seal at all. Writing it correctly is the fix, not
+        # relaxing the tool -- a fixture that hands the sealer a world-readable
+        # private key is not modelling a deployment anyone should run.
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", newline="") as f:
             f.write(privatekey)
 
         cmd = [SEAL, "-d", domain, "-s", selector, "-k", key_path,
