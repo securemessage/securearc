@@ -1,3 +1,35 @@
+# 2026-08-05, EVERY NUMBER BELOW PREDATES A CHANGE TO WHAT IS COUNTED. Read the
+#   figures in the older notes as historical; they do not describe these files now.
+#
+#   Until today `prod_lines` charged a comment sitting above ordinary code and
+#   freed one only above a `test` -- while the checker's own header stated the rule
+#   as "comments and tests never count". The code now does what the header always
+#   said it did. Across the six packages that moved the counted total from 21,353
+#   to 12,408 -- 41% of what was being measured was comment text -- and the count
+#   of files over the goal from 15 to 2, with no code removed anywhere.
+#
+#   So a ceiling quoted below is a comment-INCLUSIVE number and cannot be compared
+#   against one measured today. The reasoning in those notes stands unchanged; only
+#   their figures are on the old scale. This package now has NO entries at all:
+#   chain.zig read 628 on the old scale and 381 on this one, main.zig 636 and 372,
+#   flow.zig 526 and 261, sealbuild.zig 490 and 267, settings.zig 443 and 256.
+#
+#   The notes below argue at length that chain.zig should stay whole because
+#   cutting it would separate an RFC 8617 rule from the record it reads. That
+#   argument was right and is now also cheap to hold: the file is 381 lines of
+#   logic and was never the 628 the gate was reporting.
+#
+#   THE CONSOLIDATION WORK IS NO LONGER JUSTIFIED BY LENGTH. Thirteen files stopped
+#   being flagged without losing a line of code. What still justifies it is
+#   duplication -- and this package supplied the worked example on the same day.
+#
+#   arc.zig held a FOURTH live copy of the tag scanner that lives in
+#   securemilter_crypto.sig_header. On the old scale it measured 420 and was ON THIS
+#   LIST -- so the gate was complaining, and complaining about the wrong thing: what
+#   was wrong was 17 lines of duplicated function, not 420 lines of file. On the new
+#   scale it measures 234 and the gate says nothing. Deleting the copy moved the
+#   number by 17. Neither calibration could see the defect, which is the whole point.
+#
 # 2026-07-29, the ARC signing-half work (audit 11.29). All three growths are the
 #   RFC 8617 5.1.2 and 5.1.3 fixes plus their reasoning, and seal_cli.zig at 325 is a
 #   new conformance tool that is already under the goal:
@@ -368,9 +400,3 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-420 src/arc.zig
-628 src/chain.zig
-526 src/flow.zig
-636 src/main.zig
-490 src/sealbuild.zig
-443 src/settings.zig

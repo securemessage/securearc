@@ -347,45 +347,17 @@ fn stripFws(value: []const u8) []const u8 {
 }
 
 /// Find a tag value by name in a semicolon-separated tag-list.
-/// Handles "tag=value" pairs separated by ';', with optional whitespace.
 ///
-/// **Tag names are matched case sensitively.** RFC 6376 §3.2: "Tags MUST be
-/// interpreted in a case-sensitive manner." This differs from DMARC, whose
-/// RFC 9989 §4.7 tag names are case *insensitive*, so the two must not share a
-/// tag scanner.
+/// The tag scanner lives in `securemilter_crypto.sig_header` because a
+/// DKIM signature, an ARC set and a DNS key record are all the same RFC 6376
+/// §3.2 tag list, and this file is not where DKIM can reach.
 ///
-/// The difference is load-bearing rather than pedantic. Matching case
-/// insensitively made `S=dummy` satisfy a lookup for `s`, so an ARC-Seal whose
-/// selector tag was mis-cased was read as carrying a selector and went on to
-/// verify — where the RFC has no `s=` tag at all and the seal cannot be checked.
-/// Applies equally to the `p=` lookup in a DKIM key record, which is the same
-/// kind of tag list.
-pub fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
-    var rest = header_value;
-    while (rest.len > 0) {
-        // Skip whitespace and semicolons
-        rest = mem.trimLeft(u8, rest, &(.{ ';', ' ', '\t', '\r', '\n' }));
-        if (rest.len == 0) break;
-
-        // Find the '=' for this tag
-        const eq_pos = mem.indexOfScalar(u8, rest, '=') orelse break;
-        const name = mem.trim(u8, rest[0..eq_pos], &std.ascii.whitespace);
-
-        // Find end of value (next ';' or end)
-        const value_start = eq_pos + 1;
-        const semi_pos = mem.indexOfScalar(u8, rest[value_start..], ';');
-        const value_end = if (semi_pos) |sp| value_start + sp else rest.len;
-        const value = mem.trim(u8, rest[value_start..value_end], &std.ascii.whitespace);
-
-        if (mem.eql(u8, name, tag_name)) {
-            return value;
-        }
-
-        // Advance past this tag
-        rest = if (semi_pos) |sp| rest[value_start + sp + 1 ..] else "";
-    }
-    return null;
-}
+/// An alias rather than a second body: the copy that used to be here was
+/// character-identical to the one in `sig_header`, and `securedkim-testkey` and
+/// `securearc-testkey` each carried a third and a fourth (refactor plan stage
+/// 5.1). Kept exported under this name because `chain.zig` reads `p=` out of a
+/// key record through it.
+pub const findTag = sig_header.findTag;
 
 /// Header name/value pair (matches Connection.headers format).
 pub const Header = struct {
