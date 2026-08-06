@@ -22,6 +22,9 @@ const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securearc-check");
 const dns_mod = securemilter.dns;
 
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
+
 const msgfile = securemilter.msgfile;
 
 const arc = @import("arc.zig");
@@ -89,7 +92,15 @@ pub fn main() !void {
             port = std.fmt.parseInt(u16, raw, 10) catch return cli.fatal("-p must be a port number");
         } else if (mem.eql(u8, a, "-b")) {
             const raw = args.next() orelse return cli.fatal("missing argument for -b");
-            min_key_bits = std.fmt.parseInt(u32, raw, 10) catch return cli.fatal("-b must be a number");
+            const configured = std.fmt.parseInt(u32, raw, 10) catch return cli.fatal("-b must be a number");
+            // Reconciled with the RFC 8301 floor, exactly as the daemon does via
+            // settings.zig and as `securedkim-check` already did here (A-22).
+            // Without this, `-b 512` made this tool accept a chain the shipped
+            // `securearc` rejects -- and the only purpose of a -check tool is to
+            // report the verdict the daemon would reach. RFC 8301 3.2 is a MUST
+            // NOT for verifiers, so one command-line flag should not re-admit
+            // signatures the standard says have permanently failed.
+            min_key_bits = crypto.resolveMinRsaBits(configured).bits;
         } else if (mem.eql(u8, a, "-v")) {
             verbose = true;
         } else if (a.len > 0 and a[0] == '-') {
