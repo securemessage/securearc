@@ -7,8 +7,8 @@ conforming verifier must report -- none, pass or fail. That is exactly what
 `securearc-check` prints, so the suite drives the shipped verifier rather than a
 reimplementation written to satisfy it.
 
-Each scenario carries its own `txt-records`, served by txtdns.py on a loopback
-port, so securearc's real resolver does the key lookups.
+Each scenario carries its own `txt-records`, served by the shared DNS fake on a
+loopback port, so securearc's real resolver does the key lookups.
 
 Exit status is 1 if any case fails or errors, 0 only on a clean run, so this is
 usable as a gate rather than as output a human has to read.
@@ -22,7 +22,14 @@ import tempfile
 
 import yaml
 
-from txtdns import TxtDns
+# One DNS fake serves every conformance suite in the tree; securemilter-lib's
+# test/dnsfake.py records why it is not four any more. Reachable because
+# build.zig.zon already depends on ../securemilter-lib by path, so the six
+# repositories are checked out side by side.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "..", "securemilter-lib", "test"))
+
+from dnsfake import DnsFake, TxtZone   # noqa: E402
 
 # Resolve the checker from this file's location -- test/arc_valimail/ -> repo root
 # -- so the suite runs from a fresh clone with no editing. SECUREARC_CHECK
@@ -119,7 +126,7 @@ def main():
         # One server per scenario rather than one per case: the records are shared
         # across a scenario's tests, and binding a fresh UDP port 172 times invites
         # TIME_WAIT flakiness that would look like conformance failures.
-        with TxtDns(records, args.port, verbose=args.verbose):
+        with DnsFake(TxtZone(records), port=args.port, verbose=args.verbose):
             for name, test in tests.items():
                 if args.test and args.test != name:
                     continue

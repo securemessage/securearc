@@ -35,14 +35,19 @@ the same order, with the same treatment of a chain that fails to parse. So a sco
 here is a statement about the **shipped verifier**, not about a parallel
 implementation written to pass tests.
 
-`txtdns.py` serves each scenario's own `txt-records` on a loopback port, and
-`securearc-check -n 127.0.0.1 -p <port>` points securearc's own resolver at it —
-so record rejoining and negative answers are exercised as shipped. **No production
-code is modified or conditionally compiled to run this suite.**
+`securemilter-lib/test/dnsfake.py` serves each scenario's own `txt-records` on a
+loopback port, and `securearc-check -n 127.0.0.1 -p <port>` points securearc's own
+resolver at it — so record rejoining and negative answers are exercised as shipped.
+**No production code is modified or conditionally compiled to run this suite.**
 
-TXT-only, unlike `securespf/test/rfc7208/mockdns.py`, because ARC key lookups are a
-single TXT query for `<selector>._domainkey.<domain>`. The two are not shared
-because securespf and securearc are separate repositories.
+This file used to hold its own copy, `txtdns.py`, and said the two were not shared
+"because securespf and securearc are separate repositories and a test helper is not
+worth a package". That was overturned on 2026-08-05, on evidence rather than taste:
+there were **four** copies by the time anyone counted, three of them holding a
+byte-identical wire codec, and no package was needed — `build.zig.zon` already
+depends on `../securemilter-lib` by path, so a `sys.path` insert reaches it. The
+ARC scenarios still use a TXT-only zone (`TxtZone`); RFC 7208's fuller zone model
+is a separate class in the same file.
 
 ## Scored against RFC 8617, not the draft
 

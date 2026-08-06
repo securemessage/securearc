@@ -45,7 +45,14 @@ import tempfile
 import dkim
 import yaml
 
-from txtdns import TxtDns
+# One DNS fake serves every conformance suite in the tree; securemilter-lib's
+# test/dnsfake.py records why it is not four any more. Reachable because
+# build.zig.zon already depends on ../securemilter-lib by path, so the six
+# repositories are checked out side by side.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "..", "securemilter-lib", "test"))
+
+from dnsfake import DnsFake, TxtZone   # noqa: E402
 
 # Resolve the binary from this file's location so the suite runs from a fresh clone
 # with no editing. SECUREARC_SEAL overrides it, for a package build or CI runner
@@ -311,7 +318,7 @@ def main():
     print(f"ARC signing suite: {len(cases)} cases\n")
 
     passed, failures = 0, []
-    with TxtDns(records, args.port):
+    with DnsFake(TxtZone(records), port=args.port):
         for name, test, scenario in cases:
             ok, detail = run_case(test, scenario, records, args.port, args.verbose)
             if ok:
