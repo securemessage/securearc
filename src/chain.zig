@@ -12,6 +12,14 @@ const header_select = securemilter_crypto.header_select;
 const sig_header = securemilter_crypto.sig_header;
 
 const arc = @import("arc.zig");
+const keycycle = @import("keycycle.zig");
+
+// Owned by `keycycle.zig` since A-24, aliased here so the many uses below and the
+// public surface `check.zig`/`seal_cli.zig` reach for both stay as they were.
+const CheckOutcome = keycycle.CheckOutcome;
+const classifyDataError = keycycle.classifyDataError;
+pub const Policy = keycycle.Policy;
+pub const DEFAULT_MAX_KEY_RECORDS = keycycle.DEFAULT_MAX_KEY_RECORDS;
 
 /// Field name of an ARC header, for `header_select`.
 fn amsHeaderName(hdr: arc.Header) []const u8 {
@@ -48,9 +56,6 @@ pub const ValidationResult = struct {
     evaluation: Evaluation = .complete,
 };
 
-/// Outcome of verifying one signature.
-const CheckOutcome = enum { pass, fail, dns_temp_error, internal_error };
-
 /// Classify a failure from the resolver.
 ///
 /// Order matters. `OutOfMemory` can surface from the resolver as readily as from
@@ -63,16 +68,6 @@ fn classifyDnsError(err: anyerror) CheckOutcome {
     return if (dns_mod.isTransientError(err)) .dns_temp_error else .fail;
 }
 
-/// Classify a failure while handling data the signer published.
-///
-/// A key record, a body hash and a signature are all attacker- or
-/// publisher-controlled, so a malformed one is a permanent failure of that
-/// signature and belongs in the verdict. Only our own allocation failing is
-/// internal.
-fn classifyDataError(err: anyerror) CheckOutcome {
-    return if (err == error.OutOfMemory) .internal_error else .fail;
-}
-
 /// Validate an ARC chain per RFC 8617 §5.2.
 ///
 /// Steps:
@@ -81,18 +76,13 @@ fn classifyDataError(err: anyerror) CheckOutcome {
 /// 3. For each ARC set, verify the ARC-Seal (signs over all prior ARC headers)
 /// 4. Check cv= values: i=1 must be "none", i>1 must be "pass"
 /// 5. If any step fails, result is "fail"
-///
-/// `min_key_bits` is the smallest RSA modulus accepted for an AMS or AS
-/// signature. ARC inherits DKIM's cryptography, so RFC 8301's floor applies
-/// here too: a set signed with a factorable key must not validate, or the whole
-/// point of a chain of custody is lost at that hop.
 pub fn validateChain(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
     sets: []const arc.ArcSet,
     all_headers: []const arc.Header,
     body_data: []const u8,
-    min_key_bits: u32,
+    policy: Policy,
 ) ValidationResult {
     if (sets.len == 0) {
         return .{ .status = .none, .highest_instance = 0, .failure_reason = null };
@@ -138,7 +128,7 @@ pub fn validateChain(
     // Step 3: Verify the most recent AMS (i=N) — validates message integrity
     const newest = sets[sets.len - 1];
     var ams_reason: ?[]const u8 = null;
-    switch (verifyAms(allocator, resolver, &newest, all_headers, body_data, min_key_bits, &ams_reason)) {
+    switch (verifyAms(allocator, resolver, &newest, all_headers, body_data, policy, &ams_reason)) {
         .pass => {},
         .fail => return .{
             .status = .fail,
@@ -164,7 +154,7 @@ pub fn validateChain(
     // Step 4: Verify each ARC-Seal (validates chain integrity)
     for (sets) |set| {
         var seal_reason: ?[]const u8 = null;
-        switch (verifySeal(allocator, resolver, &set, sets[0..set.instance], min_key_bits, &seal_reason)) {
+        switch (verifySeal(allocator, resolver, &set, sets[0..set.instance], policy, &seal_reason)) {
             .pass => {},
             .fail => return .{
                 .status = .fail,
@@ -207,7 +197,7 @@ fn verifyAms(
     set: *const arc.ArcSet,
     all_headers: []const arc.Header,
     body_data: []const u8,
-    min_key_bits: u32,
+    policy: Policy,
     reason: *?[]const u8,
 ) CheckOutcome {
     // RFC 6376 §3.5 makes a= REQUIRED, and this daemon implements exactly one
@@ -246,28 +236,13 @@ fn verifyAms(
     };
     defer dns_result.deinit();
 
-    // Find key record and extract p= value
-    var pubkey_b64: ?[]const u8 = null;
-    var txt_iter = dns_result.txtRecords();
-    while (txt_iter.next()) |txt| {
-        if (arc.findTag(txt, "p")) |p| {
-            if (p.len > 0) {
-                pubkey_b64 = p;
-                break;
-            }
-        }
-    }
     // The name resolved but publishes no usable p=. That is the signer's record
-    // saying the key is not there, which is permanent.
-    const key_data_b64 = pubkey_b64 orelse {
+    // saying the key is not there, which is permanent, so it is settled before any
+    // key-independent work is spent below.
+    if (!keycycle.hasUsableKey(&dns_result)) {
         reason.* = "AMS key record has no p= value";
         return .fail;
-    };
-
-    // Decode public key from base64
-    const key_der = crypto.base64Decode(allocator, key_data_b64) catch |err|
-        return classifyDataError(err);
-    defer allocator.free(key_der);
+    }
 
     // The AMS has the same syntax and semantics as a DKIM-Signature (RFC 8617
     // §4.1.2), so its c= tag governs both halves of canonicalization and an
@@ -309,21 +284,20 @@ fn verifyAms(
         return classifyDataError(err);
     defer allocator.free(sig_bytes);
 
-    // Verify with RSA-SHA256
-    const pkey = crypto.loadRsaPublicKeyDer(key_der, min_key_bits, null) catch |err| {
-        reason.* = switch (err) {
-            error.RsaKeyTooSmall => "AMS signed with an RSA key below the minimum size",
-            error.NotRsaPublicKey => "AMS key record p= is not an RSA key",
-            else => null,
-        };
-        return classifyDataError(err);
-    };
-    defer crypto.freePublicKey(pkey);
-
-    const ok = crypto.rsaVerify(pkey, signing_input, sig_bytes) catch |err|
-        return classifyDataError(err);
-    return if (ok) .pass else .fail;
+    // Everything above is key-independent and has now been done exactly once.
+    // What repeats inside is only the public-key operation, which is irreducible:
+    // deciding whether a given key verifies this signature IS the question.
+    return keycycle.tryKeys(
+        allocator,
+        &dns_result,
+        signing_input,
+        sig_bytes,
+        policy,
+        keycycle.AMS_LABELS,
+        reason,
+    );
 }
+
 
 /// Build the signing input for AMS verification.
 ///
@@ -395,7 +369,7 @@ fn verifySeal(
     resolver: *dns_mod.Resolver,
     set: *const arc.ArcSet,
     prior_sets: []const arc.ArcSet,
-    min_key_bits: u32,
+    policy: Policy,
     reason: *?[]const u8,
 ) CheckOutcome {
     // Same requirement as the AMS: RFC 8617 §4.1.3 gives the AS a DKIM-style a=
@@ -437,25 +411,11 @@ fn verifySeal(
     };
     defer dns_result.deinit();
 
-    // Find and decode public key
-    var pubkey_b64: ?[]const u8 = null;
-    var txt_iter = dns_result.txtRecords();
-    while (txt_iter.next()) |txt| {
-        if (arc.findTag(txt, "p")) |p| {
-            if (p.len > 0) {
-                pubkey_b64 = p;
-                break;
-            }
-        }
-    }
-    const key_b64 = pubkey_b64 orelse {
+    // As on the AMS path, and for the same reason.
+    if (!keycycle.hasUsableKey(&dns_result)) {
         reason.* = "ARC-Seal key record has no p= value";
         return .fail;
-    };
-
-    const key_der = crypto.base64Decode(allocator, key_b64) catch |err|
-        return classifyDataError(err);
-    defer allocator.free(key_der);
+    }
 
     // Build seal signing input: all prior ARC headers (relaxed canonicalized)
     // in order (AAR, AMS, AS for each prior instance), plus current AAR + AMS
@@ -468,21 +428,18 @@ fn verifySeal(
         return classifyDataError(err);
     defer allocator.free(sig_bytes);
 
-    // Verify with RSA-SHA256
-    const pkey = crypto.loadRsaPublicKeyDer(key_der, min_key_bits, null) catch |err| {
-        reason.* = switch (err) {
-            error.RsaKeyTooSmall => "ARC-Seal signed with an RSA key below the minimum size",
-            error.NotRsaPublicKey => "ARC-Seal key record p= is not an RSA key",
-            else => null,
-        };
-        return classifyDataError(err);
-    };
-    defer crypto.freePublicKey(pkey);
-
-    const ok = crypto.rsaVerify(pkey, signing_input, sig_bytes) catch |err|
-        return classifyDataError(err);
-    return if (ok) .pass else .fail;
+    // Key-independent work is done; cycle the candidates (A-24).
+    return keycycle.tryKeys(
+        allocator,
+        &dns_result,
+        signing_input,
+        sig_bytes,
+        policy,
+        keycycle.SEAL_LABELS,
+        reason,
+    );
 }
+
 
 /// Build the seal signing input per RFC 8617 §5.1.1.
 /// Order: for each instance 1..i, canonicalize AAR, AMS, AS headers.
@@ -605,7 +562,7 @@ fn sealCarriesH(as_value: []const u8) bool {
 test "validateChain empty" {
     const sets: []const arc.ArcSet = &.{};
     const headers: []const arc.Header = &.{};
-    const result = validateChain(std.testing.allocator, undefined, sets, headers, "", crypto.RFC8301_MIN_RSA_BITS);
+    const result = validateChain(std.testing.allocator, undefined, sets, headers, "", .{ .min_key_bits = crypto.RFC8301_MIN_RSA_BITS });
     try std.testing.expectEqual(arc.ChainValidation.none, result.status);
     try std.testing.expectEqual(@as(u8, 0), result.highest_instance);
 }
@@ -652,7 +609,7 @@ test "validateChain cv=pass required for i>1" {
     };
 
     const headers: []const arc.Header = &.{};
-    const result = validateChain(std.testing.allocator, undefined, &sets, headers, "", crypto.RFC8301_MIN_RSA_BITS);
+    const result = validateChain(std.testing.allocator, undefined, &sets, headers, "", .{ .min_key_bits = crypto.RFC8301_MIN_RSA_BITS });
     try std.testing.expectEqual(arc.ChainValidation.fail, result.status);
     try std.testing.expectEqualStrings("ARC-Seal cv must be pass for i>1", result.failure_reason.?);
     // A structural verdict is a real determination, not a placeholder.
@@ -858,7 +815,7 @@ test "validateChain reports unknown/dns_temp_error when the key lookup fails tra
         &sets,
         headers,
         "body",
-        crypto.RFC8301_MIN_RSA_BITS,
+        .{ .min_key_bits = crypto.RFC8301_MIN_RSA_BITS },
     );
 
     try std.testing.expectEqual(Evaluation.dns_temp_error, result.evaluation);
@@ -981,7 +938,7 @@ test "A-13: verifySeal refuses a sealed h= before it spends a DNS query" {
     };
 
     var reason: ?[]const u8 = null;
-    const outcome = verifySeal(std.testing.allocator, undefined, &set, &.{}, crypto.RFC8301_MIN_RSA_BITS, &reason);
+    const outcome = verifySeal(std.testing.allocator, undefined, &set, &.{}, .{ .min_key_bits = crypto.RFC8301_MIN_RSA_BITS }, &reason);
 
     try std.testing.expectEqual(CheckOutcome.fail, outcome);
     try std.testing.expect(reason != null);

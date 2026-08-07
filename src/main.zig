@@ -421,7 +421,10 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 fn msgCtx(cfg: *const settings.Reloadable) MsgCtx {
     return .{
         .resolver = getResolver(cfg.dns_config),
-        .min_key_bits = cfg.min_key_bits,
+        .policy = .{
+            .min_key_bits = cfg.min_key_bits,
+            .max_key_records = cfg.max_key_records,
+        },
         .authserv_id = cfg.authserv_id,
         .publisher = getPublisher(),
     };

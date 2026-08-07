@@ -213,6 +213,32 @@ The seal key configured with
 is always held to the 1024-bit floor irrespective of this setting, and the daemon
 refuses to start if it is smaller.
 Read at startup only.
+.It Cm MaxKeyRecords
+How many key records to try at one selector before giving up.
+Default: 3.
+Values above 8 are clamped to 8.
+.Pp
+A domain rotating keys publishes the old and the new record at the same
+selector for a time, and RFC 6376 \[sc]6.1.2 leaves their order unspecified
+\(em resolvers commonly rotate it.
+Trying only the first would make the verdict depend on which half DNS happened
+to return, so the same message could validate on one lookup and fail on the
+next.
+.Pp
+This matters more for ARC than for DKIM.
+A failed
+.Cm ARC-Message-Signature
+or
+.Cm ARC-Seal
+makes this hop write
+.Cm cv=fail ,
+and RFC 8617 \[sc]5.1.2 makes that permanent for the life of the message: every
+later hop reads it and none may revise it.
+A transient publishing state would become a permanent chain break.
+.Pp
+The first record that verifies wins, so the ordinary single-key case costs
+exactly one public-key verification and a rotation costs one extra only when the
+record listed first is the wrong half of the pair.
 .It Cm On-DNSError
 What a sealing listener does when a previous hop's key cannot be fetched
 because DNS failed transiently
@@ -380,6 +406,7 @@ single unit, so a message is always processed entirely under one configuration:
 .Va LocalAuthMethods ,
 .Va StripAuthResults ,
 .Va MinimumKeyBits ,
+.Va MaxKeyRecords ,
 .Va On-DNSError ,
 the seal key file, and the resolver settings
 .Pq Va Nameservers , Va DNSTimeout , Va DNSRetries , Va DNSCacheSize , Va DNSNegativeTTL .

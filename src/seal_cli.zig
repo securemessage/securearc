@@ -79,6 +79,7 @@ const Usage =
     \\                     (default: 127.0.0.1)
     \\  -p <port>          DNS nameserver port (default: 53)
     \\  -b <bits>          Minimum RSA key bits accepted when validating (default: 1024)
+    \\  -r <count>         Key records to try at one selector (default: 3, max 8)
     \\  -h, --help         Show this help
     \\
     \\The chain already on the message is validated first, because the cv= this host
@@ -101,6 +102,11 @@ const Args = struct {
     /// Already reconciled with the RFC 8301 floor by `parseArgs`, so the value
     /// reaching `chain.validateChain` can never be below it.
     min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS,
+    /// How many key records to try at one selector when validating the chain we
+    /// are about to extend (A-24). Matters more here than in `securearc-check`:
+    /// committing to the wrong half of a rotating pair makes this command seal
+    /// `cv=fail` over a chain that was in fact intact.
+    max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS,
 };
 
 fn parseArgs() Args {
@@ -141,6 +147,10 @@ fn parseArgs() Args {
             // securearc-check this command does not merely report a verdict -- it
             // signs one into an ARC-Seal that every later hop is asked to trust.
             r.min_key_bits = crypto.resolveMinRsaBits(configured).bits;
+        } else if (mem.eql(u8, a, "-r")) {
+            const raw = it.next() orelse cli.fatal("-r needs a value");
+            r.max_key_records = std.fmt.parseInt(u8, raw, 10) catch cli.fatal("-r must be a number");
+            if (r.max_key_records == 0) cli.fatal("-r must be at least 1");
         } else if (a.len > 0 and a[0] == '-') {
             cli.fatal("unknown option (use -h for help)");
         } else {
@@ -273,7 +283,7 @@ pub fn main() !void {
             sets,
             headers,
             msg.body,
-            args.min_key_bits,
+            .{ .min_key_bits = args.min_key_bits, .max_key_records = args.max_key_records },
         );
         switch (vr.evaluation) {
             .complete => break :blk vr.status,

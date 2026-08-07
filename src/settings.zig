@@ -21,6 +21,10 @@ const header_scrub = securemilter.header_scrub;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 
+/// For `DEFAULT_MAX_KEY_RECORDS` only, so the default an operator gets and the
+/// ceiling the verifier enforces are declared in one place rather than drifting.
+const chain = @import("chain.zig");
+
 pub const Mode = enum {
     verify_only,
     seal_only,
@@ -132,6 +136,7 @@ pub const ArcConfig = struct {
     zmq_topic: []const u8,
     limits: connection_mod.Limits,
     min_key_bits: crypto.MinRsaBits,
+    max_key_records: u8,
     on_dns_error: OnDnsError,
 };
 pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcConfig {
@@ -262,6 +267,14 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         global.getInt(crypto.MIN_KEY_BITS_OPTION, u32, crypto.RFC8301_MIN_RSA_BITS),
     );
 
+    // A rotation legitimately publishes two key records at one selector and RRset
+    // order is unspecified, so committing to the first made the verdict depend on
+    // which half DNS listed first (audit A-24; D-20 is the same defect in
+    // `securedkim`). Same option name and default as that daemon deliberately --
+    // in ARC the cost of getting it wrong is a `cv=fail`, which is permanent and
+    // is honoured by every downstream hop.
+    const max_key_records = global.getInt("MaxKeyRecords", u8, chain.DEFAULT_MAX_KEY_RECORDS);
+
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
 
@@ -290,6 +303,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .zmq_topic = zmq_topic,
         .limits = limits,
         .min_key_bits = min_key_bits,
+        .max_key_records = max_key_records,
         .on_dns_error = on_dns_error,
     };
 }
@@ -342,6 +356,7 @@ pub const Reloadable = struct {
     signed_headers: []const u8,
     local_auth_methods: []const []const u8,
     min_key_bits: u32,
+    max_key_records: u8,
     on_dns_error: OnDnsError,
     strip_all: bool,
 
@@ -379,6 +394,7 @@ pub const Reloadable = struct {
             .signed_headers = signed_headers,
             .local_auth_methods = methods,
             .min_key_bits = c.min_key_bits.bits,
+            .max_key_records = c.max_key_records,
             .on_dns_error = c.on_dns_error,
             .strip_all = c.strip_auth_results,
         };
@@ -905,6 +921,7 @@ fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const
         .listen_addresses = &.{},
         .worker_threads = 1,
         .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
+        .max_key_records = chain.DEFAULT_MAX_KEY_RECORDS,
         .pid_file = "/nonexistent",
         .foreground = true,
         .user = null,

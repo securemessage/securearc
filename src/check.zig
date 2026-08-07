@@ -41,6 +41,7 @@ const Usage =
     \\  -n <nameserver>  DNS nameserver (default: 127.0.0.1)
     \\  -p <port>        DNS nameserver port (default: 53)
     \\  -b <bits>        Minimum RSA key bits accepted (default: 1024)
+    \\  -r <count>       Key records to try at one selector (default: 3, max 8)
     \\  -v               Verbose: also print the failure reason and instance count
     \\  -h               Show this help
     \\
@@ -77,6 +78,10 @@ pub fn main() !void {
     // suite serves its own zone on a high port, which cannot bind 53 unprivileged.
     var port: u16 = 53;
     var min_key_bits: u32 = 1024;
+    // Exposed so this tool can reproduce a key-rotation verdict the daemon would
+    // reach (A-24). A -check tool that could not vary this would answer a
+    // different question from the one the operator is asking.
+    var max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS;
     var verbose = false;
 
     while (args.next()) |a| {
@@ -101,6 +106,10 @@ pub fn main() !void {
             // NOT for verifiers, so one command-line flag should not re-admit
             // signatures the standard says have permanently failed.
             min_key_bits = crypto.resolveMinRsaBits(configured).bits;
+        } else if (mem.eql(u8, a, "-r")) {
+            const raw = args.next() orelse return cli.fatal("missing argument for -r");
+            max_key_records = std.fmt.parseInt(u8, raw, 10) catch return cli.fatal("-r must be a number");
+            if (max_key_records == 0) return cli.fatal("-r must be at least 1");
         } else if (mem.eql(u8, a, "-v")) {
             verbose = true;
         } else if (a.len > 0 and a[0] == '-') {
@@ -166,7 +175,7 @@ pub fn main() !void {
         sets,
         headers,
         msg.body,
-        min_key_bits,
+        .{ .min_key_bits = min_key_bits, .max_key_records = max_key_records },
     );
 
     // An unevaluable chain is reported as `temperror`, distinct from `fail`.

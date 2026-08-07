@@ -106,6 +106,24 @@ LocalAuthMethods = spf, dkim, dmarc
 # always held to the 1024-bit floor regardless of what is set here.
 # MinimumKeyBits = 1024
 
+# How many key records to try at one selector before giving up.
+#
+# A domain rotating keys publishes the old and the new record at the same
+# selector for a while, and the order DNS returns them in is unspecified —
+# resolvers commonly rotate it. Trying only the first therefore makes the verdict
+# depend on which half happened to come back, so the same message can validate on
+# one lookup and fail on the next.
+#
+# That matters more here than it does for DKIM. A failed AMS or seal makes this
+# hop write cv=fail, and RFC 8617 5.1.2 makes cv=fail permanent: every later hop
+# reads it and no one may revise it. A transient publishing state would become a
+# permanent chain break.
+#
+# Each extra record costs one more public-key verification, so this is bounded.
+# Values above 8 are clamped to 8. The first record that verifies wins, so the
+# ordinary single-key case still costs exactly one verification.
+# MaxKeyRecords = 3
+
 # What a sealing listener does when a previous hop's key cannot be fetched
 # because DNS failed transiently — SERVFAIL, a timeout, an unreachable resolver.
 #

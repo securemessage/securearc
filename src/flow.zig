@@ -64,7 +64,10 @@ pub const MsgCtx = struct {
     /// worth having at all. Owned by `main.zig` as thread-local state and
     /// dropped on reload; borrowed here for the length of one message.
     resolver: *dns_mod.Resolver,
-    min_key_bits: u32,
+    /// Key-acceptance policy: the RSA floor, and how many key records at one
+    /// selector to try before giving up (A-24). Grouped because they are always
+    /// set together from the same config section and always spent together.
+    policy: chain.Policy,
     /// Who this hop identifies as in `Authentication-Results`. Lives here rather
     /// than on `SealCtx` because the verify path stamps too.
     authserv_id: []const u8,
@@ -87,7 +90,7 @@ pub const MsgCtx = struct {
         all_headers: []const arc.Header,
         body_data: []const u8,
     ) chain.ValidationResult {
-        return chain.validateChain(allocator, self.resolver, sets, all_headers, body_data, self.min_key_bits);
+        return chain.validateChain(allocator, self.resolver, sets, all_headers, body_data, self.policy);
     }
 };
 
