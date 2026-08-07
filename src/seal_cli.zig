@@ -98,7 +98,9 @@ const Args = struct {
     timestamp: ?u64 = null,
     nameserver: []const u8 = "127.0.0.1",
     port: u16 = 53,
-    min_key_bits: u32 = 1024,
+    /// Already reconciled with the RFC 8301 floor by `parseArgs`, so the value
+    /// reaching `chain.validateChain` can never be below it.
+    min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS,
 };
 
 fn parseArgs() Args {
@@ -132,7 +134,13 @@ fn parseArgs() Args {
             r.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("-p must be a port number");
         } else if (mem.eql(u8, a, "-b")) {
             const raw = it.next() orelse cli.fatal("-b needs a value");
-            r.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("-b must be a number");
+            const configured = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("-b must be a number");
+            // Reconciled with the RFC 8301 floor here, once, so the value reaching
+            // chain.validateChain below cannot validate a chain the shipped
+            // securearc rejects. §3.2 is a MUST NOT for verifiers, and unlike
+            // securearc-check this command does not merely report a verdict -- it
+            // signs one into an ARC-Seal that every later hop is asked to trust.
+            r.min_key_bits = crypto.resolveMinRsaBits(configured).bits;
         } else if (a.len > 0 and a[0] == '-') {
             cli.fatal("unknown option (use -h for help)");
         } else {
@@ -216,7 +224,12 @@ pub fn main() !void {
     // Same standard as the daemon: this command emits real seals with a real
     // domain key, so a key anyone can read is refused here too rather than being
     // a daemon-only rule that the CLI quietly undercuts.
-    var key = crypto.loadRsaKeyFile(args.key_file.?, args.min_key_bits, .require_safe) catch |err| {
+    //
+    // The RFC floor rather than -b, matching main.zig: MinimumKeyBits is a policy
+    // about keys *other* ADMDs publish and must not decide whether our own seal
+    // key is acceptable. -b 4096 should not refuse a conformant 2048-bit signing
+    // key, and -b 512 must not sign with one no verifier will ever accept.
+    var key = crypto.loadRsaKeyFile(args.key_file.?, crypto.RFC8301_MIN_RSA_BITS, .require_safe) catch |err| {
         if (err == error.KeyFilePermissionsTooOpen) {
             cli.fatal("the RSA private key is readable beyond its owner; chmod 600 it");
         }
