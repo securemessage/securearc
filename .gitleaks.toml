@@ -1,0 +1,27 @@
+# gitleaks configuration for securearc.
+#
+# `useDefault` is load-bearing. A config file without it REPLACES the built-in
+# ruleset instead of extending it, so omitting it would silently disable every
+# default detector and turn this file into a hole rather than a single documented
+# exception. Keep it first, and keep it true.
+[extend]
+useDefault = true
+
+# `crypto.RFC8301_MIN_RSA_BITS` is a public compile-time constant equal to 1024:
+# the smallest RSA modulus RFC 8301 3.2 requires a verifier to accept. It is a
+# published number from a standards document and carries nothing secret.
+#
+# The generic-api-key rule matches it on Shannon entropy alone (4.36), because
+# idiomatic Zig spells a policy default `min_key_bits = SCREAMING_SNAKE_CONSTANT`
+# and a regex cannot tell that from `api_key = <credential>`. The identifier
+# contains "key", which is what draws the rule's attention in the first place.
+#
+# Scoped to this one identifier by name, deliberately, rather than by suppressing
+# the rule, allowlisting the files, or relaxing the entropy threshold: a real
+# credential on the same line, elsewhere in the same file, or caught by the same
+# rule is still rejected. The exception is as narrow as the false positive.
+[allowlist]
+description = "Public RFC 8301 minimum RSA key size constant, not a credential"
+regexes = [
+  '''crypto\.RFC8301_MIN_RSA_BITS''',
+]
