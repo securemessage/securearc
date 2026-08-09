@@ -20,12 +20,14 @@ jobs:
         with:
           repository: securemessage/securemilter-lib
           path: securemilter-lib
+          token: ${{ secrets.FORGE_TOKEN }}
 
       - name: Checkout securemilter-crypto (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: securemessage/securemilter-crypto
           path: securemilter-crypto
+          token: ${{ secrets.FORGE_TOKEN }}
 
       - name: Checkout rfc-suites (conformance framework, pinned)
         uses: actions/checkout@v4
