@@ -2,8 +2,10 @@
 # {bin} is zig-out/bin/securearc-check. The sealer (securearc-seal) is reached
 # by the suite driver via SECUREARC_SEAL — the seal step is suite-internal
 # glue, not the contract under test.
+# -v appends " i=N reason=..." to the verdict line; first_token still yields
+# the verdict, and the suite's expect_reason assertions match the detail.
 name: securearc
 suite: rfc8617-arc
-argv: ["{bin}", "-n", "{dns_addr}", "-p", "{dns_port}", "{msg_file}"]
+argv: ["{bin}", "-v", "-n", "{dns_addr}", "-p", "{dns_port}", "{msg_file}"]
 verdict:
   kind: first_token

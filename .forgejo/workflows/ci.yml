@@ -34,7 +34,7 @@ jobs:
         with:
           repository: securemessage/rfc-suites
           path: rfc-suites
-          ref: refs/tags/v0.1.0
+          ref: refs/tags/v0.2.0
           token: ${{ secrets.FORGE_TOKEN }}
 
       - name: PHP ext-yaml
@@ -45,6 +45,9 @@ jobs:
 
       - name: Build
         run: cd securearc && zig build
+
+      - name: Lint
+        run: cd securearc && zig build lint
 
       - name: Unit tests
         run: cd securearc && zig build test
