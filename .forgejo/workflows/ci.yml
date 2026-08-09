@@ -32,11 +32,14 @@ jobs:
         with:
           repository: securemessage/rfc-suites
           path: rfc-suites
-          ref: v0.1.0
+          ref: refs/tags/v0.1.0
           token: ${{ secrets.FORGE_TOKEN }}
 
       - name: PHP ext-yaml
         run: php -m | grep -qi '^yaml$' || doas pkg install -y php84-pecl-yaml
+
+      - name: libzmq (securemilter-lib event bus link dependency)
+        run: pkg info -q libzmq4 || doas pkg install -y libzmq4
 
       - name: Build
         run: cd securearc && zig build
