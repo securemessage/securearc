@@ -71,17 +71,11 @@ const rcu_mod = securemilter.rcu;
 // Restart-only state, set before worker spawn and read-only thereafter. Everything
 // a SIGHUP can change lives in `g_reloadable` instead.
 
-/// Mode per listener, index-parallel to the configured listen addresses (audit A-2).
-///
-/// Restart-only, and not merely unimplemented: a listener's mode is a property of an
-/// open socket, and changing it under an established connection would mean a message
-/// whose `connect` was accepted by a verify listener finishing as a seal. Rebinding
-/// sockets is a restart by another name.
+/// Mode per listener (audit A-2). Restart-only: changing a socket's mode under an
+/// established connection would mix verify and seal traffic on the same message.
 var g_modes: []const Mode = &.{};
 
-/// ZMQ event sink. Restart-only because `tl_publisher` is a thread-local socket
-/// created once per worker; adopting a new endpoint means tearing those down and
-/// recreating them, which is a separate piece of work from reloading values.
+/// ZMQ event sink. Restart-only: thread-local sockets are rebuilt on reload.
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "arc";
 
@@ -89,41 +83,25 @@ var g_allocator: Allocator = undefined;
 var g_config_path: []const u8 = "/usr/local/etc/securearc/securearc.conf";
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 
-/// Nameservers for the health monitor.
-///
-/// The other three daemons keep a `g_dns_config` their hook can read. This one keeps
-/// its resolver settings inside the RCU snapshot instead, and the snapshot is not yet
-/// readable at the point the monitor starts — so `main` parks them here first.
+/// Nameservers for health monitor. Parked here before the RCU snapshot is readable.
 var g_monitor_nameservers: []const []const u8 = &.{};
 
-/// `daemon.Options.spawn_threads`: start the DNS health monitor.
-///
-/// Context-free because that is what `daemon.Options` takes, and deliberately so — the
-/// hook runs at the one point in the bootstrap where creating a thread is safe, after
-/// the fork and after the managed signals are blocked.
+/// Start health monitor. Context-free to match `daemon.Options.spawn_threads`;
+/// called after daemonize and after signal blocking, the only safe point.
 fn spawnHealthMonitor() void {
     g_health_monitor = dns_mod.startMonitor(g_allocator, g_monitor_nameservers);
 }
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
-/// Seal key behind an RCU container.
-///
-/// A single ARC set is signed twice — once for the AMS, once for the AS — and
-/// both signatures must come from the same key or the set is internally
-/// inconsistent and unverifiable. The previous code held `&g_seal_key.?`
-/// across both calls while SIGHUP overwrote the struct underneath, which
-/// could straddle a reload and also leaked the old EVP_PKEY every time
-/// (audit X-2).
+/// Seal key behind RCU. Both AMS and AS signatures must use the same key; the
+/// previous code held `&g_seal_key.?` across both calls while SIGHUP could
+/// overwrite the struct, causing internal inconsistency and a leak (audit X-2).
 const SealKeyRcu = rcu_mod.Rcu(crypto.SigningKey);
 var g_seal_key: SealKeyRcu = undefined;
 
-/// The reloadable configuration, published as one immutable snapshot.
-///
-/// One cell rather than nine, deliberately. Nine independently swapped globals
-/// would let a message run against a torn configuration -- a new `authserv_id` with
-/// the old `local_auth_methods`, say -- which is a worse failure than not reloading
-/// at all, because it is invisible. Publishing the set atomically means a message
-/// sees either the whole old configuration or the whole new one (audit A-14).
+/// Reloadable config published as one snapshot (audit A-14).
+/// Nine independent globals would allow torn reads (new authserv_id with old
+/// methods). Atomic publication ensures a message sees the full old or new set.
 const ReloadableRcu = rcu_mod.Rcu(settings.Reloadable);
 var g_reloadable: ReloadableRcu = undefined;
 
@@ -132,11 +110,8 @@ fn freeReloadable(allocator: Allocator, r: *settings.Reloadable) void {
     allocator.destroy(r);
 }
 
-/// Take ownership of `r` and make it the live snapshot.
-///
-/// Owns `r` on every path: on failure it is released here rather than left to the
-/// caller, because a caller that has just been told publication failed has no way to
-/// know whether the value was boxed first. That ambiguity is what X-11 was.
+/// Publish `r` atomically. Owns `r` on all paths; failure releases it here rather
+/// than leaving ambiguity (audit X-11).
 fn adoptReloadable(r: settings.Reloadable) !void {
     var owned = r;
     const boxed = g_allocator.create(settings.Reloadable) catch |err| {

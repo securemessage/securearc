@@ -1,10 +1,5 @@
-//! SecureARC configuration: listener modes, the DNS-failure policy, and the
-//! parser that turns an INI file into an `ArcConfig`.
-//!
-//! Split out of `main.zig` under megaplan Phase 10 R1, which capped that file at
-//! 1698 lines against a 400-line standard. This was the cleanest seam available:
-//! nothing in here touches the daemon's global state, so the entire layer is pure
-//! parsing and is testable without starting a listener, a worker or a resolver.
+//! SecureARC configuration: listener modes, DNS-failure policy, INI parser.
+//! Pure parsing layer; testable without a running daemon.
 
 const std = @import("std");
 const mem = std.mem;
@@ -32,12 +27,8 @@ pub const Mode = enum {
     both,
 };
 
-/// Parse a `Mode` value from a config section.
-///
-/// An unrecognised value is an error rather than a silent fallback. The
-/// previous parser tested three spellings and left the variable untouched on
-/// anything else, so `Mode = sealing` ran a seal listener in verify mode and
-/// said nothing — a typo that costs every message its ARC set.
+/// Parse `Mode` from config. Unrecognised values are errors (previously silent:
+/// a typo like `Mode=sealing` ran seal in verify mode without warning).
 pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     if (mem.eql(u8, raw, "verify")) return .verify_only;
     if (mem.eql(u8, raw, "seal")) return .seal_only;
@@ -45,12 +36,7 @@ pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     return error.InvalidMode;
 }
 
-/// Config-facing spelling of a mode, for logs.
-///
-/// The enum tags carry an `_only` suffix that appears neither in the config file
-/// nor in the documented log format, and operators grep these lines. Kept
-/// identical to the accepted `Mode =` values so a log line reads back as the
-/// config that produced it.
+/// Log-facing mode label (matches accepted `Mode=` values).
 pub fn modeLabel(m: Mode) []const u8 {
     return switch (m) {
         .verify_only => "verify",
@@ -59,37 +45,24 @@ pub fn modeLabel(m: Mode) []const u8 {
     };
 }
 
-/// What a sealing listener does when a signer's key could not be fetched
-/// because DNS failed transiently (audit A-12).
-///
-/// RFC 8617 §5.1.2 makes `cv=fail` permanent for the life of the message, so
-/// the cheapest response locally — seal the failure and move on — is the one
-/// that does irreversible harm to a third party's chain. The default is
-/// therefore chosen by least *total* impact rather than least impact on this
-/// host, which is also what OpenDKIM defaults `On-DNSError` to.
+/// What to do when DNS fails during sealing (audit A-12).
+/// RFC 8617 §5.1.2 makes `cv=fail` permanent, so sealing a DNS failure into
+/// the chain is irreversible harm to a third party. Default chosen by least
+/// total impact (same rationale as OpenDKIM's `On-DNSError`).
 pub const OnDnsError = enum {
-    /// Defer with a 4xx and let the sender retry. The only non-destructive
-    /// answer for a hop that modifies the message, which is what sealing is
-    /// for. Costs delay; risks burning the queue lifetime against a lame
-    /// delegation that returns a transient-looking error indefinitely.
+    /// Defer (4xx), let sender retry. Only non-destructive answer for a
+    /// message-modifying hop.
     tempfail,
-    /// Add no ARC set and pass the message through untouched, reporting
-    /// `arc=temperror`. Zero delay, and right for a relay that does not modify
-    /// the message — but see the note in `doSeal`: if this hop *does* modify
-    /// it, declining to seal only moves which hop breaks the chain.
+    /// Pass through without sealing, report `arc=temperror`. Right for relays
+    /// that do not modify the message.
     skip_seal,
-    /// Seal `cv=fail`. The behaviour before A-12 was fixed, kept so an operator
-    /// who depended on it can ask for it. Not recommended: it is the only
-    /// option that inflicts permanent harm on a chain that may be perfectly
-    /// good.
+    /// Seal `cv=fail`. Pre-A-12 behaviour, kept for operators who depended on it.
+    /// Not recommended: inflicts permanent harm on a potentially good chain.
     seal_fail,
 };
 
-/// Parse an `On-DNSError` value, refusing anything unrecognised.
-///
-/// Silently defaulting here would pick a policy the operator did not ask for,
-/// on the one code path whose whole purpose is to stop a transient fault from
-/// becoming a permanent verdict.
+/// Parse `On-DNSError`; rejects unrecognised values (silent default would pick
+/// an unintended policy on the transient-fault path).
 pub fn parseOnDnsError(raw: []const u8) error{InvalidOnDnsError}!OnDnsError {
     if (mem.eql(u8, raw, "tempfail")) return .tempfail;
     if (mem.eql(u8, raw, "skip-seal")) return .skip_seal;
@@ -102,14 +75,8 @@ pub const ArcConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
-    /// Per-worker cap on simultaneous connections, enforced in the accept path.
-    ///
-    /// No default on this field on purpose. It reached the worker as a hard-coded
-    /// `DEFAULT_MAX_CONNECTIONS` while `MaxConnections` was already read by
-    /// `securespf`, so the same key was honoured by one daemon and silently ignored
-    /// by this one (audit L-2). A field that quietly supplies a constant when the
-    /// caller forgets to set it is how that happens, so every construction site
-    /// states it.
+    /// Per-worker connection cap (audit L-2). No default: previously hard-coded
+    /// while `MaxConnections` was honoured by only one daemon.
     max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
@@ -122,10 +89,8 @@ pub const ArcConfig = struct {
     dns_cache_size: u32,
     dns_negative_ttl: u32,
     /// Mode per listener, index-parallel to `listen_addresses` (audit A-2).
-    ///
-    /// One entry per socket rather than one value for the daemon: a host
-    /// running `[listener:verify]` and `[listener:seal]` needs each socket to
-    /// behave as configured, which is the whole point of having two.
+    /// One entry per socket: a host with verify + seal listeners must have each
+    /// behave as configured.
     modes: []const Mode,
     seal_domain: ?[]const u8,
     seal_selector: ?[]const u8,
@@ -336,26 +301,13 @@ fn freeList(allocator: Allocator, list: []const []const u8) void {
     allocator.free(list);
 }
 
-/// The configuration a running daemon can adopt without a restart.
+/// Configuration that can change without restarting the daemon.
 ///
-/// Published through an `Rcu` and read exactly once per message, which is what
-/// makes reloading these values safe at all. A message is processed entirely under
-/// one snapshot, so a SIGHUP arriving mid-message cannot leave the verify half
-/// working from one configuration and the seal half from another, and cannot leave
-/// the header-stripping pass using a different `authserv_id` from the stamp that
-/// follows it. Workers announce quiescence only at the top of their event loop
-/// (`reload.zig`), so the pointer stays valid for the message that took it.
+/// An `Rcu` publishes one snapshot per message. Workers report quiescence only
+/// between event-loop iterations, keeping that snapshot valid for the message.
 ///
-/// Every string is owned. The values arrive pointing into a `Config` that
-/// `reloadConfig` frees before it returns, so adopting them directly is what makes
-/// the difference between a reload and a use-after-free.
-///
-/// What is deliberately *not* here is anything a running process cannot honestly
-/// change: listen addresses and per-listener modes are bound to open sockets, and a
-/// mode cannot change under an established connection; the `connection.Limits` caps
-/// are fixed when a worker is spawned; `worker_threads`, `pid_file`, `user` and
-/// `foreground` are startup decisions. Those stay restart-only and the man page says
-/// so, per option, rather than leaving the operator to infer it.
+/// All strings are owned because `reloadConfig` frees the source `Config`.
+/// Listener addresses, modes, limits, and process settings remain restart-only.
 pub const Reloadable = struct {
     authserv_id: []const u8,
     dns_config: dns_mod.ResolverConfig,
@@ -419,10 +371,9 @@ pub const Reloadable = struct {
         freeList(allocator, self.dns_config.nameservers);
     }
 
-    /// The forged-header strip rule for this snapshot.
+    /// Strip rule for Authentication-Results headers in this snapshot.
     ///
-    /// `own_methods` is `arc` and always will be: it names what *this* daemon
-    /// asserts, which is a property of the program rather than of the deployment.
+    /// This daemon always asserts the `arc` method.
     pub fn stripPolicy(self: *const Reloadable) header_scrub.StripPolicy {
         return .{ .own_methods = &.{"arc"}, .strip_all = self.strip_all };
     }
@@ -453,12 +404,8 @@ test "parse config minimal" {
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.modes[0]);
 }
 
-// L-2: `MaxConnections` was read by `securespf` and ignored here, so an operator
-// who set it on this daemon got 256 and no diagnostic. The value has two
-// consumers -- the accept-path cap in `worker.handleAccept` and the
-// RLIMIT_NOFILE calculation in `daemon.calculateFdNeed` -- and wiring only one of
-// them would raise the fd budget without raising the limit that budget was sized
-// for, or the reverse.
+// L-2 regression: `MaxConnections` controls both the accept cap and the
+// `RLIMIT_NOFILE` calculation.
 test "L-2: MaxConnections is honoured, and defaults when absent" {
     {
         var cfg = try config_mod.parse(std.testing.allocator,
@@ -535,10 +482,7 @@ test "a listener section with no Socket is refused" {
     try std.testing.expectError(error.MissingListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
 }
 
-// Same hazard as securedkim's, with sealing in place of signing: the loopback
-// fallback took `default_mode` from `[global] Mode`, so a typo in the only
-// listener's Socket could bring a listener written as `verify` up as a sealer --
-// an unauthenticated sealing oracle for SealDomain, reachable locally.
+// A malformed verify listener must not fall back to a sealing listener.
 test "a typo cannot silently invert a verify listener into a sealing one" {
     var cfg = try config_mod.parse(std.testing.allocator,
         \\[global]
@@ -554,13 +498,8 @@ test "a typo cannot silently invert a verify listener into a sealing one" {
     try std.testing.expectError(error.InvalidListenerSocket, parseArcConfig(std.testing.allocator, &cfg));
 }
 
-// The implicit listener binds loopback, never 0.0.0.0.
-//
-// Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. On a seal listener a
-// reachable port is an unauthenticated signing oracle for the sealing domain; on a
-// verify listener it dictates the Authentication-Results this host stamps, which is
-// X-1/M-1 without needing to forge a header. The milter protocol authenticates
-// nobody, so reachability IS authorization.
+// The implicit milter listener is loopback-only because the protocol does not
+// authenticate its clients.
 test "the implicit listener binds loopback, not every interface" {
     const ini_text =
         \\[global]
@@ -586,9 +525,7 @@ test "the implicit listener binds loopback, not every interface" {
     }
 }
 
-// A safe default, not a policy override: an operator whose Postfix lives in another
-// jail must still be able to ask for a routable socket. `parse config minimal`
-// above already uses 0.0.0.0 explicitly, so that path stays covered too.
+// An explicit routable listener remains supported for separate Postfix jails.
 test "an explicit 0.0.0.0 socket is still honoured" {
     const ini_text =
         \\[global]
@@ -629,7 +566,7 @@ test "local auth methods default to none" {
     defer std.testing.allocator.free(arc_cfg.dns_nameservers);
     defer std.testing.allocator.free(arc_cfg.local_auth_methods);
 
-    // A sealer that authenticates nothing locally must not vouch for anything.
+    // A sealer with no local authentication results emits none.
     try std.testing.expectEqual(@as(usize, 0), arc_cfg.local_auth_methods.len);
     try std.testing.expect(!arc_cfg.strip_auth_results);
 }
@@ -684,9 +621,7 @@ test "parse config seal mode" {
     try std.testing.expectEqualStrings("arc2026", arc_cfg.seal_selector.?);
 }
 
-// A-2 regression. Before the fix, `mode` was one variable written by every
-// listener section in turn, so this config ran BOTH sockets in seal mode and
-// the verify listener silently sealed.
+// A-2 regression: listener modes must not overwrite each other.
 test "each listener keeps its own mode" {
     const ini_text =
         \\[global]
@@ -718,8 +653,7 @@ test "each listener keeps its own mode" {
     try std.testing.expectEqual(Mode.seal_only, arc_cfg.modes[1]);
 }
 
-// Declaration order in the file decides the index, because that is the order
-// the worker binds them in and therefore the index it reports on a connection.
+// Listener indices follow declaration order, which is also bind order.
 test "listener modes follow declaration order" {
     const ini_text =
         \\[global]
@@ -780,8 +714,7 @@ test "a listener without Mode inherits the global default" {
     try std.testing.expectEqual(Mode.verify_only, arc_cfg.modes[1]);
 }
 
-// The implicit default listener must still get a mode, or `modes` and
-// `listen_addresses` fall out of step and every index lookup is wrong.
+// The implicit listener also needs an index-parallel mode entry.
 test "implicit default listener gets a mode" {
     const ini_text =
         \\[global]
@@ -809,16 +742,14 @@ test "On-DNSError accepts the three policies and refuses anything else" {
     try std.testing.expectEqual(OnDnsError.skip_seal, try parseOnDnsError("skip-seal"));
     try std.testing.expectEqual(OnDnsError.seal_fail, try parseOnDnsError("seal-fail"));
 
-    // Underscores are the enum tag spelling, not the config spelling; accepting
-    // them would give two ways to write one value.
+    // Enum tags are not accepted configuration values.
     try std.testing.expectError(error.InvalidOnDnsError, parseOnDnsError("skip_seal"));
     try std.testing.expectError(error.InvalidOnDnsError, parseOnDnsError("Tempfail"));
     try std.testing.expectError(error.InvalidOnDnsError, parseOnDnsError("defer"));
     try std.testing.expectError(error.InvalidOnDnsError, parseOnDnsError(""));
 }
 
-// The default is the one that cannot permanently damage a third party's chain,
-// even though it is not the cheapest for this host.
+// `tempfail` avoids sealing a permanent failure after a transient DNS error.
 test "On-DNSError defaults to tempfail and is read from the config" {
     const ini_text =
         \\[global]
@@ -854,10 +785,7 @@ test "On-DNSError defaults to tempfail and is read from the config" {
     try std.testing.expectEqual(OnDnsError.skip_seal, cfg2_parsed.on_dns_error);
 }
 
-// Found by an end-to-end lab test whose own `printf >> config` appended the
-// setting after the last section header, so it landed in [listener:seal] and was
-// ignored — the daemon used the default and said nothing. Refusing is the same
-// answer A-2 got.
+// Reject a listener-level policy instead of silently using the global default.
 test "On-DNSError in a listener section is refused rather than ignored" {
     const ini_text =
         \\[global]
@@ -915,16 +843,9 @@ test "an unrecognised Mode is refused" {
     try std.testing.expectError(error.InvalidMode, parseArcConfig(std.testing.allocator, &cfg));
 }
 
-// --- Reloadable: the snapshot SIGHUP publishes (audit A-14) -------------------
-//
-// This is fresh memory-management code on the reload path, and X-11 was a
-// borrow-versus-own mistake that shipped because nothing tested the contract. The
-// two properties worth pinning are that the snapshot is genuinely independent of the
-// config it was built from, and that a failure partway through building one leaks
-// nothing.
+// --- Reloadable snapshot tests (audit A-14) ------------------------------------
 
-/// An `ArcConfig` whose strings live in `buf`, so a test can scribble over the
-/// originals afterwards and see whether the snapshot noticed.
+/// An `ArcConfig` backed by mutable strings for ownership tests.
 fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const u8, ns: [][]const u8) ArcConfig {
     return .{
         .authserv_id = authserv,
@@ -958,11 +879,7 @@ fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const
 }
 
 test "a reloaded snapshot does not borrow from the config it came from" {
-    // The property that makes reload safe rather than a use-after-free:
-    // `reloadConfig` frees the parsed `Config` before it returns, so anything the
-    // snapshot still points at is gone by the time the next message reads it. Tested
-    // by overwriting the source buffers rather than by freeing them, so the result is
-    // a deterministic comparison instead of a hope that the allocator notices.
+    // Overwrite the source buffers to verify that the snapshot owns every string.
     const a = std.testing.allocator;
 
     const authserv = try a.dupe(u8, "mail.first.test");
@@ -1002,8 +919,7 @@ test "a reloaded snapshot does not borrow from the config it came from" {
     try std.testing.expectEqual(@as(usize, 1), snap.dns_config.nameservers.len);
     try std.testing.expectEqualStrings("10.0.0.1", snap.dns_config.nameservers[0]);
 
-    // Scalars come across too, including the two an operator would change during an
-    // incident and that A-14 made silently ineffective.
+    // Reloadable scalar fields are copied too.
     try std.testing.expectEqual(@as(u32, 2048), snap.min_key_bits);
     try std.testing.expectEqual(OnDnsError.skip_seal, snap.on_dns_error);
     try std.testing.expect(snap.strip_all);
@@ -1012,14 +928,7 @@ test "a reloaded snapshot does not borrow from the config it came from" {
 }
 
 test "a snapshot that fails partway through frees what it had already copied" {
-    // Six separate allocations plus the per-element dupes inside two lists, each
-    // guarded by its own errdefer. Stated as a property over every allocation the
-    // function performs rather than against a hand-picked index, so it cannot rot as
-    // the field list changes -- the same shape as the X-8 test over `emitArcSet`.
-    //
-    // `FailingAllocator` reports any block still outstanding when the test ends, so a
-    // missing errdefer fails here rather than becoming a leak on every SIGHUP that
-    // happens to land under memory pressure.
+    // Exercise each allocation failure; `FailingAllocator` detects leaked blocks.
     var saw_success = false;
     var saw_failure = false;
 
@@ -1053,18 +962,17 @@ test "a snapshot that fails partway through frees what it had already copied" {
             saw_failure = true;
         }
 
-        // Nothing outstanding on either path.
+        // Neither path may leave allocations outstanding.
         try std.testing.expectEqual(failing.allocations, failing.deallocations);
     }
 
-    // Guard against the loop passing because it exercised nothing.
+    // Verify that the loop covered both outcomes.
     try std.testing.expect(saw_failure);
     try std.testing.expect(saw_success);
 }
 
 test "the strip policy always claims arc, and carries strip_all through" {
-    // `own_methods` names what this daemon asserts, so it is a property of the
-    // program. `strip_all` is the operator's, and it is reloadable.
+    // ARC is always this daemon's asserted method; `strip_all` is reloadable.
     const a = std.testing.allocator;
     const authserv = try a.dupe(u8, "mail.first.test");
     defer a.free(authserv);

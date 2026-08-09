@@ -1,17 +1,7 @@
-//! Construction of the ARC set's header bytes: the AAR content, the canonicalized
-//! signing inputs for the AMS and the ARC-Seal, and base64 folding.
+//! ARC set construction: AAR content, signing inputs, and base64 folding.
 //!
-//! Split out of `main.zig` under megaplan Phase 10 R1. The seam is a real one
-//! rather than a line count: everything here turns message content plus explicit
-//! configuration into bytes, and decides nothing. The seal *decision* flow --
-//! which key to use, what to do when DNS fails, whether to seal at all -- stays in
-//! `main.zig` with the daemon state it reads.
-//!
-//! Seven of these nine functions were already free of global state. The two that
-//! were not (`buildSigningHeaders`, `buildAarContent`) now take their configuration
-//! as parameters, which is what makes the whole layer testable without starting a
-//! daemon: the AAR trust rule in `buildAarContent` is a security boundary, and it
-//! was previously reachable only through a live sealing path.
+//! This module converts explicit configuration and message content into headers.
+//! The milter flow retains daemon-state and sealing-policy decisions.
 
 const std = @import("std");
 const mem = std.mem;
@@ -34,13 +24,9 @@ fn connHeaderName(hdr: connection_mod.Header) []const u8 {
     return hdr.name;
 }
 
-/// Canonicalize the headers named in `signed_headers` and append them to `buf`.
+/// Canonicalize the headers selected by `signed_headers` into `buf`.
 ///
-/// The AMS we sign has to select header instances by the same rule a verifier
-/// will use to check it (RFC 8617 via RFC 6376 §5.4.2), so this shares the
-/// selector with validation rather than repeating the walk. Taking the last
-/// match for every mention, as this did, would make any oversigned AMS we
-/// produced unverifiable everywhere else (audit A-6).
+/// Uses the same header-instance selection rule as validation (RFC 6376 §5.4.2).
 pub fn buildSigningHeaders(
     conn: *connection_mod.Connection,
     buf: *std.ArrayListUnmanaged(u8),
@@ -54,13 +40,8 @@ pub fn buildSigningHeaders(
         conn.headers.items,
     );
     while (walk.next()) |hdr| {
-        // The message's own field name, not the `h=` spelling of it: relaxed
-        // canonicalization lowercases both, but simple preserves what the
-        // message carried, and that is what a verifier hashes.
-        // Rendered rather than fabricated. Relaxed deletes the whitespace around
-        // the colon so it cannot matter here, but knowing that is not this
-        // function's job, and a future `c=` reaching this path would inherit the
-        // bug (audit D-23).
+        // Render the original field name and spacing; simple canonicalization
+        // preserves both.
         const full = try hdr.render(conn.allocator);
         defer conn.allocator.free(full);
         const canonicalized = try canon_mod.canonicalizeHeader(conn.allocator, .relaxed, full);
@@ -70,26 +51,10 @@ pub fn buildSigningHeaders(
     }
 }
 
-/// Which prior ARC sets the ARC-Seal signature covers.
+/// Select prior ARC sets covered by the ARC-Seal signature.
 ///
-/// RFC 8617 §5.1.2 is a MUST, and it inverts the usual rule: *"In the case of a
-/// failed Authenticated Received Chain, the header fields included in the signature
-/// scope of the AS header field b= value MUST only include the ARC Set header fields
-/// created by the MTA that detected the malformed chain, as if this newest ARC Set
-/// was the only set present."*
-///
-/// The section's own informational note gives the reason: for a malformed chain
-/// *"there is no way to generate a deterministic set of AS header fields"*. Signing
-/// the prior sets anyway produces a signature over bytes no verifier can reliably
-/// reconstruct, so a `cv=fail` seal built that way is not merely different — it is
-/// unverifiable (audit A-20).
-///
-/// **Its own function because the conformance suite cannot see this.** Reintroducing
-/// the defect leaves the ValiMail signing suite at 17/17: for a `cv=fail` chain a
-/// validator stops at the failed seal (§5.2 step 2) and never checks ours, and `b=`
-/// is not byte-comparable across tag orderings. Verified by reverting it and
-/// re-running. So the rule is pinned by the test below instead, and the extraction
-/// exists to make that test possible without a signing key.
+/// RFC 8617 §5.1.2 requires a `cv=fail` seal to cover only the new set; malformed
+/// prior sets cannot provide a deterministic signing input.
 pub fn sealScope(cv: arc.ChainValidation, prior_sets: []const arc.ArcSet) []const arc.ArcSet {
     return if (cv == .fail) &.{} else prior_sets;
 }
@@ -191,17 +156,9 @@ pub fn resultsPart(header_value: []const u8) ?[]const u8 {
     return if (result.len == 0) null else result;
 }
 
-/// Fold a base64 string by inserting CRLF+TAB every 76 characters, so Postfix cannot
-/// introduce a mid-token fold at an arbitrary position.
+/// Fold base64 with CRLF+TAB every 76 characters.
 ///
-/// Returns a NEW allocation the caller owns in every case.
-///
-/// It used to return `b64` itself when short enough to need no folding, so the result
-/// was sometimes borrowed and sometimes owned, with nothing in the type to say which.
-/// Both call sites did the only thing available to them and freed neither, which leaked
-/// a folded RSA signature on every sealed message (audit X-11). Duplicating the short
-/// case costs one copy of a value that is, by definition, at most 76 bytes, and makes
-/// `defer allocator.free(...)` correct unconditionally.
+/// Always returns a caller-owned allocation, including the unwrapped case.
 pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
     const chunk_size = 76;
     if (b64.len <= chunk_size) return allocator.dupe(u8, b64);
@@ -221,19 +178,10 @@ pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
-/// Failure to build the set. The step that failed is reported out-of-band rather
-/// than as a distinct error per step: the caller logs it and tempfails either way,
-/// and twenty error names would be twenty things to keep in sync with one `switch`.
+/// Set construction failure; the failing step is reported out-of-band.
 pub const BuildError = error{BuildFailed};
 
-/// The three header values of one ARC set, owned as a unit.
-///
-/// Modelled on `securedkim`'s `SignResult`: the struct names the allocator that
-/// made it and frees itself, so a caller cannot get the ownership wrong. That is
-/// exactly the contract `foldBase64` lacked, and X-11 was the price -- two
-/// allocations leaked per sealed message that no caller could have known to free,
-/// because the signature did not say. Handing back three bare slices instead would
-/// be the same trap three times over.
+/// The three owned header values in an ARC set.
 pub const BuiltSet = struct {
     aar: []u8,
     ams: []u8,
@@ -247,13 +195,9 @@ pub const BuiltSet = struct {
     }
 };
 
-/// Everything `buildSet` needs beyond the message already on the connection.
+/// Resolved inputs for `buildSet` beyond the connection.
 ///
-/// All of it is resolved configuration and an already-acquired key: this layer
-/// reads no daemon state and makes no policy choice. `cv` in particular arrives
-/// *decided*, because deciding it is where A-12 lived — a nameserver blip must not
-/// become a permanent `cv=fail` — and that judgement needs to see the DNS outcome,
-/// so it stays with the flow.
+/// The caller supplies policy decisions and an acquired signing key.
 pub const SetParams = struct {
     instance: u8,
     cv: arc.ChainValidation,
@@ -265,14 +209,7 @@ pub const SetParams = struct {
     sign_key: *const crypto.SigningKey,
     /// Sets already on the message, for the ARC-Seal's signing input.
     prior_sets: []const arc.ArcSet,
-    /// Signature timestamp for `t=` on both the AMS and the ARC-Seal.
-    ///
-    /// Injected rather than read from the clock here, for two reasons that happen to
-    /// point the same way. Sealing must be reproducible to be testable at all -- the
-    /// ValiMail signing suite supplies a fixed timestamp and compares the resulting
-    /// `b=` byte for byte, which is impossible if this layer calls `time()` itself.
-    /// And this module decides nothing by design (see the file comment), so reading
-    /// ambient state would be the one exception.
+    /// Timestamp for both AMS and ARC-Seal `t=` tags, supplied for reproducibility.
     timestamp: u64,
 };
 
@@ -283,19 +220,9 @@ fn fail(step: *?[]const u8, what: []const u8) BuildError {
     return error.BuildFailed;
 }
 
-/// Build all three header values of the new ARC set. Writes nothing.
+/// Build all header values for a new ARC set without emitting them.
 ///
-/// That it writes nothing is the point rather than an incidental property. A milter
-/// header packet cannot be recalled once it is on the wire, so an allocation failure
-/// partway through emission used to deliver a *partial* set — and RFC 8617 §5.1.2
-/// makes the next hop record that as a permanent `cv=fail`, destroying a chain that
-/// may have been valid (audit X-8). Keeping every allocation in this module and every
-/// write in the flow makes that ordering structural: the caller has no set to emit
-/// until it has all of it.
-///
-/// On failure `failed_step` names the step, following the `reason: *?[]const u8`
-/// convention `chain.zig` already uses for the same job. Partially built values are
-/// released here, so a failed call returns nothing and leaks nothing.
+/// `failed_step` identifies failures; partial values are released before return.
 pub fn buildSet(
     conn: *connection_mod.Connection,
     p: SetParams,
@@ -425,17 +352,7 @@ test "results part drops the authserv-id" {
     try std.testing.expect(resultsPart("mail.example.org;   ") == null);
 }
 
-// --- X-11: the fold must always hand back an allocation the caller owns ------
-//
-// It used to return its input unchanged when short enough to need no folding, so the
-// result was owned on one path and borrowed on the other with nothing in the type to
-// say which. Neither call site freed it, which leaked a folded RSA signature on every
-// sealed message and grew RSS without bound.
-//
-// `std.testing.allocator` is what makes this a real check rather than a restatement:
-// it fails the test if the returned slice is never freed, and it fails just as loudly
-// if the `free` below is handed memory it did not allocate. One contract, both
-// directions.
+// --- X-11: `foldBase64` always returns owned memory ---------------------------
 test "foldBase64 returns owned memory on both the folding and the short path" {
     const a = std.testing.allocator;
 
@@ -462,19 +379,10 @@ test "foldBase64 returns owned memory on both the folding and the short path" {
     try std.testing.expectEqual(sig_b64.len + 4 * 3, folded_sig.len);
 }
 
-// --- The AAR trust rule (RFC 8617 §5.1.1) ------------------------------------
+// --- AAR trust rule (RFC 8617 §5.1.1) ------------------------------------------
 //
-// This is a security boundary and it had no direct test. `buildAarContent` decides
-// which Authentication-Results headers this ADMD is willing to vouch for
-// cryptographically, and everything it accepts gets sealed into the chain under our
-// domain's signature. Until the seal path was parameterised the rule was reachable
-// only through a live daemon with a signing key, a resolver and a socket, so it was
-// exercised end to end by the `a3` lab probe and not at all by anything cheaper.
-// Being able to write these six tests is the reason the extraction was worth doing.
-//
-// An A-R header on an inbound message is attacker-controlled. Copying one we did not
-// produce would have this host sign an assertion it never made -- the mail equivalent
-// of countersigning a stranger's affidavit.
+// Only Authentication-Results for this authserv-id and configured local methods
+// may be sealed into an ARC-Authentication-Results header.
 
 /// A connection carrying `hdrs` and nothing else.
 ///

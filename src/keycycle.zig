@@ -1,19 +1,7 @@
-//! Trying the key records published at one selector until one verifies.
+//! Verify a signature against published key records at one selector.
 //!
-//! Split out of `chain.zig` when adding A-24: the AMS and the ARC-Seal paths each
-//! needed the same cycling, and two near-identical copies of it is exactly the
-//! duplication S-12 was filed about. The line-limit gate flagged the growth, which
-//! is the seam working as intended rather than a number to be raised.
-//!
-//! ## Why cycle at all
-//!
-//! A domain rotating keys publishes the old and the new record at one selector,
-//! and RFC 6376 6.1.2 leaves their order unspecified -- resolvers commonly rotate
-//! it. Committing to the first record therefore makes the verdict depend on which
-//! half DNS happened to return: the same message verifies on one lookup and fails
-//! on the next. `securedkim` fixed this as D-20; `securearc` carried the defect
-//! until A-24, where it is worse, because a failed AMS or seal makes this hop
-//! write `cv=fail` and RFC 8617 5.1.2 makes that permanent.
+//! Key-record order is unspecified during rotation, so verification tries bounded
+//! candidates until one succeeds.
 
 const std = @import("std");
 const mem = std.mem;
@@ -31,47 +19,28 @@ const arc = @import("arc.zig");
 /// The verdict of checking one signature.
 pub const CheckOutcome = enum { pass, fail, dns_temp_error, internal_error };
 
-/// Classify a failure while handling data the signer published.
+/// Classify failures from published signature data.
 ///
-/// A key record, a body hash and a signature are all attacker- or
-/// publisher-controlled, so a malformed one is a permanent failure of that
-/// signature and belongs in the verdict. Only our own allocation failing is
-/// internal.
+/// Only allocation failure is internal; malformed published data fails validation.
 pub fn classifyDataError(err: anyerror) CheckOutcome {
     return if (err == error.OutOfMemory) .internal_error else .fail;
 }
 
-/// How many TXT records at one selector we are willing to try before giving up.
-///
-/// Bounded because the count is the zone owner's choice and each record costs
-/// another public-key verification. Same values as `securedkim`'s, deliberately:
-/// an operator tuning one daemon should not have to discover that the other
-/// counts differently.
+/// Default and maximum key records tried per selector.
 pub const DEFAULT_MAX_KEY_RECORDS: u8 = 3;
 pub const MAX_KEY_RECORDS_CEILING: u8 = 8;
 
-/// The two policy knobs that always travel together, grouped rather than passed
-/// as a growing tail of scalars.
+/// Per-chain validation limits.
 pub const Policy = struct {
-    /// Smallest RSA modulus accepted for an AMS or AS signature. ARC inherits
-    /// DKIM's cryptography, so RFC 8301's floor applies here too: a set signed
-    /// with a factorable key must not validate, or the whole point of a chain of
-    /// custody is lost at that hop.
+    /// Smallest RSA modulus accepted for an AMS or ARC-Seal signature.
     min_key_bits: u32,
-    /// Clamped to `MAX_KEY_RECORDS_CEILING` at the point of use, so a configured
-    /// value cannot turn one selector into unbounded verification work.
+    /// Capped at `MAX_KEY_RECORDS_CEILING` during validation.
     max_key_records: u8 = DEFAULT_MAX_KEY_RECORDS,
-    /// Wall-clock bound on one chain validation, in ms; 0 disables (X-21).
-    /// A chain of N sets costs N+1 key fetches, and a slow-but-working resolver
-    /// holds the worker for all of them -- the count caps bound the work, this
-    /// bounds the time. Same option name and default as `securespf`'s.
+    /// Chain-validation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
 };
 
-/// What to call the thing being verified, when a key is refused on policy grounds.
-///
-/// Data rather than a branch: the caller picks the wording once, so the loop below
-/// stays free of any "which header am I" test.
+/// Header-specific diagnostics for policy-rejected keys.
 pub const Labels = struct {
     too_small: []const u8,
     not_rsa: []const u8,
@@ -87,10 +56,7 @@ pub const SEAL_LABELS = Labels{
     .not_rsa = "ARC-Seal key record p= is not an RSA key",
 };
 
-/// Whether this name publishes any usable key at all.
-///
-/// Answered before the caller spends its key-independent work, because "the record
-/// says there is no key" is permanent and no amount of hashing can change it.
+/// Whether the selector publishes a non-empty `p=` key record.
 pub fn hasUsableKey(dns_result: *const dns_mod.resolver.Result) bool {
     var it = dns_result.txtRecords();
     while (it.next()) |txt| {
@@ -101,17 +67,10 @@ pub fn hasUsableKey(dns_result: *const dns_mod.resolver.Result) bool {
     return false;
 }
 
-/// Try each published key record against one already-built signing input.
+/// Try published key records against an already-built signing input.
 ///
-/// The first key that verifies wins and returns immediately, so the ordinary
-/// single-record case still costs exactly one verification and a rotation costs
-/// one extra only when the record DNS listed first is the wrong half of the pair.
-///
-/// A failure is *held* rather than returned, because until every candidate has
-/// been tried "this signature does not verify" is not yet a fact -- the same
-/// reasoning as `securedkim`'s `tryKeyRecords`. The first failure's reason is the
-/// one reported, so the message an operator sees describes the key the zone listed
-/// first rather than whichever happened to be tried last.
+/// Return the first successful verification; otherwise retain the first failure
+/// and its diagnostic reason.
 pub fn tryKeys(
     allocator: Allocator,
     dns_result: *dns_mod.resolver.Result,
@@ -163,8 +122,7 @@ pub fn tryKeys(
     }
 
     if (held_reason) |r| reason.* = r;
-    // Callers gate on `hasUsableKey`, so at least one candidate was tried and
-    // `held` is set; the orelse is the honest verdict if that stops holding.
+    // A caller normally ensures at least one usable key record exists.
     return held orelse .fail;
 }
 
@@ -205,7 +163,7 @@ test "tryKeys cycles past a decoy record to the one that verifies (A-24)" {
     const good_txt = try std.fmt.allocPrint(allocator, "v=DKIM1; k=rsa; p={s}", .{good_p});
     defer allocator.free(good_txt);
 
-    // The decoy is listed FIRST, which is the whole point: before A-24 this daemon
+    // The decoy is listed first (before A-24):
     // committed to whichever record DNS returned first and never looked further.
     var answers = [_]dns_mod.packet.Answer{ txtAnswer(JUNK_TXT), txtAnswer(good_txt) };
     var result = dns_mod.resolver.Result{ .answers = &answers, .allocator = allocator };

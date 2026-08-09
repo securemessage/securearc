@@ -9,11 +9,8 @@
 //! path, and the AAR trust rule that governs what this ADMD is willing to vouch
 //! for, are reachable from a test without a running daemon.
 //!
-//! The two context structs are defined here but *constructed* in `main.zig`, by
-//! `msgCtx` and `sealCtx`. That split is deliberate: a constructor here would have
-//! to reach back into `main.zig` for the globals, making the two files circular.
-//! Keeping construction where the globals live means this module needs no import of
-//! its parent at all.
+//! Context structs defined here, constructed in `main.zig`: avoids import cycle
+//! (this module must not import its parent).
 
 const std = @import("std");
 const posix = std.posix;
@@ -184,15 +181,9 @@ pub fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
 /// Everything sealing needs beyond chain validation: this ADMD's identity, the key,
 /// and the policy for a chain we could not evaluate.
 ///
-/// Deliberately a second, larger struct rather than more fields on `MsgCtx`.
-/// `doVerify` needs five values and `doSeal` needs eleven, so one combined context
-/// would hand the verify path a signing key it has no business holding. Composing
-/// them keeps that separation while stating the real relationship: sealing
-/// *includes* validating, because a chain is evaluated before it is extended.
-///
-/// `main.zig`'s `sealCtx` returns null when this daemon is not configured to seal,
-/// which is the three separate guards `doSeal` used to open with, consolidated into
-/// the one place that can answer the question.
+/// Separate from `MsgCtx`: `doVerify` needs 5 values, `doSeal` needs 11; combining
+/// them would hand verify a signing key. Sealing includes validating (chain evaluated
+/// before extended); `main.zig`'s `sealCtx` is null when not configured to seal.
 pub const SealCtx = struct {
     msg: MsgCtx,
     domain: []const u8,
@@ -293,7 +284,7 @@ test "On-DNSError=tempfail defers rather than recording a permanent cv=fail" {
         .failure_reason = "SERVFAIL from 192.0.2.1",
         .evaluation = .dns_temp_error,
     });
-    // A-12: the whole point is that a nameserver blip must not become a verdict.
+    // A-12: a transient DNS failure must not become a verdict (`unknown`, not `fail`).
     try std.testing.expectEqual(
         @as(u8, @intFromEnum(responses.Code.tempfail)),
         out.stop,
@@ -462,9 +453,8 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
         .local_auth_methods = ctx.local_auth_methods,
         .sign_key = ctx.sign_key,
         .prior_sets = sets,
-        // Read here rather than in `sealbuild`, which is deliberately free of
-        // ambient state so that a fixed timestamp can be injected and the resulting
-        // signature compared byte for byte.
+        // Read here, not `sealbuild`: `sealbuild` is stateless (fixed timestamp for
+        // byte-for-byte comparison tests).
         .timestamp = @intCast(std.time.timestamp()),
     }, &failed_step) catch
         return sealInternalError(failed_step orelse "building the ARC set");

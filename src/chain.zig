@@ -27,12 +27,8 @@ fn amsHeaderName(hdr: arc.Header) []const u8 {
     return hdr.name;
 }
 
-/// Whether chain validation actually reached a verdict.
-///
-/// A `cv=` value asserts something about the message, and RFC 8617 §5.1.2 makes
-/// `cv=fail` permanent for the life of that message: no later hop may revise it.
-/// So a verdict must only be reported when it was genuinely determined. This
-/// says whether it was (audit A-12).
+/// Whether validation produced a real verdict (audit A-12).
+/// `cv=fail` is permanent per RFC 8617 §5.1.2; only report when genuinely determined.
 pub const Evaluation = enum {
     /// Every signature was checked; `status` is a real verdict.
     complete,
@@ -55,20 +51,13 @@ pub const ValidationResult = struct {
     status: arc.ChainValidation,
     highest_instance: u8,
     failure_reason: ?[]const u8,
-    /// Whether `status` is a determination or a placeholder. Callers MUST check
-    /// this before acting on `status`: a transient DNS failure previously
-    /// arrived here indistinguishable from a forged signature, and both were
-    /// reported as `fail` (audit A-12).
+    /// Callers MUST check this before acting on `status`: transient DNS failures
+    /// previously arrived indistinguishable from forged signatures (audit A-12).
     evaluation: Evaluation = .complete,
 };
 
-/// Classify a failure from the resolver.
-///
-/// Order matters. `OutOfMemory` can surface from the resolver as readily as from
-/// anywhere else, and `isTransientError` would call it transient — it treats
-/// everything except an authoritative "no such name" as transient, which is the
-/// right default for DNS but wrong for a local allocation failure. Checking for
-/// it first keeps our own faults out of the DNS bucket.
+/// Order matters: check `OutOfMemory` first. `isTransientError` treats everything
+/// except authoritative `NXDOMAIN` as transient; wrong for local allocation failures.
 fn classifyDnsError(err: anyerror) CheckOutcome {
     if (err == error.OutOfMemory) return .internal_error;
     return if (dns_mod.isTransientError(err)) .dns_temp_error else .fail;

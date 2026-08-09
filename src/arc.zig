@@ -76,12 +76,8 @@ pub const ChainValidation = enum {
     }
 };
 
-/// Why a set of ARC headers does not form a chain that can be validated.
-///
-/// RFC 8617 §5.1.2: a chain that is too long, or whose instance numbers are
-/// not a complete sequence, is `cv=fail`. Reporting anything else — including
-/// validating whatever prefix happens to be well-formed — asserts a verdict
-/// over a chain that is not the one attached to the message.
+/// Chain errors: RFC 8617 §5.1.2 requires `cv=fail` for any incomplete or too-long
+/// chain. Validating a partial prefix asserts a verdict over a chain not attached.
 pub const ChainError = error{
     /// An instance number between 1 and the highest one seen is missing.
     ChainGap,
