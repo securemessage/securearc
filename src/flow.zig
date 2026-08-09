@@ -163,6 +163,16 @@ pub fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
             log.err("internal error validating ARC chain: {s}", .{result.failure_reason orelse "unknown"});
             return @intFromEnum(responses.Code.tempfail);
         },
+        // X-21: the deadline is our budget, not the chain's property -- the
+        // sender retries, exactly as for a transient DNS failure, and the log
+        // keeps the two apart.
+        .deadline_exceeded => {
+            log.warn("ARC chain evaluation deadline exceeded at i={d}", .{result.highest_instance});
+            addArHeaderSimple(conn, ctx.authserv_id, "arc", "temperror", result.failure_reason) catch |err|
+                return auth_stamp.deferCode(err, "arc");
+            publishEvent(ctx.publisher, conn.allocator, "verify", "temperror", result.highest_instance);
+            return @intFromEnum(responses.Code.@"continue");
+        },
     }
 
     addArHeaderSimple(conn, ctx.authserv_id, "arc", result.status.toString(), result.failure_reason) catch |err|
@@ -255,6 +265,14 @@ fn chainOutcome(
         },
 
         .dns_temp_error => return dnsTempOutcome(ctx.on_dns_error, vr),
+
+        // X-21: our budget ran out, which is the seal path's version of a
+        // transient failure -- the operator's On-DNSError policy decides, and
+        // a permanent cv=fail is never the silent default.
+        .deadline_exceeded => {
+            log.warn("not sealing: evaluation deadline exceeded at i={d}", .{vr.highest_instance});
+            return dnsTempOutcome(ctx.on_dns_error, vr);
+        },
     }
 }
 

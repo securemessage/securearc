@@ -4,6 +4,7 @@ const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -42,6 +43,11 @@ pub const Evaluation = enum {
     /// Our problem rather than the sender's, and never chargeable to the chain
     /// (audit A-12a).
     internal_error,
+    /// The evaluation's own wall-clock budget ran out (X-21). Not a verdict:
+    /// the chain was not fully checked, so `status` is `.unknown`. Distinct
+    /// from `dns_temp_error` because the operator response differs -- one is
+    /// their resolver, the other is our budget.
+    deadline_exceeded,
 };
 
 /// Result of validating an ARC chain.
@@ -83,6 +89,35 @@ pub fn validateChain(
     all_headers: []const arc.Header,
     body_data: []const u8,
     policy: Policy,
+) ValidationResult {
+    // X-21: one deadline for the whole walk, set at the start. An N-set chain
+    // spends N+1 key fetches; the per-selector cap (MaxKeyRecords) bounds the
+    // work of each, and this bounds the time of all of them together. Expiry
+    // is never a verdict against the chain -- it maps to the same "we could
+    // not check" answer as a transient DNS failure, but stays distinguishable
+    // in the log.
+    return validateChainInner(
+        allocator,
+        resolver,
+        sets,
+        all_headers,
+        body_data,
+        policy,
+        deadline_mod.Deadline.fromNow(policy.max_evaluation_ms),
+    );
+}
+
+/// The walk, with the deadline as a parameter. Public callers go through
+/// `validateChain`; tests inject `Deadline.initAbsolute(0)` so expiry is
+/// deterministic -- no sleep, no clock control, no slow resolver to lean on.
+fn validateChainInner(
+    allocator: Allocator,
+    resolver: *dns_mod.Resolver,
+    sets: []const arc.ArcSet,
+    all_headers: []const arc.Header,
+    body_data: []const u8,
+    policy: Policy,
+    deadline: deadline_mod.Deadline,
 ) ValidationResult {
     if (sets.len == 0) {
         return .{ .status = .none, .highest_instance = 0, .failure_reason = null };
@@ -126,6 +161,12 @@ pub fn validateChain(
     }
 
     // Step 3: Verify the most recent AMS (i=N) — validates message integrity
+    if (deadline.expired()) return .{
+        .status = .unknown,
+        .highest_instance = sets[sets.len - 1].instance,
+        .failure_reason = "evaluation deadline exceeded before the AMS check",
+        .evaluation = .deadline_exceeded,
+    };
     const newest = sets[sets.len - 1];
     var ams_reason: ?[]const u8 = null;
     switch (verifyAms(allocator, resolver, &newest, all_headers, body_data, policy, &ams_reason)) {
@@ -153,6 +194,15 @@ pub fn validateChain(
 
     // Step 4: Verify each ARC-Seal (validates chain integrity)
     for (sets) |set| {
+        // The deadline is checked per seal: each iteration spends a key fetch,
+        // so this is the point where a slow resolver would otherwise be
+        // re-entered without limit.
+        if (deadline.expired()) return .{
+            .status = .unknown,
+            .highest_instance = set.instance,
+            .failure_reason = "evaluation deadline exceeded during ARC-Seal checks",
+            .evaluation = .deadline_exceeded,
+        };
         var seal_reason: ?[]const u8 = null;
         switch (verifySeal(allocator, resolver, &set, sets[0..set.instance], policy, &seal_reason)) {
             .pass => {},
@@ -298,7 +348,6 @@ fn verifyAms(
     );
 }
 
-
 /// Build the signing input for AMS verification.
 ///
 /// Canonicalizes the headers listed in the h= tag under `header_canon` -- which
@@ -439,7 +488,6 @@ fn verifySeal(
         reason,
     );
 }
-
 
 /// Build the seal signing input per RFC 8617 §5.1.1.
 /// Order: for each instance 1..i, canonicalize AAR, AMS, AS headers.
@@ -774,6 +822,44 @@ test "classifyDataError blames the publisher for malformed data, us for OOM" {
     try std.testing.expectEqual(CheckOutcome.internal_error, classifyDataError(error.OutOfMemory));
     try std.testing.expectEqual(CheckOutcome.fail, classifyDataError(error.InvalidCharacter));
     try std.testing.expectEqual(CheckOutcome.fail, classifyDataError(error.RsaKeyTooSmall));
+}
+
+test "X-21: an expired deadline stops the walk before any DNS, and is not a verdict" {
+    // The deadline is injected as already expired, so this is deterministic.
+    // `undefined` for the resolver is the assertion, as in the A-13 test:
+    // reaching DNS would crash, so passing IS the proof the budget was checked
+    // first.
+    const sets = [_]arc.ArcSet{.{
+        .instance = 1,
+        .aar_value = "i=1; mail.example.org; spf=none",
+        .ams_value = "i=1; a=rsa-sha256; d=example.org; s=sel; b=abc; bh=y; h=from",
+        .as_value = "i=1; cv=none; a=rsa-sha256; d=example.org; s=sel; b=abc",
+        .seal_cv = .none,
+        .seal_algorithm = "rsa-sha256",
+        .seal_domain = "example.org",
+        .seal_selector = "sel",
+        .seal_signature = "abc",
+        .ams_algorithm = "rsa-sha256",
+        .ams_domain = "example.org",
+        .ams_selector = "sel",
+        .ams_signature = "abc",
+        .ams_body_hash = "y",
+        .ams_canonicalization = "relaxed/relaxed",
+        .ams_signed_headers = "from",
+    }};
+
+    const headers: []const arc.Header = &.{};
+    const result = validateChainInner(
+        std.testing.allocator,
+        undefined,
+        &sets,
+        headers,
+        "body",
+        .{ .min_key_bits = crypto.RFC8301_MIN_RSA_BITS },
+        deadline_mod.Deadline.initAbsolute(0),
+    );
+    try std.testing.expectEqual(Evaluation.deadline_exceeded, result.evaluation);
+    try std.testing.expectEqual(arc.ChainValidation.unknown, result.status);
 }
 
 test "validateChain reports unknown/dns_temp_error when the key lookup fails transiently" {

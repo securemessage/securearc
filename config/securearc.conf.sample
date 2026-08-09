@@ -124,6 +124,16 @@ LocalAuthMethods = spf, dkim, dmarc
 # ordinary single-key case still costs exactly one verification.
 # MaxKeyRecords = 3
 
+# --- Evaluation time budget (X-21) ---
+#
+# MaxEvaluationMs is the wall-clock ceiling in milliseconds for evaluating one
+# message, shared by every DNS lookup the verdict needs. Exhausting it gives
+# temperror, never fail: the message was not judged, and the sender retries.
+# A slow resolver, not a hostile sender, is what it guards against.
+#
+# 0 disables it. SIGHUP reloads it.
+# MaxEvaluationMs = 20000
+
 # What a sealing listener does when a previous hop's key cannot be fetched
 # because DNS failed transiently — SERVFAIL, a timeout, an unreachable resolver.
 #

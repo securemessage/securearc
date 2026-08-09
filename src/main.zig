@@ -424,6 +424,7 @@ fn msgCtx(cfg: *const settings.Reloadable) MsgCtx {
         .policy = .{
             .min_key_bits = cfg.min_key_bits,
             .max_key_records = cfg.max_key_records,
+            .max_evaluation_ms = cfg.max_evaluation_ms,
         },
         .authserv_id = cfg.authserv_id,
         .publisher = getPublisher(),

@@ -16,6 +16,7 @@ const listener_mod = securemilter.listener;
 const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const header_scrub = securemilter.header_scrub;
 
 const securemilter_crypto = @import("securemilter_crypto");
@@ -137,6 +138,7 @@ pub const ArcConfig = struct {
     limits: connection_mod.Limits,
     min_key_bits: crypto.MinRsaBits,
     max_key_records: u8,
+    max_evaluation_ms: i64,
     on_dns_error: OnDnsError,
 };
 pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcConfig {
@@ -275,6 +277,11 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     // is honoured by every downstream hop.
     const max_key_records = global.getInt("MaxKeyRecords", u8, chain.DEFAULT_MAX_KEY_RECORDS);
 
+    // X-21: the wall-clock bound on one chain validation, shared spelling and
+    // default with `securespf`. The MaxKeyRecords cap bounds the work of one
+    // selector; this bounds the time of the whole walk.
+    const max_evaluation_ms = global.getInt(deadline_mod.OPTION_NAME, i64, deadline_mod.DEFAULT_MS);
+
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "arc");
 
@@ -304,6 +311,7 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
         .limits = limits,
         .min_key_bits = min_key_bits,
         .max_key_records = max_key_records,
+        .max_evaluation_ms = max_evaluation_ms,
         .on_dns_error = on_dns_error,
     };
 }
@@ -357,6 +365,7 @@ pub const Reloadable = struct {
     local_auth_methods: []const []const u8,
     min_key_bits: u32,
     max_key_records: u8,
+    max_evaluation_ms: i64,
     on_dns_error: OnDnsError,
     strip_all: bool,
 
@@ -395,6 +404,7 @@ pub const Reloadable = struct {
             .local_auth_methods = methods,
             .min_key_bits = c.min_key_bits.bits,
             .max_key_records = c.max_key_records,
+            .max_evaluation_ms = c.max_evaluation_ms,
             .on_dns_error = c.on_dns_error,
             .strip_all = c.strip_auth_results,
         };
@@ -922,6 +932,7 @@ fn scratchConfig(authserv: []u8, headers: []u8, domain: []u8, methods: [][]const
         .worker_threads = 1,
         .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
         .max_key_records = chain.DEFAULT_MAX_KEY_RECORDS,
+        .max_evaluation_ms = deadline_mod.DEFAULT_MS,
         .pid_file = "/nonexistent",
         .foreground = true,
         .user = null,

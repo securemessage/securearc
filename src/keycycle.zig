@@ -21,6 +21,7 @@ const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -60,6 +61,11 @@ pub const Policy = struct {
     /// Clamped to `MAX_KEY_RECORDS_CEILING` at the point of use, so a configured
     /// value cannot turn one selector into unbounded verification work.
     max_key_records: u8 = DEFAULT_MAX_KEY_RECORDS,
+    /// Wall-clock bound on one chain validation, in ms; 0 disables (X-21).
+    /// A chain of N sets costs N+1 key fetches, and a slow-but-working resolver
+    /// holds the worker for all of them -- the count caps bound the work, this
+    /// bounds the time. Same option name and default as `securespf`'s.
+    max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
 };
 
 /// What to call the thing being verified, when a key is refused on policy grounds.

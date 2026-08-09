@@ -239,6 +239,15 @@ A transient publishing state would become a permanent chain break.
 The first record that verifies wins, so the ordinary single-key case costs
 exactly one public-key verification and a rotation costs one extra only when the
 record listed first is the wrong half of the pair.
+.It Cm MaxEvaluationMs
+The wall-clock ceiling in milliseconds for evaluating one message, shared by
+every DNS lookup the verdict needs.
+Default: 20000.
+0 disables it.
+.Pp
+Exhausting the budget yields temperror, never fail: the message was not
+judged, and the sender retries.
+A slow resolver, not a hostile sender, is what it guards against.
 .It Cm On-DNSError
 What a sealing listener does when a previous hop's key cannot be fetched
 because DNS failed transiently

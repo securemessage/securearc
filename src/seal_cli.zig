@@ -34,6 +34,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securearc-seal");
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const connection_mod = securemilter.connection;
 
 const securemilter_crypto = @import("securemilter_crypto");
@@ -80,6 +81,8 @@ const Usage =
     \\  -p <port>          DNS nameserver port (default: 53)
     \\  -b <bits>          Minimum RSA key bits accepted when validating (default: 1024)
     \\  -r <count>         Key records to try at one selector (default: 3, max 8)
+    \\  -m <ms>            Wall-clock budget for validating the existing chain
+    \\                     (default: 20000, the daemon's MaxEvaluationMs; 0 disables)
     \\  -h, --help         Show this help
     \\
     \\The chain already on the message is validated first, because the cv= this host
@@ -107,6 +110,10 @@ pub const Args = struct {
     /// committing to the wrong half of a rotating pair makes this command seal
     /// `cv=fail` over a chain that was in fact intact.
     max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS,
+    /// The daemon's MaxEvaluationMs (X-21). This tool signs its answer, so the
+    /// daemon's budget must apply here or the sealed cv= could be one the
+    /// daemon would never have reached in time.
+    max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
     help: bool = false,
 };
 
@@ -205,6 +212,17 @@ pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Arg
             };
             if (r.max_key_records == 0) {
                 err_msg.* = "-r must be at least 1";
+                return error.OutOfRange;
+            }
+        } else if (mem.eql(u8, a, "-m")) {
+            i += 1;
+            const raw = valueAt(argv, i, "-m", err_msg) orelse return error.MissingValue;
+            r.max_evaluation_ms = std.fmt.parseInt(i64, raw, 10) catch {
+                err_msg.* = "-m must be a number of milliseconds";
+                return error.InvalidNumber;
+            };
+            if (r.max_evaluation_ms < 0) {
+                err_msg.* = "-m must be 0 (disabled) or a positive number of milliseconds";
                 return error.OutOfRange;
             }
         } else if (a.len > 0 and a[0] == '-') {
@@ -364,7 +382,7 @@ pub fn main() !void {
             sets,
             headers,
             msg.body,
-            .{ .min_key_bits = args.min_key_bits, .max_key_records = args.max_key_records },
+            .{ .min_key_bits = args.min_key_bits, .max_key_records = args.max_key_records, .max_evaluation_ms = args.max_evaluation_ms },
         );
         switch (vr.evaluation) {
             .complete => break :blk vr.status,
@@ -376,6 +394,9 @@ pub fn main() !void {
             .dns_temp_error => cli.fatal("cannot determine cv=: transient DNS failure while " ++
                 "validating the existing chain (sealing cv=fail would be permanent)"),
             .internal_error => cli.fatal("cannot determine cv=: internal error validating the chain"),
+            // X-21: an expired budget is the same class -- do not seal a guess.
+            .deadline_exceeded => cli.fatal("cannot determine cv=: evaluation deadline exceeded while " ++
+                "validating the existing chain (sealing cv=fail would be permanent)"),
         }
     };
 
@@ -491,4 +512,21 @@ test "parseArgs: missing values, bad numbers, unknown options" {
     try expectParseError(error.InvalidNumber, "-r must be a number", &.{ "-r", "x", "m.eml" });
     try expectParseError(error.OutOfRange, "-r must be at least 1", &.{ "-r", "0", "m.eml" });
     try expectParseError(error.UnknownOption, "unknown option (use -h for help)", &.{"--seal-everything"});
+}
+
+test "parseArgs: -m maps to max_evaluation_ms, 0 disables, negatives refused" {
+    var msg: ?[]const u8 = null;
+    const base = [_][]const u8{ "-d", "d", "-s", "s", "-k", "k" };
+    const a = try parseArgs(&(base ++ .{ "-m", "5000", "m.eml" }), &msg);
+    try std.testing.expectEqual(@as(i64, 5000), a.max_evaluation_ms);
+
+    const off = try parseArgs(&(base ++ .{ "-m", "0", "m.eml" }), &msg);
+    try std.testing.expectEqual(@as(i64, 0), off.max_evaluation_ms);
+
+    try expectParseError(error.InvalidNumber, "-m must be a number of milliseconds", &(base ++ .{ "-m", "x", "m.eml" }));
+    try expectParseError(error.OutOfRange, "-m must be 0 (disabled) or a positive number of milliseconds", &(base ++ .{ "-m", "-1", "m.eml" }));
+    try expectParseError(error.MissingValue, "-m needs a value", &(base ++ .{"-m"}));
+
+    const dflt = try parseArgs(&(base ++ .{"m.eml"}), &msg);
+    try std.testing.expectEqual(deadline_mod.DEFAULT_MS, dflt.max_evaluation_ms);
 }
