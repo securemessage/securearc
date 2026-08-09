@@ -88,7 +88,7 @@ const Usage =
     \\
 ;
 
-const Args = struct {
+pub const Args = struct {
     file: ?[]const u8 = null,
     domain: ?[]const u8 = null,
     selector: ?[]const u8 = null,
@@ -107,40 +107,89 @@ const Args = struct {
     /// committing to the wrong half of a rotating pair makes this command seal
     /// `cv=fail` over a chain that was in fact intact.
     max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS,
+    help: bool = false,
 };
 
-fn parseArgs() Args {
-    var r = Args{};
-    var it = process.args();
-    _ = it.next();
+pub const ParseError = error{
+    UnknownOption,
+    MissingValue,
+    InvalidNumber,
+    OutOfRange,
+    MissingFile,
+    MissingRequired,
+};
 
-    while (it.next()) |a| {
+/// Fetch the value following a flag, or set the static message and return null.
+/// `flag` is comptime so the message is a folded literal, not an allocation.
+fn valueAt(argv: []const []const u8, i: usize, comptime flag: []const u8, err_msg: *?[]const u8) ?[]const u8 {
+    if (i >= argv.len) {
+        err_msg.* = flag ++ " needs a value";
+        return null;
+    }
+    return argv[i];
+}
+
+/// Parse the command line (excluding the program name) into `Args`.
+///
+/// Pure and error-returning BY DESIGN: the first version read `process.args()`
+/// and exited through `cli.fatal`, which A-22 filed as untestable -- a sealer
+/// whose flag handling cannot be exercised in a test is one whose regressions
+/// ship. On failure `err_msg` receives a static description; `main` maps it to
+/// the exit. Messages are the ones the exiting version printed.
+pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Args {
+    err_msg.* = null;
+    var r = Args{};
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
         if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            cli.out(Usage);
-            process.exit(0);
+            // Returning here preserves the original's early-exit: whatever
+            // followed -h was never examined.
+            r.help = true;
+            return r;
         } else if (mem.eql(u8, a, "-d")) {
-            r.domain = it.next() orelse cli.fatal("-d needs a value");
+            i += 1;
+            r.domain = valueAt(argv, i, "-d", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "-s")) {
-            r.selector = it.next() orelse cli.fatal("-s needs a value");
+            i += 1;
+            r.selector = valueAt(argv, i, "-s", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "-k")) {
-            r.key_file = it.next() orelse cli.fatal("-k needs a value");
+            i += 1;
+            r.key_file = valueAt(argv, i, "-k", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "-a")) {
-            r.authserv_id = it.next() orelse cli.fatal("-a needs a value");
+            i += 1;
+            r.authserv_id = valueAt(argv, i, "-a", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "--headers")) {
-            r.signed_headers = it.next() orelse cli.fatal("--headers needs a value");
+            i += 1;
+            r.signed_headers = valueAt(argv, i, "--headers", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "--methods")) {
-            r.methods_raw = it.next() orelse cli.fatal("--methods needs a value");
+            i += 1;
+            r.methods_raw = valueAt(argv, i, "--methods", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "-t")) {
-            const raw = it.next() orelse cli.fatal("-t needs a value");
-            r.timestamp = std.fmt.parseInt(u64, raw, 10) catch cli.fatal("-t must be a number");
+            i += 1;
+            const raw = valueAt(argv, i, "-t", err_msg) orelse return error.MissingValue;
+            r.timestamp = std.fmt.parseInt(u64, raw, 10) catch {
+                err_msg.* = "-t must be a number";
+                return error.InvalidNumber;
+            };
         } else if (mem.eql(u8, a, "-n")) {
-            r.nameserver = it.next() orelse cli.fatal("-n needs a value");
+            i += 1;
+            r.nameserver = valueAt(argv, i, "-n", err_msg) orelse return error.MissingValue;
         } else if (mem.eql(u8, a, "-p")) {
-            const raw = it.next() orelse cli.fatal("-p needs a value");
-            r.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("-p must be a port number");
+            i += 1;
+            const raw = valueAt(argv, i, "-p", err_msg) orelse return error.MissingValue;
+            r.port = std.fmt.parseInt(u16, raw, 10) catch {
+                err_msg.* = "-p must be a port number";
+                return error.InvalidNumber;
+            };
         } else if (mem.eql(u8, a, "-b")) {
-            const raw = it.next() orelse cli.fatal("-b needs a value");
-            const configured = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("-b must be a number");
+            i += 1;
+            const raw = valueAt(argv, i, "-b", err_msg) orelse return error.MissingValue;
+            const configured = std.fmt.parseInt(u32, raw, 10) catch {
+                err_msg.* = "-b must be a number";
+                return error.InvalidNumber;
+            };
             // Reconciled with the RFC 8301 floor here, once, so the value reaching
             // chain.validateChain below cannot validate a chain the shipped
             // securearc rejects. §3.2 is a MUST NOT for verifiers, and unlike
@@ -148,20 +197,42 @@ fn parseArgs() Args {
             // signs one into an ARC-Seal that every later hop is asked to trust.
             r.min_key_bits = crypto.resolveMinRsaBits(configured).bits;
         } else if (mem.eql(u8, a, "-r")) {
-            const raw = it.next() orelse cli.fatal("-r needs a value");
-            r.max_key_records = std.fmt.parseInt(u8, raw, 10) catch cli.fatal("-r must be a number");
-            if (r.max_key_records == 0) cli.fatal("-r must be at least 1");
+            i += 1;
+            const raw = valueAt(argv, i, "-r", err_msg) orelse return error.MissingValue;
+            r.max_key_records = std.fmt.parseInt(u8, raw, 10) catch {
+                err_msg.* = "-r must be a number";
+                return error.InvalidNumber;
+            };
+            if (r.max_key_records == 0) {
+                err_msg.* = "-r must be at least 1";
+                return error.OutOfRange;
+            }
         } else if (a.len > 0 and a[0] == '-') {
-            cli.fatal("unknown option (use -h for help)");
+            err_msg.* = "unknown option (use -h for help)";
+            return error.UnknownOption;
         } else {
             r.file = a;
         }
     }
 
-    if (r.file == null) cli.fatal("a message file is required (use -h for help)");
-    if (r.domain == null) cli.fatal("-d <domain> is required");
-    if (r.selector == null) cli.fatal("-s <selector> is required");
-    if (r.key_file == null) cli.fatal("-k <keyfile> is required");
+    // Help wins over the required-argument checks, as it always has.
+    if (r.help) return r;
+    if (r.file == null) {
+        err_msg.* = "a message file is required (use -h for help)";
+        return error.MissingFile;
+    }
+    if (r.domain == null) {
+        err_msg.* = "-d <domain> is required";
+        return error.MissingRequired;
+    }
+    if (r.selector == null) {
+        err_msg.* = "-s <selector> is required";
+        return error.MissingRequired;
+    }
+    if (r.key_file == null) {
+        err_msg.* = "-k <keyfile> is required";
+        return error.MissingRequired;
+    }
     return r;
 }
 
@@ -218,7 +289,17 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = parseArgs();
+    const argv = try process.argsAlloc(allocator);
+    defer process.argsFree(allocator, argv);
+
+    var err_msg: ?[]const u8 = null;
+    const args = parseArgs(argv[1..], &err_msg) catch {
+        cli.fatal(err_msg orelse "invalid arguments");
+    };
+    if (args.help) {
+        cli.out(Usage);
+        return;
+    }
 
     const raw = std.fs.cwd().readFileAlloc(allocator, args.file.?, MAX_MESSAGE_BYTES) catch
         cli.fatal("cannot read the message file");
@@ -337,4 +418,77 @@ pub fn main() !void {
     cli.out("ARC-Message-Signature: ");
     cli.out(set.ams);
     cli.out("\n");
+}
+
+// --- parseArgs tests (A-22) --------------------------------------------------
+
+fn expectParseError(
+    expected: ParseError,
+    expected_msg: []const u8,
+    argv: []const []const u8,
+) !void {
+    var msg: ?[]const u8 = null;
+    try std.testing.expectError(expected, parseArgs(argv, &msg));
+    try std.testing.expectEqualStrings(expected_msg, msg.?);
+}
+
+test "parseArgs: minimal valid invocation and defaults" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{ "-d", "example.com", "-s", "arc2026", "-k", "k.pem", "m.eml" }, &msg);
+    try std.testing.expectEqualStrings("m.eml", a.file.?);
+    try std.testing.expectEqualStrings("example.com", a.domain.?);
+    try std.testing.expectEqualStrings("arc2026", a.selector.?);
+    try std.testing.expectEqualStrings("k.pem", a.key_file.?);
+    try std.testing.expectEqualStrings("securearc.test", a.authserv_id);
+    try std.testing.expectEqualStrings("from:to:subject:date:message-id", a.signed_headers);
+    try std.testing.expect(a.methods_raw == null);
+    try std.testing.expect(a.timestamp == null);
+    try std.testing.expectEqual(@as(u16, 53), a.port);
+    try std.testing.expectEqual(chain.DEFAULT_MAX_KEY_RECORDS, a.max_key_records);
+}
+
+test "parseArgs: every option maps to its field" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{ "-d", "d.test", "-s", "sel", "-k", "k", "-a", "auth.test", "--headers", "from:to", "--methods", "spf,dkim", "-t", "1700000000", "-n", "10.0.0.9", "-p", "5353", "-b", "2048", "-r", "7", "m.eml" }, &msg);
+    try std.testing.expectEqualStrings("auth.test", a.authserv_id);
+    try std.testing.expectEqualStrings("from:to", a.signed_headers);
+    try std.testing.expectEqualStrings("spf,dkim", a.methods_raw.?);
+    try std.testing.expectEqual(@as(u64, 1700000000), a.timestamp.?);
+    try std.testing.expectEqualStrings("10.0.0.9", a.nameserver);
+    try std.testing.expectEqual(@as(u16, 5353), a.port);
+    try std.testing.expectEqual(@as(u32, 2048), a.min_key_bits);
+    try std.testing.expectEqual(@as(u8, 7), a.max_key_records);
+}
+
+test "parseArgs: -b reconciles with the RFC 8301 floor" {
+    // The sealer's version of the rule is the one that matters most: it SIGNS
+    // the verdict, so a flag that went below the floor would seal a verdict
+    // the shipped daemon cannot reach.
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{ "-d", "d", "-s", "s", "-k", "k", "-b", "512", "m.eml" }, &msg);
+    try std.testing.expectEqual(@as(u32, crypto.RFC8301_MIN_RSA_BITS), a.min_key_bits);
+}
+
+test "parseArgs: -h short-circuits, required checks included" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{"-h"}, &msg);
+    try std.testing.expect(a.help);
+}
+
+test "parseArgs: required arguments are enforced in order" {
+    try expectParseError(error.MissingFile, "a message file is required (use -h for help)", &.{});
+    try expectParseError(error.MissingRequired, "-d <domain> is required", &.{"m.eml"});
+    try expectParseError(error.MissingRequired, "-s <selector> is required", &.{ "-d", "d", "m.eml" });
+    try expectParseError(error.MissingRequired, "-k <keyfile> is required", &.{ "-d", "d", "-s", "s", "m.eml" });
+}
+
+test "parseArgs: missing values, bad numbers, unknown options" {
+    try expectParseError(error.MissingValue, "-d needs a value", &.{"-d"});
+    try expectParseError(error.MissingValue, "--headers needs a value", &.{"--headers"});
+    try expectParseError(error.InvalidNumber, "-t must be a number", &.{ "-t", "now", "m.eml" });
+    try expectParseError(error.InvalidNumber, "-p must be a port number", &.{ "-p", "x", "m.eml" });
+    try expectParseError(error.InvalidNumber, "-b must be a number", &.{ "-b", "x", "m.eml" });
+    try expectParseError(error.InvalidNumber, "-r must be a number", &.{ "-r", "x", "m.eml" });
+    try expectParseError(error.OutOfRange, "-r must be at least 1", &.{ "-r", "0", "m.eml" });
+    try expectParseError(error.UnknownOption, "unknown option (use -h for help)", &.{"--seal-everything"});
 }

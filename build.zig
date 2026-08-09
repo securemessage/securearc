@@ -109,6 +109,17 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_tests.step);
 
+    // The CLI roots carry their own tests (parseArgs, A-22). main.zig never
+    // imports them, so without these the tests existed but were never even
+    // COMPILED -- the most misleading green there is.
+    const check_tests = b.addTest(.{ .root_module = check_mod });
+    const run_check_tests = b.addRunArtifact(check_tests);
+    test_step.dependOn(&run_check_tests.step);
+
+    const seal_cli_tests = b.addTest(.{ .root_module = seal_cli_mod });
+    const run_seal_cli_tests = b.addRunArtifact(seal_cli_tests);
+    test_step.dependOn(&run_seal_cli_tests.step);
+
     // One canonical checker, shared from securemilter-lib rather than copied.
     const lint = b.addSystemCommand(&.{"sh"});
     lint.addFileArg(securemilter_dep.path("tools/check-line-limit.sh"));

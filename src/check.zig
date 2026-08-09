@@ -54,6 +54,119 @@ const Usage =
 /// few kilobytes, and bounded so a stray argument cannot exhaust memory.
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
+pub const Args = struct {
+    path: ?[]const u8 = null,
+    nameserver: []const u8 = "127.0.0.1",
+    // Exposed for the same reason securespf-check exposes it: the conformance
+    // suite serves its own zone on a high port, which cannot bind 53 unprivileged.
+    port: u16 = 53,
+    min_key_bits: u32 = 1024,
+    // Exposed so this tool can reproduce a key-rotation verdict the daemon would
+    // reach (A-24). A -check tool that could not vary this would answer a
+    // different question from the one the operator is asking.
+    max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS,
+    verbose: bool = false,
+    help: bool = false,
+};
+
+pub const ParseError = error{
+    UnknownOption,
+    MissingValue,
+    InvalidNumber,
+    OutOfRange,
+    MissingFile,
+};
+
+/// Fetch the value following a flag, or set the static message and return null.
+/// `flag` is comptime so the message is a folded literal, not an allocation.
+fn valueAt(argv: []const []const u8, i: usize, comptime flag: []const u8, err_msg: *?[]const u8) ?[]const u8 {
+    if (i >= argv.len) {
+        err_msg.* = "missing argument for " ++ flag;
+        return null;
+    }
+    return argv[i];
+}
+
+/// Parse the command line (excluding the program name) into `Args`.
+///
+/// Pure and error-returning BY DESIGN: the first version of this loop lived
+/// inline in `main`, reading `process.args()` and exiting through `cli.fatal`,
+/// which A-22 filed as untestable by construction -- a CLI whose flag handling
+/// cannot be exercised in a test is a CLI whose regressions are found by the
+/// conformance suite or by nobody. On failure `err_msg` receives a static
+/// description of which flag failed and why; `main` maps that to the exit.
+pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Args {
+    err_msg.* = null;
+    var r = Args{};
+
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
+            // The pre-refactor loop printed usage and returned AT this point,
+            // so anything after -h was never examined. Returning here keeps
+            // that exact shape.
+            r.help = true;
+            return r;
+        } else if (mem.eql(u8, a, "-f")) {
+            i += 1;
+            r.path = valueAt(argv, i, "-f", err_msg) orelse return error.MissingValue;
+        } else if (mem.eql(u8, a, "-n")) {
+            i += 1;
+            r.nameserver = valueAt(argv, i, "-n", err_msg) orelse return error.MissingValue;
+        } else if (mem.eql(u8, a, "-p")) {
+            i += 1;
+            const raw = valueAt(argv, i, "-p", err_msg) orelse return error.MissingValue;
+            r.port = std.fmt.parseInt(u16, raw, 10) catch {
+                err_msg.* = "-p must be a port number";
+                return error.InvalidNumber;
+            };
+        } else if (mem.eql(u8, a, "-b")) {
+            i += 1;
+            const raw = valueAt(argv, i, "-b", err_msg) orelse return error.MissingValue;
+            const configured = std.fmt.parseInt(u32, raw, 10) catch {
+                err_msg.* = "-b must be a number";
+                return error.InvalidNumber;
+            };
+            // Reconciled with the RFC 8301 floor, exactly as the daemon does via
+            // settings.zig and as `securedkim-check` already did here (A-22).
+            // Without this, `-b 512` made this tool accept a chain the shipped
+            // `securearc` rejects -- and the only purpose of a -check tool is to
+            // report the verdict the daemon would reach. RFC 8301 3.2 is a MUST
+            // NOT for verifiers, so one command-line flag should not re-admit
+            // signatures the standard says have permanently failed.
+            r.min_key_bits = crypto.resolveMinRsaBits(configured).bits;
+        } else if (mem.eql(u8, a, "-r")) {
+            i += 1;
+            const raw = valueAt(argv, i, "-r", err_msg) orelse return error.MissingValue;
+            r.max_key_records = std.fmt.parseInt(u8, raw, 10) catch {
+                err_msg.* = "-r must be a number";
+                return error.InvalidNumber;
+            };
+            if (r.max_key_records == 0) {
+                err_msg.* = "-r must be at least 1";
+                return error.OutOfRange;
+            }
+        } else if (mem.eql(u8, a, "-v")) {
+            r.verbose = true;
+        } else if (a.len > 0 and a[0] == '-') {
+            err_msg.* = "unknown option (use -h for help)";
+            return error.UnknownOption;
+        } else {
+            r.path = a;
+        }
+    }
+
+    // Help wins over the required-argument check, as it always has: `-h` with no
+    // message file must print usage, not an error.
+    if (r.help) return r;
+    if (r.path == null) {
+        err_msg.* = "a message file is required (use -h for help)";
+        return error.MissingFile;
+    }
+    return r;
+}
+
 /// Convert the shared parser's fields into `arc.Header`, which is what
 /// `parseArcSets` and `validateChain` take. A field-for-field copy, `had_space`
 /// included -- the bit exists so `c=simple` can rebuild the field verbatim, and a
@@ -69,57 +182,24 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = process.args();
-    _ = args.next();
+    const argv = try process.argsAlloc(allocator);
+    defer process.argsFree(allocator, argv);
 
-    var path: ?[]const u8 = null;
-    var nameserver: []const u8 = "127.0.0.1";
-    // Exposed for the same reason securespf-check exposes it: the conformance
-    // suite serves its own zone on a high port, which cannot bind 53 unprivileged.
-    var port: u16 = 53;
-    var min_key_bits: u32 = 1024;
-    // Exposed so this tool can reproduce a key-rotation verdict the daemon would
-    // reach (A-24). A -check tool that could not vary this would answer a
-    // different question from the one the operator is asking.
-    var max_key_records: u8 = chain.DEFAULT_MAX_KEY_RECORDS;
-    var verbose = false;
-
-    while (args.next()) |a| {
-        if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            cli.out(Usage);
-            return;
-        } else if (mem.eql(u8, a, "-f")) {
-            path = args.next() orelse return cli.fatal("missing argument for -f");
-        } else if (mem.eql(u8, a, "-n")) {
-            nameserver = args.next() orelse return cli.fatal("missing argument for -n");
-        } else if (mem.eql(u8, a, "-p")) {
-            const raw = args.next() orelse return cli.fatal("missing argument for -p");
-            port = std.fmt.parseInt(u16, raw, 10) catch return cli.fatal("-p must be a port number");
-        } else if (mem.eql(u8, a, "-b")) {
-            const raw = args.next() orelse return cli.fatal("missing argument for -b");
-            const configured = std.fmt.parseInt(u32, raw, 10) catch return cli.fatal("-b must be a number");
-            // Reconciled with the RFC 8301 floor, exactly as the daemon does via
-            // settings.zig and as `securedkim-check` already did here (A-22).
-            // Without this, `-b 512` made this tool accept a chain the shipped
-            // `securearc` rejects -- and the only purpose of a -check tool is to
-            // report the verdict the daemon would reach. RFC 8301 3.2 is a MUST
-            // NOT for verifiers, so one command-line flag should not re-admit
-            // signatures the standard says have permanently failed.
-            min_key_bits = crypto.resolveMinRsaBits(configured).bits;
-        } else if (mem.eql(u8, a, "-r")) {
-            const raw = args.next() orelse return cli.fatal("missing argument for -r");
-            max_key_records = std.fmt.parseInt(u8, raw, 10) catch return cli.fatal("-r must be a number");
-            if (max_key_records == 0) return cli.fatal("-r must be at least 1");
-        } else if (mem.eql(u8, a, "-v")) {
-            verbose = true;
-        } else if (a.len > 0 and a[0] == '-') {
-            return cli.fatal("unknown option (use -h for help)");
-        } else {
-            path = a;
-        }
+    var err_msg: ?[]const u8 = null;
+    const opts = parseArgs(argv[1..], &err_msg) catch {
+        cli.fatal(err_msg orelse "invalid arguments");
+    };
+    if (opts.help) {
+        cli.out(Usage);
+        return;
     }
 
-    const msg_path = path orelse return cli.fatal("a message file is required (use -h for help)");
+    const msg_path = opts.path.?;
+    const nameserver = opts.nameserver;
+    const port = opts.port;
+    const min_key_bits = opts.min_key_bits;
+    const max_key_records = opts.max_key_records;
+    const verbose = opts.verbose;
 
     const raw = std.fs.cwd().readFileAlloc(allocator, msg_path, MAX_MESSAGE_BYTES) catch |err| {
         cli.err("securearc-check: cannot read ");
@@ -210,4 +290,77 @@ fn chainToString(v: arc.ChainValidation) []const u8 {
         .fail => "fail",
         .unknown => "unknown",
     };
+}
+
+// --- parseArgs tests (A-22) --------------------------------------------------
+
+fn expectParseError(
+    expected: ParseError,
+    expected_msg: []const u8,
+    argv: []const []const u8,
+) !void {
+    var msg: ?[]const u8 = null;
+    try std.testing.expectError(expected, parseArgs(argv, &msg));
+    try std.testing.expectEqualStrings(expected_msg, msg.?);
+}
+
+test "parseArgs: defaults and a positional message file" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{"msg.eml"}, &msg);
+    try std.testing.expectEqualStrings("msg.eml", a.path.?);
+    try std.testing.expectEqualStrings("127.0.0.1", a.nameserver);
+    try std.testing.expectEqual(@as(u16, 53), a.port);
+    try std.testing.expectEqual(@as(u32, 1024), a.min_key_bits);
+    try std.testing.expectEqual(chain.DEFAULT_MAX_KEY_RECORDS, a.max_key_records);
+    try std.testing.expect(!a.verbose);
+    try std.testing.expect(!a.help);
+}
+
+test "parseArgs: every flag maps to its field" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{ "-f", "a.eml", "-n", "10.0.0.9", "-p", "5353", "-b", "2048", "-r", "5", "-v" }, &msg);
+    try std.testing.expectEqualStrings("a.eml", a.path.?);
+    try std.testing.expectEqualStrings("10.0.0.9", a.nameserver);
+    try std.testing.expectEqual(@as(u16, 5353), a.port);
+    try std.testing.expectEqual(@as(u32, 2048), a.min_key_bits);
+    try std.testing.expectEqual(@as(u8, 5), a.max_key_records);
+    try std.testing.expect(a.verbose);
+}
+
+test "parseArgs: -b reconciles with the RFC 8301 floor instead of trusting the operator" {
+    // A-22/A-23's rule: a -check tool must answer the question the DAEMON
+    // answers, and the daemon cannot go below the floor.
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{ "-b", "512", "m.eml" }, &msg);
+    try std.testing.expectEqual(@as(u32, crypto.RFC8301_MIN_RSA_BITS), a.min_key_bits);
+}
+
+test "parseArgs: -h needs no message file" {
+    var msg: ?[]const u8 = null;
+    const a = try parseArgs(&.{"-h"}, &msg);
+    try std.testing.expect(a.help);
+    try std.testing.expect(a.path == null);
+}
+
+test "parseArgs: missing message file is an error with its message" {
+    try expectParseError(error.MissingFile, "a message file is required (use -h for help)", &.{});
+}
+
+test "parseArgs: missing flag values name the flag" {
+    try expectParseError(error.MissingValue, "missing argument for -f", &.{"-f"});
+    try expectParseError(error.MissingValue, "missing argument for -n", &.{"-n"});
+    try expectParseError(error.MissingValue, "missing argument for -p", &.{"-p"});
+    try expectParseError(error.MissingValue, "missing argument for -b", &.{"-b"});
+    try expectParseError(error.MissingValue, "missing argument for -r", &.{"-r"});
+}
+
+test "parseArgs: bad numbers and ranges" {
+    try expectParseError(error.InvalidNumber, "-p must be a port number", &.{ "-p", "fifty-three", "m.eml" });
+    try expectParseError(error.InvalidNumber, "-b must be a number", &.{ "-b", "big", "m.eml" });
+    try expectParseError(error.InvalidNumber, "-r must be a number", &.{ "-r", "x", "m.eml" });
+    try expectParseError(error.OutOfRange, "-r must be at least 1", &.{ "-r", "0", "m.eml" });
+}
+
+test "parseArgs: unknown options are rejected" {
+    try expectParseError(error.UnknownOption, "unknown option (use -h for help)", &.{"--frobnicate"});
 }
