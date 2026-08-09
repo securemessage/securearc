@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout securearc
+        uses: actions/checkout@v4
+        with:
+          path: securearc
+
+      - name: Checkout securemilter-lib (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/securemilter-lib
+          path: securemilter-lib
+
+      - name: Checkout securemilter-crypto (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/securemilter-crypto
+          path: securemilter-crypto
+
+      - name: Checkout rfc-suites (conformance framework, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/rfc-suites
+          path: rfc-suites
+          ref: v0.1.0
+          token: ${{ secrets.FORGE_TOKEN }}
+
+      - name: PHP ext-yaml
+        run: php -m | grep -qi '^yaml$' || doas pkg install -y php84-pecl-yaml
+
+      - name: Build
+        run: cd securearc && zig build
+
+      - name: Unit tests
+        run: cd securearc && zig build test
+
+      - name: RFC 8617 conformance (ARC, runtime-key seal/validate)
+        run: |
+          cd securearc && \
+            SECUREARC_SEAL=zig-out/bin/securearc-seal \
+            php ../rfc-suites/suites/rfc8617-arc/run.php \
+              --adapter test/adapter-securearc.yaml \
+              --bin zig-out/bin/securearc-check

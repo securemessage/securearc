@@ -1,0 +1,9 @@
+# Adapter: SecureMilter securearc (validator direction)
+# {bin} is zig-out/bin/securearc-check. The sealer (securearc-seal) is reached
+# by the suite driver via SECUREARC_SEAL — the seal step is suite-internal
+# glue, not the contract under test.
+name: securearc
+suite: rfc8617-arc
+argv: ["{bin}", "-n", "{dns_addr}", "-p", "{dns_port}", "{msg_file}"]
+verdict:
+  kind: first_token
