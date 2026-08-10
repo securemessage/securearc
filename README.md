@@ -147,6 +147,24 @@ securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
 
 > **Note**: Use `securedkim-genkey` to generate ARC keys — ARC uses the same `selector._domainkey.domain` DNS format as DKIM.
 
+### securearc-check
+
+Validate the ARC chain of a message file, calling the same chain-validation code path the daemon uses:
+
+```sh
+securearc-check message.eml
+securearc-check -n 127.0.0.1 -p 5353 -v message.eml
+```
+
+### securearc-seal
+
+Seal a message file, calling the same ARC-set construction the daemon uses; prints the new `ARC-Authentication-Results`, `ARC-Seal`, and `ARC-Message-Signature` fields:
+
+```sh
+securearc-seal -d example.com -s arc2026 -k /usr/local/etc/securearc/arc.key \
+    --methods spf,dkim,dmarc message.eml
+```
+
 ## Signals
 
 - **SIGHUP** — Reload configuration. The reloadable settings are adopted as one unit, so a message is always handled entirely under a single configuration. Covers the seal key, `AuthservID`, `SealDomain`, `SealSelector`, `SignedHeaders`, `LocalAuthMethods`, `StripAuthResults`, `MinimumKeyBits`, `On-DNSError` and the resolver settings. A failed reload leaves the previous configuration in place and logs why.
