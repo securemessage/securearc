@@ -1,8 +1,17 @@
 [global]
 AuthservID      = mail.example.com
 WorkerThreads   = 0
+
+# Maximum simultaneous connections accepted by each worker thread.
+# Default: 256.
+# MaxConnections = 256
+
 Syslog          = yes
 SyslogFacility  = mail
+
+# Logging verbosity: err, warn, info, debug.
+# LogLevel      = info
+
 PidFile         = /var/run/securearc/securearc.pid
 
 # Drop privileges to this user, as "user" or "user:group".
@@ -32,6 +41,13 @@ Foreground      = no
 DnsNameserver   = 127.0.0.1
 DnsTimeout      = 5
 DnsRetries      = 2
+
+# Maximum entries in the per-worker DNS cache, and the TTL in seconds applied
+# to negative answers (NXDOMAIN, SERVFAIL) so a lookup that just failed is not
+# retried on every message.
+# DnsCacheSize    = 1000
+# DnsNegativeTTL  = 60
+
 ZmqEndpoint     = tcp://events.internal:5555
 ZmqTopic        = arc
 
