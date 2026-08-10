@@ -1,0 +1,156 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREARC-SEAL 8
+.Os
+.Sh NAME
+.Nm securearc-seal
+.Nd command-line ARC sealing tool
+.Sh SYNOPSIS
+.Nm
+.Fl d Ar domain
+.Fl s Ar selector
+.Fl k Ar keyfile
+.Op Fl a Ar authserv-id
+.Op Fl -headers Ar list
+.Op Fl -methods Ar list
+.Op Fl t Ar timestamp
+.Op Fl n Ar nameserver
+.Op Fl p Ar port
+.Op Fl b Ar bits
+.Op Fl r Ar count
+.Op Fl m Ar ms
+.Ar message-file
+.Sh DESCRIPTION
+.Nm
+seals an RFC 5322 message file using the same ARC-set construction
+.Xr securearc 8
+uses, and prints the three new header fields to standard output, separated
+by blank lines:
+.Bd -literal -offset indent
+ARC-Authentication-Results: ...
+
+ARC-Seal: ...
+
+ARC-Message-Signature: ...
+.Ed
+.Pp
+The chain already on the message is validated first, using the same
+.Fn validateChain
+the daemon calls, because the
+.Cm cv=
+this host seals is a statement about that existing chain.
+An existing chain that fails to parse is treated as
+.Cm cv=fail
+(RFC 8617 \[sc]5.1.2), and a chain already marked
+.Cm cv=fail
+is not extended at all (RFC 8617 \[sc]5.1.3): in that case
+.Nm
+exits 0 and prints nothing.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl d Ar domain
+Signing domain
+.Pq Cm d=
+for the new ARC set.
+Required.
+.It Fl s Ar selector
+Selector
+.Pq Cm s=
+for the new ARC set.
+Required.
+.It Fl k Ar keyfile
+RSA private key file, PEM format.
+Required.
+Held to the RFC 8301 1024-bit floor and refused if its permissions are
+readable beyond its owner, exactly as
+.Cm SealKeyFile
+is in
+.Xr securearc 8 .
+.It Fl a Ar authserv-id
+authserv-id for the ARC-Authentication-Results header, and the id whose
+Authentication-Results this host vouches for.
+Default:
+.Dq securearc.test .
+.It Fl -headers Ar list
+Colon-separated
+.Cm h=
+list for the ARC-Message-Signature.
+Default:
+.Dq from:to:subject:date:message-id .
+.It Fl -methods Ar list
+Comma-separated local authentication methods this host performs.
+Only Authentication-Results whose methods are all listed are sealed into the
+ARC-Authentication-Results header; anything else is sender-supplied and
+yields an honest
+.Dq none
+(RFC 8617 \[sc]5.1.1).
+Default: empty, meaning nothing is sealed.
+.It Fl t Ar timestamp
+Signature timestamp for
+.Cm t= .
+Default: the current time.
+Fix this to make output byte-reproducible across runs.
+.It Fl n Ar nameserver
+DNS nameserver used to validate the existing chain.
+Default:
+.Dq 127.0.0.1 .
+.It Fl p Ar port
+DNS nameserver port.
+Default: 53.
+.It Fl b Ar bits
+Minimum RSA key bits accepted while validating the existing chain.
+Default: 1024.
+Reconciled with the RFC 8301 floor; applies only to keys published by other
+ADMDs in the chain being validated, not to the signing key given with
+.Fl k ,
+which is always held to the floor regardless.
+.It Fl r Ar count
+Key records to try at one selector while validating the existing chain.
+Default: 3.
+Values above 8 are clamped to 8.
+.It Fl m Ar ms
+Wall-clock budget for validating the existing chain, in milliseconds.
+Default: 20000, matching the daemon's
+.Cm MaxEvaluationMs .
+0 disables the limit.
+.It Fl h , Fl -help
+Display usage information.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+A new ARC set was produced and printed, or the existing chain was already
+.Cm cv=fail
+and nothing was sealed (RFC 8617 \[sc]5.1.3).
+.It 1
+The existing chain validated, but the new ARC set could not be built.
+.It 2
+The tool could not run: bad arguments, an unreadable or unparsable message
+file, a key that could not be loaded, a transient DNS failure or evaluation
+deadline while validating the existing chain, or the chain is already at the
+maximum of 50 instances.
+.El
+.Sh EXAMPLES
+Seal a message using local resolution:
+.Bd -literal -offset indent
+securearc-seal -d example.com -s arc2026 -k /usr/local/etc/securearc/arc.key \e
+    --methods spf,dkim,dmarc message.eml
+.Ed
+.Pp
+Produce byte-reproducible output for a conformance suite:
+.Bd -literal -offset indent
+securearc-seal -d example.com -s arc2026 -k arc.key -t 1700000000 \e
+    -n 127.0.0.1 -p 5353 message.eml
+.Ed
+.Sh SEE ALSO
+.Xr securearc 8 ,
+.Xr securearc-check 8 ,
+.Xr securearc-testkey 8
+.Sh STANDARDS
+.Rs
+.%T Authenticated Received Chain (ARC) Protocol
+.%R RFC 8617
+.Re
+.Sh AUTHORS
+.An Daniel Morante

@@ -1,0 +1,125 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREARC-CHECK 8
+.Os
+.Sh NAME
+.Nm securearc-check
+.Nd command-line ARC chain validation tool
+.Sh SYNOPSIS
+.Nm
+.Op Fl f Ar message-file
+.Op Fl n Ar nameserver
+.Op Fl p Ar port
+.Op Fl b Ar bits
+.Op Fl r Ar count
+.Op Fl m Ar ms
+.Op Fl v
+.Ar message-file
+.Sh DESCRIPTION
+.Nm
+validates the Authenticated Received Chain (ARC) of an RFC 5322 message file
+and prints the chain validation value
+.Pq Dq none , Dq pass , or Dq fail
+to standard output.
+It calls the same
+.Fn parseArcSets
+and
+.Fn validateChain
+functions
+.Xr securearc 8
+uses, in the same order and with the same treatment of a chain that fails to
+parse, so a result from
+.Nm
+is a statement about the shipped verifier rather than about a separate
+implementation written to pass tests.
+.Pp
+This exists so ARC chain validation can be driven by an external conformance
+suite the way
+.Xr securedkim-check 8
+lets the RFC 6376 suite drive DKIM verification.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl f Ar message-file
+Message file to validate.
+May also be given positionally.
+Required.
+.It Fl n Ar nameserver
+DNS nameserver IP address.
+Default:
+.Dq 127.0.0.1 .
+.It Fl p Ar port
+DNS nameserver port.
+Default: 53.
+Exposed because a conformance suite typically serves its own zone on a high
+port, which cannot bind to port 53 unprivileged.
+.It Fl b Ar bits
+Minimum RSA key bits accepted on an ARC-Message-Signature or ARC-Seal.
+Default: 1024.
+Reconciled with the RFC 8301 \[sc]3.2 floor exactly as
+.Xr securearc 8
+does: a value below 1024 is silently raised, so this flag cannot make
+.Nm
+accept a chain the shipped daemon would reject.
+.It Fl r Ar count
+Key records to try at one selector before giving up.
+Default: 3.
+Values above 8 are clamped to 8.
+.It Fl m Ar ms
+Wall-clock budget for the whole validation, in milliseconds.
+Default: 20000, matching the daemon's
+.Cm MaxEvaluationMs .
+0 disables the limit.
+.It Fl v
+Verbose: also print the failure reason and the highest ARC instance examined.
+.It Fl h
+Display usage information.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+A verdict was reached and printed to standard output, including
+.Dq fail .
+.It 2
+The tool could not run: the message file could not be read or parsed, or
+memory was exhausted.
+.El
+.Sh OUTPUT
+The chain validation value is printed alone on a line:
+.Dq none
+(no ARC sets present),
+.Dq pass ,
+.Dq fail ,
+or
+.Dq temperror
+(a transient DNS failure or the
+.Fl m
+deadline was exceeded while validating).
+With
+.Fl v ,
+a
+.Dq reason=
+field naming the failure and an
+.Dq i=
+field giving the highest ARC instance examined follow on the same line.
+.Sh EXAMPLES
+Validate a message using the default resolver:
+.Bd -literal -offset indent
+securearc-check message.eml
+.Ed
+.Pp
+Validate against a conformance suite's own zone, with the failure reason:
+.Bd -literal -offset indent
+securearc-check -n 127.0.0.1 -p 5353 -v message.eml
+.Ed
+.Sh SEE ALSO
+.Xr securearc 8 ,
+.Xr securearc-seal 8 ,
+.Xr securearc-testkey 8
+.Sh STANDARDS
+.Rs
+.%T Authenticated Received Chain (ARC) Protocol
+.%R RFC 8617
+.Re
+.Sh AUTHORS
+.An Daniel Morante
