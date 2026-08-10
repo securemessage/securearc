@@ -1,7 +1,6 @@
-//! `securearc-seal` seals a message file through the daemon's ARC-set builder.
+//! `securearc-seal` seals a message file using the daemon's ARC-set construction.
 //!
-//! It uses `sealbuild.buildSet`, `Connection`, and the same chain-state rules as
-//! the milter flow. Message parsing is shared with `securearc-check`.
+//! It shares chain-state rules and message parsing with the milter tools.
 
 const std = @import("std");
 const mem = std.mem;

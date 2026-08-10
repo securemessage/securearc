@@ -119,7 +119,7 @@ pub fn chainAlreadyBroken(sets: []const ArcSet) bool {
     return false;
 }
 
-/// Human-readable reason for an A-R header.
+/// Human-readable ChainError reason suitable for A-R header text.
 pub fn describeChainError(err: anyerror) []const u8 {
     return switch (err) {
         error.ChainGap => "broken ARC chain: missing instance",

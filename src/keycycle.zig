@@ -163,8 +163,7 @@ test "tryKeys cycles past a decoy record to the one that verifies (A-24)" {
     const good_txt = try std.fmt.allocPrint(allocator, "v=DKIM1; k=rsa; p={s}", .{good_p});
     defer allocator.free(good_txt);
 
-    // The decoy is listed first (before A-24):
-    // committed to whichever record DNS returned first and never looked further.
+    // A decoy first verifies that iteration reaches the later valid record.
     var answers = [_]dns_mod.packet.Answer{ txtAnswer(JUNK_TXT), txtAnswer(good_txt) };
     var result = dns_mod.resolver.Result{ .answers = &answers, .allocator = allocator };
 
@@ -179,10 +178,8 @@ test "tryKeys cycles past a decoy record to the one that verifies (A-24)" {
         &reason,
     ));
 
-    // Teeth, and the reason this test is worth having: capped at a single record
-    // the decoy is all that is seen and the verdict flips. So the pass above was
-    // genuinely carried by the second record rather than by the first happening to
-    // work -- and the cap is proven honoured rather than merely declared.
+    // With a one-record cap the decoy alone is seen and the verdict flips,
+    // proving the earlier pass depended on the second record.
     var capped_reason: ?[]const u8 = null;
     try std.testing.expectEqual(CheckOutcome.fail, tryKeys(
         allocator,

@@ -99,16 +99,10 @@ fn appendCanonHdr(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), name: 
     try buf.appendSlice(allocator, "\r\n");
 }
 
-/// Assemble the ARC-Authentication-Results content from results this ADMD
-/// actually produced (RFC 8617 §5.1.1).
+/// Build ARC-Authentication-Results from this ADMD's results (RFC 8617 §5.1.1).
 ///
-/// An A-R header qualifies only if it claims our authserv-id *and* every
-/// method it asserts is listed in `LocalAuthMethods`. Anything else is a
-/// sender-supplied claim: copying it here would have this host cryptographically
-/// vouch for authentication it never performed. A host that lists no local
-/// methods therefore seals an honest `none`.
-///
-/// Caller owns the returned slice. Returns null only on allocation failure.
+/// A header must claim this authserv-id and assert only local methods; otherwise
+/// sealing it would vouch for sender-supplied results. The caller owns the slice.
 pub fn buildAarContent(
     conn: *connection_mod.Connection,
     authserv_id: []const u8,

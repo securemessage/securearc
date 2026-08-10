@@ -43,8 +43,7 @@ const buildSealInput = sealbuild.buildSealInput;
 const buildAarContent = sealbuild.buildAarContent;
 const foldBase64 = sealbuild.foldBase64;
 
-/// Everything handling one message needs, regardless of whether we go on to seal it:
-/// how to reach DNS, the smallest key to accept, who we stamp as, and where events go.
+/// Context shared by the verify and seal paths.
 ///
 /// Named `MsgCtx` rather than the `ChainCtx` it started as. It began as exactly the
 /// three values `doVerify` and `doSeal` both used to build a resolver and validate
