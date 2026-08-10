@@ -66,15 +66,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(check_exe);
 
-    // securearc-seal: seal a message file with the daemon's own sealing path.
-    //
-    // The counterpart to securearc-check, and it closes the last untested signing
-    // path in this repository -- nothing had ever examined a seal securearc
-    // produced. The cost of leaving that open was measured on securedkim the same
-    // day: D-18 broke Ed25519 signing and verification symmetrically, so they
-    // round-tripped perfectly while every emitted signature was rejected by the
-    // rest of the internet, and reverting only the signing half is invisible to
-    // every test that does not hand the output to an outside verifier.
+    // securearc-seal exercises the daemon's sealing path against external
+    // verifiers, not only the implementation's own validation.
     const seal_cli_mod = b.createModule(.{
         .root_source_file = b.path("src/seal_cli.zig"),
         .target = target,
@@ -109,9 +102,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_tests.step);
 
-    // The CLI roots carry their own tests (parseArgs, A-22). main.zig never
-    // imports them, so without these the tests existed but were never even
-    // COMPILED -- the most misleading green there is.
+    // CLI roots are test targets because main.zig does not import them.
     const check_tests = b.addTest(.{ .root_module = check_mod });
     const run_check_tests = b.addRunArtifact(check_tests);
     test_step.dependOn(&run_check_tests.step);
