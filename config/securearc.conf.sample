@@ -23,7 +23,7 @@ PidFile         = /var/run/securearc/securearc.pid
 # Name the group the MTA runs in and the socket can be shared with Postfix and
 # nothing else. A sealing socket will seal what it is given, so anything that
 # can connect to it can have mail sealed as your domain.
-User            = _arc
+User            = mailnull
 
 # File-creation mask for the PID file and any unix-domain listener.
 #

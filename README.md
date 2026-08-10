@@ -24,10 +24,9 @@ SecureARC validates ARC chains on inbound mail and seals messages with new ARC s
 # Build
 zig build
 
-# Create user and directories
-pw useradd _arc -d /nonexistent -s /usr/sbin/nologin
+# Create directories (mailnull is the shared FreeBSD milter account other
+# milters already run as -- no dedicated user needed)
 mkdir -p /var/run/securearc /usr/local/etc/securearc
-chown _arc:_arc /var/run/securearc
 
 # Generate ARC key (uses same format as DKIM)
 securedkim-genkey -s arc2026 -d example.com -o /usr/local/etc/securearc/arc.key
@@ -38,13 +37,13 @@ securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
 
 # Set permissions
 chmod 0600 /usr/local/etc/securearc/arc.key
-chown _arc:_arc /usr/local/etc/securearc/arc.key
+chown mailnull:mailnull /usr/local/etc/securearc/arc.key
 
 # Write config
 cat > /usr/local/etc/securearc/securearc.conf << 'EOF'
 [global]
 AuthservID      = mail.example.com
-User            = _arc
+User            = mailnull
 PidFile         = /var/run/securearc/securearc.pid
 DnsNameserver   = 127.0.0.1
 
