@@ -294,6 +294,7 @@ fn runDaemon() !void {
         .worker_threads = arc_cfg.worker_threads,
         .max_connections = arc_cfg.max_connections,
         .num_listeners = @intCast(arc_cfg.listen_addresses.len),
+        .listen_addresses = arc_cfg.listen_addresses,
         .spawn_threads = spawnHealthMonitor,
     });
     defer boot.deinit();
