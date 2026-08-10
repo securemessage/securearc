@@ -63,10 +63,32 @@ Enable this when
 .Nm
 is the first or only milter in the chain (RFC 8601 Section 5).
 Default: no.
+.It Cm Mode
+Default operating mode for any
+.Ql [listener:name]
+section that does not set its own
+.Cm Mode :
+.Dq seal ,
+.Dq verify ,
+or
+.Dq both .
+Falls back to
+.Dq verify
+if neither this nor a per-listener
+.Cm Mode
+is set.
+See
+.Cm Mode
+under
+.Sx Listener Sections
+for the per-listener override.
 .It Cm WorkerThreads
 Number of worker threads.
 0 means auto-detect CPU count.
 Default: 0.
+.It Cm MaxConnections
+Maximum simultaneous connections per worker.
+Default: 256.
 .It Cm PidFile
 Path to the PID file.
 Default:
@@ -352,14 +374,11 @@ Any other value is a configuration error and
 refuses to start.
 .Pp
 Each listener is independent.
-Releases before this one held a single daemon-wide mode that every
-.Ql [listener:...]
-section overwrote in turn, so the last section in the file decided the mode
-for every socket — including the two-listener layout shown in the sample
-configuration, which ran both sockets in seal mode.
 Check the
 .Ql listener[N] mode=...
-lines logged at startup against the intended configuration after upgrading.
+lines logged at startup against the intended configuration, particularly when
+a verify section and a seal section both appear as in the sample
+configuration.
 .It Cm SealDomain
 Domain name for ARC sealing.
 Required for seal mode.
