@@ -240,25 +240,19 @@ pub fn parseArcSets(allocator: Allocator, headers: []const Header) ![]ArcSet {
 ///     arc-as-info  = instance [CFWS] ";" tag-list
 ///
 /// So `i=` is not a member of the tag list at all, and the grammar requires it
-/// first. The previous implementation approximated that with
-/// `startsWith("i=")`, which is not the same thing in either direction:
+/// first. A naive `startsWith("i=")` test is too strict, since `[CFWS]` is
+/// permitted in three places and CFWS includes parenthesised comments, and too
+/// lenient once it falls through to a bare scan for `i=` anywhere in the field.
 ///
-///   * **Too strict.** `[CFWS]` is permitted in three places, and CFWS includes
-///     parenthesised comments. A conformant `(set 1) i = 1 ; cv=none` failed the
-///     prefix test, and the by-name fallback then read the tag name as
-///     `(set 1) i`, so the whole set was rejected as malformed. We were refusing
-///     mail the RFC allows.
-///   * **Too lenient.** Anything the prefix test missed fell through to a scan
-///     for `i=` anywhere in the field.
-///
-/// This parses the production properly and *keeps* the fallback. The fallback is
-/// a deliberate interop concession, not an oversight: OpenARC never checks the
-/// position at all -- `arc_parse_header_field` does only RFC 5322 field-level
-/// syntax and the value is fetched by name with `arc_param_get(set, "i")` --
-/// so enforcing the grammar would make us reject chains the reference
-/// implementation accepts, on an Experimental protocol, for no security gain.
-/// The instance is range-checked by the caller either way, and duplicate tags
-/// are already refused (A-16, A-17), so a late `i=` is not more forgeable.
+/// This parses the production properly and *keeps* a by-name fallback for
+/// anything that does not match. The fallback is a deliberate interop
+/// concession, not an oversight: OpenARC never checks the position at all --
+/// `arc_parse_header_field` does only RFC 5322 field-level syntax and the value
+/// is fetched by name with `arc_param_get(set, "i")` -- so enforcing the grammar
+/// would make us reject chains the reference implementation accepts, on an
+/// Experimental protocol, for no security gain. The instance is range-checked by
+/// the caller either way, and duplicate tags are already refused (A-16, A-17),
+/// so a late `i=` is not more forgeable.
 ///
 /// Note `%s"i"`: RFC 7405 makes that a case-*sensitive* match, so `I=1` is not an
 /// instance tag. `findTag` is case-sensitive too, since A-17.
@@ -332,27 +326,18 @@ fn stripFws(value: []const u8) []const u8 {
     }
     if (!has_ws) return value;
 
-    // Slow path: return a trimmed view by finding last non-WS byte
-    // Since internal WS in base64/h= tokens is only from folding (and findTag
-    // already trims leading/trailing), the WS should only appear at fold points.
-    // For a zero-alloc approach, just trim from edges — the base64 decoder and
-    // header-list parser will skip internal WS if present.
-    // Actually: we can't strip INTERNAL whitespace without allocating.
-    // Return the trimmed value — callers must handle internal FWS.
+    // Internal WS in a base64/h= token comes only from folding, so trimming the
+    // edges is enough without allocating; callers (the base64 decoder and the
+    // header-list parser) skip any internal FWS that remains.
     return mem.trim(u8, value, &(.{ ' ', '\t', '\r', '\n' }));
 }
 
 /// Find a tag value by name in a semicolon-separated tag-list.
 ///
-/// The tag scanner lives in `securemilter_crypto.sig_header` because a
-/// DKIM signature, an ARC set and a DNS key record are all the same RFC 6376
-/// §3.2 tag list, and this file is not where DKIM can reach.
-///
-/// An alias rather than a second body: the copy that used to be here was
-/// character-identical to the one in `sig_header`, and `securedkim-testkey` and
-/// `securearc-testkey` each carried a third and a fourth (refactor plan stage
-/// 5.1). Kept exported under this name because `chain.zig` reads `p=` out of a
-/// key record through it.
+/// An alias, not a second body: the tag scanner lives in
+/// `securemilter_crypto.sig_header` because a DKIM signature, an ARC set and a
+/// DNS key record are all the same RFC 6376 §3.2 tag list. Kept exported under
+/// this name because `chain.zig` reads `p=` out of a key record through it.
 pub const findTag = sig_header.findTag;
 
 /// Header name/value pair (matches Connection.headers format).
@@ -399,10 +384,8 @@ test "parseInstance basic" {
 
 test "A-11: CFWS is allowed everywhere the instance production allows it" {
     // `instance = [CFWS] %s\"i\" [CFWS] \"=\" [CFWS] position`. Each of these is a
-    // conformant ARC header field, and every one of them was REJECTED before:
-    // the old prefix test needed a literal `i=`, and the by-name fallback then
-    // read the tag name as `(set 1) i` and gave up. We were refusing chains the
-    // RFC permits, which is the opposite of what A-11 describes.
+    // conformant ARC header field and must parse; a literal `i=` prefix test
+    // would miss them all and refuse chains the RFC permits (audit A-11).
     try std.testing.expectEqual(@as(?u8, 1), parseInstance("(set 1) i=1; cv=none"));
     try std.testing.expectEqual(@as(?u8, 1), parseInstance("i = 1 ; cv=none"));
     try std.testing.expectEqual(@as(?u8, 2), parseInstance("i (why not) = 2; cv=pass"));
@@ -575,9 +558,9 @@ test "findTag matches tag names case sensitively (RFC 6376 3.2)" {
     try std.testing.expect(findTag(mis_cased, "s") == null);
     try std.testing.expectEqualStrings("dummy", findTag(mis_cased, "S").?);
 
-    // While this matched case insensitively, an ARC-Seal carrying `S=` was read
-    // as having a selector and went on to verify against a key it named by
-    // accident. The suite case is `as_format_tags_key_case`.
+    // Matching case-insensitively would let an ARC-Seal carrying `S=` be read as
+    // having a selector and verify against a key it never actually named. The
+    // suite case is `as_format_tags_key_case`.
     const correct = "i=1; cv=none; a=rsa-sha256; d=example.org; s=dummy";
     try std.testing.expectEqualStrings("dummy", findTag(correct, "s").?);
 }

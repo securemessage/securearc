@@ -30,14 +30,10 @@ pub const chain = @import("chain.zig");
 
 /// Listener modes, DNS-failure policy and the config parser.
 ///
-/// Re-exported so an external caller keeps the names it already used, and aliased
-/// below so the several dozen references in this file did not have to be rewritten
-/// to move the code — a mechanical rename across a 1698-line file is exactly the
-/// kind of large diff that hides a real change inside it.
+/// Re-exported so an external caller keeps the names it already used.
 pub const settings = @import("settings.zig");
 
-/// Construction of the ARC set's header bytes. Aliased for the same reason as
-/// `settings` above: the move should not show up as a rename at every call site.
+/// Construction of the ARC set's header bytes.
 pub const sealbuild = @import("sealbuild.zig");
 
 /// The end-of-message flow: validate a chain, and extend it.
@@ -93,9 +89,10 @@ fn spawnHealthMonitor() void {
 }
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
-/// Seal key behind RCU. Both AMS and AS signatures must use the same key; the
-/// previous code held `&g_seal_key.?` across both calls while SIGHUP could
-/// overwrite the struct, causing internal inconsistency and a leak (audit X-2).
+/// Seal key behind RCU. Both AMS and AS signatures must use the same key, so a
+/// pointer held across both calls must not be invalidated by a concurrent SIGHUP
+/// overwriting the struct, which would cause internal inconsistency and a leak
+/// (audit X-2).
 const SealKeyRcu = rcu_mod.Rcu(crypto.SigningKey);
 var g_seal_key: SealKeyRcu = undefined;
 
@@ -538,10 +535,8 @@ fn reloadSealKey(key_path: []const u8) void {
     });
 }
 
-/// Main-thread reload callback: re-read the configuration on SIGHUP.
-///
-/// Said "re-reads seal key" until 2026-07-29, which was the whole of A-10/A-14 -- the
-/// man page promised the configuration and this adopted one value out of it.
+/// Main-thread reload callback: re-read the whole configuration on SIGHUP, not
+/// just the seal key (audit A-10/A-14).
 ///
 /// Every failure path keeps the previous configuration live and still advances the
 /// generation: a half-applied reload is the outcome worth avoiding.
@@ -619,10 +614,7 @@ fn onWorkerReload() void {
 
 // Every module has to be named here, not merely imported above. An unreferenced
 // `@import` is not analyzed, so its tests are silently absent from the run -- and a
-// test that does not run looks exactly like a test that passes. `msgfile` was added
-// with three tests and the total did not move, which is how this was noticed. It is
-// no longer listed because it is no longer here: the message-file parser moved to
-// securemilter-lib in stage 5.2, and its tests run there.
+// test that does not run looks exactly like a test that passes.
 test {
     _ = arc;
     _ = chain;

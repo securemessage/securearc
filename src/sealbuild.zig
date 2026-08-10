@@ -207,8 +207,7 @@ pub const SetParams = struct {
     timestamp: u64,
 };
 
-/// Record which step failed and fail. Keeps each failure site one line, as it was
-/// when these lines called `sealInternalError` directly.
+/// Record which step failed and fail. Keeps each failure site one line.
 fn fail(step: *?[]const u8, what: []const u8) BuildError {
     step.* = what;
     return error.BuildFailed;
@@ -350,7 +349,7 @@ test "results part drops the authserv-id" {
 test "foldBase64 returns owned memory on both the folding and the short path" {
     const a = std.testing.allocator;
 
-    // The short path. This is the one that used to borrow.
+    // The short path: no folding needed, but the result must still be owned.
     const short = "c2hvcnQ=";
     const folded_short = try foldBase64(a, short);
     defer a.free(folded_short);
@@ -363,8 +362,7 @@ test "foldBase64 returns owned memory on both the folding and the short path" {
     defer a.free(folded_limit);
     try std.testing.expectEqualStrings(at_limit, folded_limit);
 
-    // The folding path, at the length an RSA-2048 signature actually reaches, which
-    // is why the leak fired on every message rather than occasionally.
+    // The folding path, at the length an RSA-2048 signature actually reaches.
     const sig_b64 = "A" ** 344;
     const folded_sig = try foldBase64(a, sig_b64);
     defer a.free(folded_sig);

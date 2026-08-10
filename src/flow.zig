@@ -1,16 +1,13 @@
 //! What happens at end-of-message: validate an ARC chain, and extend it.
 //!
-//! Split out of `main.zig`, which had grown to 1063 lines. The seam is ownership of
-//! state: this module decides and constructs, `main.zig` owns the daemon's
-//! configuration and hands down a snapshot of it.
+//! `main.zig` owns the daemon's configuration and global state; this module only
+//! decides and constructs from a snapshot handed down by `main.zig`. Nothing here
+//! reads global state, so the AMS and ARC-Seal verification path, and the AAR trust
+//! rule that governs what this ADMD is willing to vouch for, are reachable from a
+//! test without a running daemon.
 //!
-//! Nothing here reads global state. That is the property that made the move
-//! possible, and it is worth keeping: it means the AMS and ARC-Seal verification
-//! path, and the AAR trust rule that governs what this ADMD is willing to vouch
-//! for, are reachable from a test without a running daemon.
-//!
-//! Context structs defined here, constructed in `main.zig`: avoids import cycle
-//! (this module must not import its parent).
+//! `MsgCtx` and `SealCtx` are defined here but constructed only in `main.zig`, which
+//! avoids an import cycle: this module must not import its parent.
 
 const std = @import("std");
 const posix = std.posix;
@@ -35,22 +32,14 @@ const chain = @import("chain.zig");
 const settings = @import("settings.zig");
 const OnDnsError = settings.OnDnsError;
 
-/// Aliased rather than qualified at each use, so moving this code out of `main.zig`
-/// did not also rewrite every call site inside it.
 const sealbuild = @import("sealbuild.zig");
 const buildSigningHeaders = sealbuild.buildSigningHeaders;
 const buildSealInput = sealbuild.buildSealInput;
 const buildAarContent = sealbuild.buildAarContent;
 const foldBase64 = sealbuild.foldBase64;
 
-/// Context shared by the verify and seal paths.
-///
-/// Named `MsgCtx` rather than the `ChainCtx` it started as. It began as exactly the
-/// three values `doVerify` and `doSeal` both used to build a resolver and validate
-/// against a key-size floor — a real duplication, not an invented grouping. Moving
-/// the code here added two more, because stamping the result and publishing the event
-/// are also per-message concerns that used to reach globals. "Chain" stopped being
-/// the honest description at that point.
+/// Context shared by the verify and seal paths: everything both need to validate a
+/// chain, stamp the result, and publish the event.
 ///
 /// Constructed by `main.zig`, never here — see this file's header for why.
 pub const MsgCtx = struct {
@@ -239,10 +228,10 @@ fn chainOutcome(
     // No body means no AMS can be checked, so the chain cannot be shown intact.
     const body_data = conn.getBody() orelse return .{ .seal = .fail };
 
-    // This is where A-12 lived: `vr.status` was taken as the cv= value whatever
-    // produced it, so a nameserver blip while fetching a previous hop's key sealed
-    // cv=fail — permanent for the life of the message under RFC 8617 §5.1.2, and
-    // indistinguishable to every later hop from a forged signature.
+    // `vr.status` is only used as the cv= value on `.complete` evaluation (audit
+    // A-12): a transient DNS failure must not seal a permanent cv=fail, since RFC
+    // 8617 §5.1.2 makes that verdict indistinguishable to later hops from a forged
+    // signature for the life of the message.
     const vr = ctx.msg.validate(conn.allocator, sets, all_headers, body_data);
     switch (vr.evaluation) {
         .complete => return .{ .seal = vr.status },
@@ -475,21 +464,16 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
 
 /// Emit the three headers of one ARC set as a unit.
 ///
-/// A milter `addHeader` packet cannot be recalled once it is on the wire, and
-/// the old code built and wrote each header where it was computed, with fallible
-/// allocations in between. An allocation failure partway through therefore
-/// delivered a message carrying a *partial* set — AAR alone, or AAR and AMS with
-/// no ARC-Seal. RFC 8617 requires all three per instance, so the next hop reads
-/// that as a malformed chain and records a permanent `cv=fail` (§5.1.2). Our own
-/// resource failure thus destroyed a chain that may have been perfectly valid,
-/// which is precisely the harm A-12 was filed to prevent, reached through a
-/// different door (audit X-8).
+/// A milter `addHeader` packet cannot be recalled once it is on the wire, so a
+/// partial set — AAR alone, or AAR and AMS with no ARC-Seal — must never reach it.
+/// RFC 8617 requires all three per instance; the next hop reads a partial set as a
+/// malformed chain and records a permanent `cv=fail` (§5.1.2), destroying a chain
+/// that may have been perfectly valid (audit X-8). Every payload is therefore built
+/// before the first byte is written, so an allocation failure always leaves the
+/// message untouched; a socket that dies mid-set fails the whole transaction anyway,
+/// and the milter protocol offers nothing stronger, since three headers cannot be
+/// sent as one packet.
 ///
-/// Every payload is built before the first byte is written, so allocation
-/// failures all land while the message is still untouched. What remains is a
-/// socket that dies mid-set, and that fails the whole transaction anyway; the
-/// milter protocol offers nothing stronger, since three headers cannot be sent
-/// as one packet.
 /// Takes the allocator and fd rather than the `Connection` it came from: those
 /// are all it uses, and the property that matters here — nothing on the wire
 /// unless everything is on the wire — is then testable against a pipe.
@@ -523,15 +507,9 @@ pub fn emitArcSet(
 
     // Nothing fallible between here and the final write.
     //
-    // WRITTEN SEAL-FIRST BECAUSE `addHeader` APPENDS. It builds SMFIR_ADDHEADER,
-    // which adds to the end of the header block; `insertHeader` is the one that
-    // takes an index. The previous code wrote AAR, AMS, AS believing each call
-    // prepended, and its comment named the intended result — "the message reading
-    // AS, AMS, AAR downward, the conventional order for the newest set". The intent
-    // was right and the mechanism was not, so the delivered order came out reversed.
-    // Measured on the lab, comparing the run immediately before this change with the
-    // one after it: AAR/AMS/AS at lines 21/22/31 became AS/AMS/AAR at 21/27/36
-    // (audit A-8).
+    // Written seal-first because `addHeader` appends: it builds SMFIR_ADDHEADER,
+    // which adds to the end of the header block, so writing seal, then AMS, then
+    // AAR delivers the message reading AS, AMS, AAR downward (audit A-8).
     //
     // AS, AMS, AAR downward is what OpenARC emits and what every sealed example
     // message in RFC 8617's test corpus shows. Neither is a requirement — §5 says
@@ -556,13 +534,12 @@ pub fn sealInternalError(what: []const u8) u8 {
     return @intFromEnum(responses.Code.tempfail);
 }
 
-/// Record the ARC result on the message.
-///
-/// Returned `void` and swallowed all three failures, so a message could be
-/// delivered with no `arc=` field while the daemon reported success (audit X-9).
-/// On a verify listener that field is the only record of what this hop concluded
-/// about the chain, and a later hop cannot reconstruct it: the AMS covers content
-/// as it was *here*, so once the message moves on, the evidence is gone.
+/// Record the ARC result on the message. Must stay fallible (audit X-9): on a
+/// verify listener the `arc=` field is the only record of what this hop concluded
+/// about the chain, and a later hop cannot reconstruct it — the AMS covers content
+/// as it was *here*, so once the message moves on, the evidence is gone. Swallowing
+/// a stamping failure would deliver the message with no `arc=` field while this
+/// daemon reported success.
 pub fn addArHeaderSimple(
     conn: *connection_mod.Connection,
     authserv_id: []const u8,
@@ -605,14 +582,10 @@ pub fn publishEvent(
 // --- X-8: a partial ARC set must never reach the wire ------------------------
 
 test "emitArcSet writes the whole set or nothing, at every failure point" {
-    // The harmful state is a *partial* set. RFC 8617 requires all three headers
-    // per instance, so AAR alone, or AAR+AMS with no ARC-Seal, is a malformed
-    // chain: the next hop records cv=fail and 5.1.2 makes that permanent. Our own
-    // allocation failure would then destroy a chain that may be perfectly valid.
-    //
     // Stated as a property over every allocation the function performs rather
     // than against a hand-picked fail index, so it cannot rot as the number of
-    // allocations inside addHeader changes.
+    // allocations inside addHeader changes. See `emitArcSet`'s doc comment for
+    // why a partial set must never reach the wire.
     var fail_index: usize = 0;
     var saw_success = false;
     var saw_failure = false;
@@ -642,20 +615,10 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
 
         if (res) |_| {
             saw_success = true;
-            // All three present, seal first on the wire.
-            //
-            // THIS ASSERTION USED TO BE REVERSED, and its comment explained why:
-            // "in the order that makes the message read ARC-Seal, AMS, AAR downward
-            // once each prepend is applied". `addHeader` builds SMFIR_ADDHEADER,
-            // which appends -- nothing prepends -- so writing AAR first delivered
-            // AAR first, the reverse of the stated intent. The test asserted the
-            // write order and agreed with the code, so both were wrong together and
-            // neither could catch the other (audit A-8).
-            //
-            // Wire order is now the delivered top-down order: AS, AMS, AAR, matching
-            // OpenARC and RFC 8617's example messages. Not a conformance property --
-            // §5 calls relative trace-field order "unimportant" -- so this pins a
-            // convention, and pins that the mechanism still matches the intent.
+            // All three present, seal first on the wire, so the delivered top-down
+            // order reads AS, AMS, AAR, matching OpenARC and RFC 8617's example
+            // messages (audit A-8). Not a conformance property -- §5 calls relative
+            // trace-field order "unimportant" -- so this pins a convention.
             const aar_at = std.mem.indexOf(u8, buf[0..n], "ARC-Authentication-Results") orelse
                 return error.TestUnexpectedResult;
             const ams_at = std.mem.indexOf(u8, buf[0..n], "ARC-Message-Signature") orelse
@@ -666,9 +629,8 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
             try std.testing.expect(ams_at < aar_at);
         } else |_| {
             saw_failure = true;
-            // The message must be untouched. Before X-8 was fixed, headers were
-            // built and written where they were computed, so a failure here left
-            // one or two of the three on the wire and this read returned bytes.
+            // The message must be untouched: a failure here must never leave one or
+            // two of the three headers on the wire (audit X-8).
             try std.testing.expectEqual(@as(usize, 0), n);
         }
     }
@@ -679,13 +641,7 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
     try std.testing.expect(saw_success);
 }
 
-// X-9: this wrapper must stay fallible.
-//
-// It returned `void` and swallowed all three failure points, so a message could
-// be delivered with no `arc=` field while this daemon reported success. On a
-// verify listener that field is the only record of what this hop concluded about
-// the chain, and no later hop can reconstruct it: each AMS covers content as it
-// was here, so once the message moves on the evidence is gone.
+// X-9: this wrapper must stay fallible. See `addArHeaderSimple`'s doc comment.
 test "the Authentication-Results wrapper cannot swallow failures" {
     comptime {
         const ret = @typeInfo(@TypeOf(addArHeaderSimple)).@"fn".return_type.?;

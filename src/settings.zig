@@ -28,8 +28,8 @@ pub const Mode = enum {
     both,
 };
 
-/// Parse `Mode` from config. Unrecognised values are errors (previously silent:
-/// a typo like `Mode=sealing` ran seal in verify mode without warning).
+/// Parse `Mode` from config. Unrecognised values are errors, not a silent
+/// fallback: a typo like `Mode=sealing` must not run seal in verify mode.
 pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     if (mem.eql(u8, raw, "verify")) return .verify_only;
     if (mem.eql(u8, raw, "seal")) return .seal_only;
@@ -57,8 +57,8 @@ pub const OnDnsError = enum {
     /// Pass through without sealing, report `arc=temperror`. Right for relays
     /// that do not modify the message.
     skip_seal,
-    /// Seal `cv=fail`. Pre-A-12 behaviour, kept for operators who depended on it.
-    /// Not recommended: inflicts permanent harm on a potentially good chain.
+    /// Seal `cv=fail`. Not recommended: inflicts permanent harm on a
+    /// potentially good chain, but kept for operators who want it.
     seal_fail,
 };
 
@@ -76,8 +76,8 @@ pub const ArcConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
-    /// Per-worker connection cap (audit L-2). No default: previously hard-coded
-    /// while `MaxConnections` was honoured by only one daemon.
+    /// Per-worker connection cap (audit L-2). No fallback default: every
+    /// daemon must honour `MaxConnections` explicitly.
     max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
@@ -193,10 +193,9 @@ pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcC
     seal_selector = seal_selector orelse global.get("SealSelector");
     seal_key_file = seal_key_file orelse global.get("SealKeyFile");
 
-    // Owned slice, borrowed contents. It needs unwinding of its own: everything
-    // above is still an ArrayList with an errdefer, but this slice is not.
-    // Without this, any `try` added below silently leaks it — which is exactly
-    // what the On-DNSError validation did until it was moved to the top.
+    // Owned slice, borrowed contents. It needs its own errdefer: everything
+    // above is still an ArrayList with one, but this slice is not, so any `try`
+    // added below this line would silently leak it.
     const dns_nameservers = try global.getCsvList(allocator, "DnsNameserver", "127.0.0.1");
     errdefer allocator.free(dns_nameservers);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;

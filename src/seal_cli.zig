@@ -118,8 +118,7 @@ pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Arg
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            // Returning here preserves the original's early-exit: whatever
-            // followed -h was never examined.
+            // Return immediately: anything after -h is not examined.
             r.help = true;
             return r;
         } else if (mem.eql(u8, a, "-d")) {
@@ -196,7 +195,7 @@ pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Arg
         }
     }
 
-    // Help wins over the required-argument checks, as it always has.
+    // Help wins over the required-argument checks.
     if (r.help) return r;
     if (r.file == null) {
         err_msg.* = "a message file is required (use -h for help)";

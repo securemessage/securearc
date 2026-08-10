@@ -358,9 +358,9 @@ fn buildAmsSigningInput(
 
     // RFC 8617 inherits DKIM's signing rules, so the AMS `h=` tag selects header
     // instances exactly as a DKIM `h=` does: a repeated name walks up from the
-    // bottom, and a mention with no instance left contributes nothing. This loop
-    // used to take the last match for every mention, which is the same defect as
-    // D-1 and made an oversigned AMS impossible to validate (audit A-6).
+    // bottom, and a mention with no instance left contributes nothing. Taking the
+    // last match for every mention instead would make an oversigned AMS impossible
+    // to validate (audit A-6).
     var walk = header_select.walker(arc.Header, amsHeaderName, set.ams_signed_headers, all_headers);
     while (walk.next()) |hdr| {
         const full = try hdr.render(allocator);
@@ -706,8 +706,8 @@ test "AMS h= repeated: successive instances bottom upward, not the same one twic
 
 test "AMS h= oversigned: the surplus mention contributes nothing" {
     // One From, named twice. The second mention is the null input of RFC 6376
-    // §3.7, so the field is hashed once. Hashing it twice, as this used to,
-    // makes every oversigned AMS fail validation.
+    // §3.7, so the field is hashed once. Hashing it twice would make every
+    // oversigned AMS fail validation.
     const allocator = std.testing.allocator;
     const set = amsSetWithSignedHeaders("from:from");
     const headers = [_]arc.Header{
@@ -766,8 +766,8 @@ test "relaxed and simple produce different bytes for the same message" {
 
 test "an absent c= means simple/simple, not relaxed/relaxed" {
     // RFC 6376 §3.5: c= defaults to simple/simple. A sealer that omits the tag
-    // entirely is legal and common, and used to false-fail here because the body
-    // half honoured the default while the header half was forced to relaxed.
+    // entirely is legal and common, and the header half must honour the same
+    // default as the body half rather than being forced to relaxed.
     const pair = try canon.parseCanonicalization("");
     try std.testing.expectEqual(canon.Algorithm.simple, pair.header);
     try std.testing.expectEqual(canon.Algorithm.simple, pair.body);
@@ -854,8 +854,8 @@ test "X-21: an expired deadline stops the walk before any DNS, and is not a verd
 test "validateChain reports unknown/dns_temp_error when the key lookup fails transiently" {
     // A single well-formed set whose AMS key can never be fetched: the resolver
     // points at a port nothing listens on, with no retries and a short timeout.
-    // Before A-12 this produced cv=fail, which RFC 8617 5.1.2 makes permanent —
-    // so one nameserver blip destroyed a legitimate chain for good.
+    // A transient DNS failure must not become cv=fail, which RFC 8617 §5.1.2
+    // makes permanent for the life of the message (audit A-12).
     const sets = [_]arc.ArcSet{.{
         .instance = 1,
         .aar_value = "i=1; test",
@@ -907,9 +907,8 @@ test "isSupportedAlgorithm accepts only rsa-sha256" {
 
     // An absent a= and an unrecognised one are both unusable: the verifier can
     // only compute RSA over SHA-256, so anything else names an algorithm it
-    // cannot perform. Previously neither was checked and the signature was
-    // verified as though it had said rsa-sha256 -- so a signature claiming
-    // `a=rsa-poptart` was honoured. Suite cases: ams_fields_a_empty,
+    // cannot perform, and a signature claiming e.g. `a=rsa-poptart` must not be
+    // honoured as though it said rsa-sha256. Suite cases: ams_fields_a_empty,
     // ams_fields_a_unknown, as_fields_a_empty, as_fields_a_unknown.
     try std.testing.expect(!isSupportedAlgorithm(""));
     try std.testing.expect(!isSupportedAlgorithm("rsa-poptart"));

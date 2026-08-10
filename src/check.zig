@@ -95,12 +95,11 @@ fn valueAt(argv: []const []const u8, i: usize, comptime flag: []const u8, err_ms
 
 /// Parse the command line (excluding the program name) into `Args`.
 ///
-/// Pure and error-returning BY DESIGN: the first version of this loop lived
-/// inline in `main`, reading `process.args()` and exiting through `cli.fatal`,
-/// which A-22 filed as untestable by construction -- a CLI whose flag handling
-/// cannot be exercised in a test is a CLI whose regressions are found by the
-/// conformance suite or by nobody. On failure `err_msg` receives a static
-/// description of which flag failed and why; `main` maps that to the exit.
+/// Pure and error-returning by design (audit A-22): reading `process.args()`
+/// and exiting through `cli.fatal` inline would make flag handling untestable,
+/// so regressions could only be caught by the conformance suite or not at all.
+/// On failure `err_msg` receives a static description of which flag failed and
+/// why; `main` maps that to the exit.
 pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Args {
     err_msg.* = null;
     var r = Args{};
@@ -109,9 +108,7 @@ pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Arg
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (mem.eql(u8, a, "-h") or mem.eql(u8, a, "--help")) {
-            // The pre-refactor loop printed usage and returned AT this point,
-            // so anything after -h was never examined. Returning here keeps
-            // that exact shape.
+            // Return immediately: anything after -h is not examined.
             r.help = true;
             return r;
         } else if (mem.eql(u8, a, "-f")) {
@@ -174,8 +171,8 @@ pub fn parseArgs(argv: []const []const u8, err_msg: *?[]const u8) ParseError!Arg
         }
     }
 
-    // Help wins over the required-argument check, as it always has: `-h` with no
-    // message file must print usage, not an error.
+    // Help wins over the required-argument check: `-h` with no message file
+    // must print usage, not an error.
     if (r.help) return r;
     if (r.path == null) {
         err_msg.* = "a message file is required (use -h for help)";
