@@ -140,7 +140,7 @@ LocalAuthMethods = spf, dkim, dmarc
 # ordinary single-key case still costs exactly one verification.
 # MaxKeyRecords = 3
 
-# --- Evaluation time budget (X-21) ---
+# --- Evaluation time budget ---
 #
 # MaxEvaluationMs is the wall-clock ceiling in milliseconds for evaluating one
 # message, shared by every DNS lookup the verdict needs. Exhausting it gives
@@ -168,9 +168,8 @@ LocalAuthMethods = spf, dkim, dmarc
 #              It does NOT rescue the chain if this hop does alter them: the
 #              previous hop's AMS then covers changed content and the next hop
 #              computes cv=fail anyway. It only moves who breaks the chain.
-#   seal-fail  Seal cv=fail. What releases before this option did. NOT
-#              RECOMMENDED — the only setting that permanently destroys a chain
-#              that may be perfectly valid.
+#   seal-fail  Seal cv=fail anyway. NOT RECOMMENDED — the only setting that
+#              permanently destroys a chain that may be perfectly valid.
 #
 # Verify listeners are not configurable: they report arc=temperror and deliver,
 # because a verifier writes no permanent verdict into the message. An internal
@@ -178,14 +177,12 @@ LocalAuthMethods = spf, dkim, dmarc
 # never charged to the sender's chain.
 # On-DNSError = tempfail
 
-# Each listener has its own Mode: verify, seal, or both. A listener that omits
-# Mode inherits a [global] Mode if one is set, otherwise verify. An unrecognised
-# value is refused at startup rather than silently falling back.
-#
-# Releases before this one kept a single daemon-wide mode that each listener
-# section overwrote in turn, so the last section won for every socket — this
-# exact two-listener layout ran BOTH sockets in seal mode. Confirm the
-# "listener[N] mode=..." lines logged at startup after upgrading.
+# Each listener has its own Mode: verify, seal, or both, and each is
+# independent of the others. A listener that omits Mode inherits a [global]
+# Mode if one is set, otherwise verify. An unrecognised value is refused at
+# startup rather than silently falling back. Confirm the "listener[N]
+# mode=..." lines logged at startup match what you intended, particularly
+# when a verify section and a seal section both appear below.
 #
 # SealDomain, SealSelector and SealKeyFile are read from a listener section but
 # apply daemon-wide: there is one seal key, so per-listener sealing identities
@@ -194,16 +191,16 @@ LocalAuthMethods = spf, dkim, dmarc
 # Both sockets are loopback. "inbound" and "relay" describe the mail, not the
 # connection: the client is always the local Postfix. The milter protocol has no
 # authentication, so reachability is authorization -- anything that can open the
-# verify port dictates the Authentication-Results this host stamps (finding X-1/M-1
-# without forging a header), and anything that can open the seal port gets an
+# verify port dictates the Authentication-Results this host stamps without
+# forging a header, and anything that can open the seal port gets an
 # unauthenticated ARC signing oracle for SealDomain below. Widen only if Postfix
 # genuinely runs on another machine, and then restrict it with pf.
 
 [listener:verify-inbound]
 # The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
 # configuration ERROR, not a synonym for 127.0.0.1. A Socket value that cannot be
-# parsed stops startup and names this section (X-14); it is never silently ignored
-# and never falls back to the default listener.
+# parsed stops startup and names this section; it is never silently ignored and
+# never falls back to the default listener.
 Socket          = inet:8895@127.0.0.1
 Mode            = verify
 
