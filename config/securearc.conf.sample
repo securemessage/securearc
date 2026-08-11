@@ -54,7 +54,7 @@ ZmqTopic        = arc
 # Signing key for ARC sealing (same format as DKIM)
 SealDomain      = example.com
 SealSelector    = arc2026
-SealKeyFile     = /usr/local/etc/securearc/keys/arc.key
+SealKeyFile     = /var/db/securearc/keys/arc.key
 SignedHeaders    = from:to:subject:date:message-id
 
 # Authentication methods this ADMD evaluates locally, i.e. the results the
