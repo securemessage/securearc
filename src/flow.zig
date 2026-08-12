@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const securemilter = @import("securemilter");
 const connection_mod = securemilter.connection;
 const auth_stamp = securemilter.auth_stamp;
+const header_fold = securemilter.header_fold;
 const escape = securemilter.escape;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -497,11 +498,23 @@ pub fn emitArcSet(
     // only because every ARC canonicalization here is `relaxed`, which deletes the
     // whitespace around the colon before hashing; the first `c=simple` AMS to reach
     // this path would have been sealed against bytes we never sent.
-    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar, leading_space);
+    // The built values carry CRLF folds — the canonical form, and the bytes
+    // that were hashed. The milter protocol carries folds as bare LF
+    // (smfi_addheader(3): the MTA adds the CR); sending CRLF doubles every
+    // fold into a blank line at the MTA, which ends the header block early for
+    // every downstream parser.
+    const aar_wire = try header_fold.toWire(allocator, aar);
+    defer allocator.free(aar_wire);
+    const ams_wire = try header_fold.toWire(allocator, ams);
+    defer allocator.free(ams_wire);
+    const seal_wire = try header_fold.toWire(allocator, seal_hdr);
+    defer allocator.free(seal_wire);
+
+    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar_wire, leading_space);
     defer allocator.free(p_aar);
-    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams, leading_space);
+    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams_wire, leading_space);
     defer allocator.free(p_ams);
-    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_hdr, leading_space);
+    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_wire, leading_space);
     defer allocator.free(p_seal);
 
     // Nothing fallible between here and the final write.
