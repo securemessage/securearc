@@ -30,7 +30,8 @@ mkdir -p /var/run/securearc /usr/local/etc/securearc
 
 # Generate ARC key (uses same format as DKIM)
 securedkim-genkey -s arc2026 -d example.com -o /usr/local/etc/securearc/arc.key
-# (add the DNS TXT record to your zone at arc2026._domainkey.example.com)
+# (the record lands in /usr/local/etc/securearc/arc.dns -- paste or $INCLUDE it
+#  into your zone at arc2026._domainkey.example.com)
 
 # Verify key is published
 securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
