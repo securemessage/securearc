@@ -51,7 +51,6 @@ const doSeal = flow.doSeal;
 const buildSigningHeaders = sealbuild.buildSigningHeaders;
 const buildSealInput = sealbuild.buildSealInput;
 const buildAarContent = sealbuild.buildAarContent;
-const foldBase64 = sealbuild.foldBase64;
 
 pub const Mode = settings.Mode;
 pub const OnDnsError = settings.OnDnsError;

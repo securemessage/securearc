@@ -1,4 +1,4 @@
-//! ARC set construction: AAR content, signing inputs, and base64 folding.
+//! ARC set construction: AAR content, signing inputs, and the folded headers.
 //!
 //! This module converts explicit configuration and message content into headers.
 //! The milter flow retains daemon-state and sealing-policy decisions.
@@ -11,6 +11,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const connection_mod = securemilter.connection;
 const auth_results = securemilter.auth_results;
+const header_fold = securemilter.header_fold;
 const log = securemilter.log;
 
 const securemilter_crypto = @import("securemilter_crypto");
@@ -150,26 +151,21 @@ pub fn resultsPart(header_value: []const u8) ?[]const u8 {
     return if (result.len == 0) null else result;
 }
 
-/// Fold base64 with CRLF+TAB every 76 characters.
+/// Append one `tag=value` to a sealing folder, folding onto a continuation
+/// line when the tag would push the line past the RFC 5322 §2.1.1 limit.
 ///
-/// Always returns a caller-owned allocation, including the unwrapped case.
-pub fn foldBase64(allocator: Allocator, b64: []const u8) ![]const u8 {
-    const chunk_size = 76;
-    if (b64.len <= chunk_size) return allocator.dupe(u8, b64);
-
-    var result: std.ArrayListUnmanaged(u8) = .{};
-    errdefer result.deinit(allocator);
-
-    var offset: usize = 0;
-    while (offset < b64.len) {
-        const end = @min(offset + chunk_size, b64.len);
-        try result.appendSlice(allocator, b64[offset..end]);
-        if (end < b64.len) {
-            try result.appendSlice(allocator, "\r\n\t");
-        }
-        offset = end;
-    }
-    return result.toOwnedSlice(allocator);
+/// The first tag takes no separator: the `"Name: "` the value is emitted and
+/// hashed with supplies the opening whitespace. Every tag here is inside a
+/// signature's hash, and folding inside the hash is safe precisely because
+/// both AMS and AS are canonicalized relaxed on every path below — relaxed
+/// unfolds the value before hashing (RFC 6376 §3.4.2), so the fold cannot
+/// change what either side computes.
+fn appendTag(folder: *header_fold.Folder, tag: []const u8, value: []const u8) !void {
+    const separator: []const u8 = if (folder.buf.items.len > 0) "; " else "";
+    var token_buf: [160]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}={s}", .{ tag, value }) catch
+        return error.BuildFailed;
+    try folder.append(separator, token);
 }
 
 /// Set construction failure; the failing step is reported out-of-band.
@@ -230,7 +226,24 @@ pub fn buildSet(
         return fail(failed_step, "building the ARC-Authentication-Results content");
     defer allocator.free(ar_content);
 
-    const aar = std.fmt.allocPrint(allocator, "i={d}; {s}", .{ p.instance, ar_content }) catch
+    // Folded at construction: the value below is the byte string the ARC-Seal
+    // signs (via buildSealInput) and the byte string emitArcSet transmits, so
+    // the fold must exist before the seal is computed, not after. The content
+    // is copied out of this host's own Authentication-Results headers, whose
+    // folds were placed for that field name's width; appendStructured unfolds
+    // and refolds them for this one.
+    var aar_buf: std.ArrayList(u8) = .{};
+    errdefer aar_buf.deinit(allocator);
+    var aar_folder = header_fold.Folder.init(&aar_buf, allocator, "ARC-Authentication-Results:".len + 1);
+    aar_folder.appendStructured("", "i=") catch
+        return fail(failed_step, "formatting the ARC-Authentication-Results header");
+    var instance_buf: [4]u8 = undefined;
+    const instance_str = std.fmt.bufPrint(&instance_buf, "{d}", .{p.instance}) catch unreachable;
+    aar_folder.appendStructured("", instance_str) catch
+        return fail(failed_step, "formatting the ARC-Authentication-Results header");
+    aar_folder.appendStructured("; ", ar_content) catch
+        return fail(failed_step, "formatting the ARC-Authentication-Results header");
+    const aar = aar_buf.toOwnedSlice(allocator) catch
         return fail(failed_step, "formatting the ARC-Authentication-Results header");
     errdefer allocator.free(aar);
 
@@ -251,18 +264,43 @@ pub fn buildSet(
         return fail(failed_step, "encoding the body hash");
     defer allocator.free(body_hash_b64);
 
-    // Pre-folded, and written once. The final header value below is this template
-    // with the signature appended, so the bytes a verifier canonicalizes are the
-    // bytes we hashed by construction. Spelling the layout out twice and keeping
-    // the two in sync by hand is a silent break waiting for the first person to add
-    // a tag to one of them: the signature would cover a header the message does not
-    // carry, and every verifier everywhere would report a failure.
-    const ams_template = std.fmt.allocPrint(
-        allocator,
-        "i={d}; a=rsa-sha256;\r\n\tc=relaxed/relaxed; d={s}; s={s}; t={d};\r\n\th={s};\r\n\tbh={s};\r\n\tb=",
-        .{ p.instance, p.domain, p.selector, p.timestamp, p.signed_headers, body_hash_b64 },
-    ) catch return fail(failed_step, "formatting the AMS template");
-    defer allocator.free(ams_template);
+    // Written once, folded at construction. The final header value below is this
+    // buffer with the signature appended, so the bytes a verifier canonicalizes
+    // are the bytes we hashed by construction. Spelling the layout out twice and
+    // keeping the two in sync by hand is a silent break waiting for the first
+    // person to add a tag to one of them: the signature would cover a header the
+    // message does not carry, and every verifier everywhere would report a
+    // failure.
+    //
+    // The tags are folded only where canonicalization can undo it: every ARC
+    // input here is canonicalized relaxed, which unfolds continuation lines
+    // before hashing (RFC 6376 §3.4.2), so the fold cannot change what either
+    // side computes. The b= base64 is chunked regardless — whitespace inside it
+    // is ignored when reassembling the signature (§3.5), which is what lets an
+    // RSA-4096 signature stay inside the 998-character MUST at all.
+    var ams_buf: std.ArrayList(u8) = .{};
+    errdefer ams_buf.deinit(allocator);
+    var ams_folder = header_fold.Folder.init(&ams_buf, allocator, "ARC-Message-Signature:".len + 1);
+    appendTag(&ams_folder, "i", instance_str) catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "a", "rsa-sha256") catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "c", "relaxed/relaxed") catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "d", p.domain) catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "s", p.selector) catch
+        return fail(failed_step, "formatting the AMS template");
+    var ts_buf: [20]u8 = undefined;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{p.timestamp}) catch unreachable;
+    appendTag(&ams_folder, "t", ts_str) catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "h", p.signed_headers) catch
+        return fail(failed_step, "formatting the AMS template");
+    appendTag(&ams_folder, "bh", body_hash_b64) catch
+        return fail(failed_step, "formatting the AMS template");
+    ams_folder.append("; ", "b=") catch
+        return fail(failed_step, "formatting the AMS template");
 
     var ams_input: std.ArrayListUnmanaged(u8) = .{};
     defer ams_input.deinit(allocator);
@@ -274,7 +312,7 @@ pub fn buildSet(
     const ams_full_template = std.fmt.allocPrint(
         allocator,
         "ARC-Message-Signature: {s}",
-        .{ams_template},
+        .{ams_buf.items},
     ) catch return fail(failed_step, "formatting the AMS signing input");
     defer allocator.free(ams_full_template);
     const canon_ams_tmpl = canon_mod.canonicalizeHeader(allocator, .relaxed, ams_full_template) catch
@@ -289,30 +327,43 @@ pub fn buildSet(
     const ams_sig_b64 = crypto.base64Encode(allocator, ams_sig_raw) catch
         return fail(failed_step, "encoding the AMS signature");
     defer allocator.free(ams_sig_b64);
-    const folded_ams_sig = foldBase64(allocator, ams_sig_b64) catch
-        return fail(failed_step, "folding the AMS signature");
-    defer allocator.free(folded_ams_sig);
 
-    // The template ends at `b=`, so appending the signature yields exactly what was
-    // signed. No second copy of the layout to drift.
-    const ams_value = std.fmt.allocPrint(allocator, "{s}{s}", .{ ams_template, folded_ams_sig }) catch
+    // The template ends at `b=`, so appending the signature yields exactly what
+    // was signed. No second copy of the layout to drift. `ams_folder` still
+    // tracks the column the template ended on, so the chunks pick up there.
+    ams_folder.appendChunked(ams_sig_b64) catch
+        return fail(failed_step, "folding the AMS signature");
+    const ams_value = ams_buf.toOwnedSlice(allocator) catch
         return fail(failed_step, "formatting the AMS header");
     errdefer allocator.free(ams_value);
 
     // ARC-Seal: signs this set's AAR and AMS, plus whatever prior ARC headers
     // `sealScope` admits -- everything for a live chain, nothing for a failed one.
-    const as_template = std.fmt.allocPrint(
-        allocator,
-        "i={d}; cv={s}; a=rsa-sha256; d={s}; s={s}; t={d};\r\n\tb=",
-        .{ p.instance, p.cv.toString(), p.domain, p.selector, p.timestamp },
-    ) catch return fail(failed_step, "formatting the ARC-Seal template");
-    defer allocator.free(as_template);
+    // Same construction as the AMS: one folded buffer, template first, and the
+    // signature lands where the Folder's column tracking left off.
+    var as_buf: std.ArrayList(u8) = .{};
+    errdefer as_buf.deinit(allocator);
+    var as_folder = header_fold.Folder.init(&as_buf, allocator, "ARC-Seal:".len + 1);
+    appendTag(&as_folder, "i", instance_str) catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    appendTag(&as_folder, "cv", p.cv.toString()) catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    appendTag(&as_folder, "a", "rsa-sha256") catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    appendTag(&as_folder, "d", p.domain) catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    appendTag(&as_folder, "s", p.selector) catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    appendTag(&as_folder, "t", ts_str) catch
+        return fail(failed_step, "formatting the ARC-Seal template");
+    as_folder.append("; ", "b=") catch
+        return fail(failed_step, "formatting the ARC-Seal template");
 
     const seal_scope = sealScope(p.cv, p.prior_sets);
 
     var seal_input: std.ArrayListUnmanaged(u8) = .{};
     defer seal_input.deinit(allocator);
-    buildSealInput(conn, &seal_input, seal_scope, aar, ams_value, as_template) catch
+    buildSealInput(conn, &seal_input, seal_scope, aar, ams_value, as_buf.items) catch
         return fail(failed_step, "assembling the ARC-Seal signing input");
 
     const seal_sig_raw = crypto.rsaSign(allocator, p.sign_key.rsa_pkey.?, seal_input.items) catch
@@ -321,12 +372,10 @@ pub fn buildSet(
     const seal_sig_b64 = crypto.base64Encode(allocator, seal_sig_raw) catch
         return fail(failed_step, "encoding the ARC-Seal signature");
     defer allocator.free(seal_sig_b64);
-    const folded_seal_sig = foldBase64(allocator, seal_sig_b64) catch
-        return fail(failed_step, "folding the ARC-Seal signature");
-    defer allocator.free(folded_seal_sig);
 
-    // Same construction as the AMS: the signed template plus the signature.
-    const as_value = std.fmt.allocPrint(allocator, "{s}{s}", .{ as_template, folded_seal_sig }) catch
+    as_folder.appendChunked(seal_sig_b64) catch
+        return fail(failed_step, "folding the ARC-Seal signature");
+    const as_value = as_buf.toOwnedSlice(allocator) catch
         return fail(failed_step, "formatting the ARC-Seal header");
 
     return .{ .aar = aar, .ams = ams_value, .seal = as_value, .allocator = allocator };
@@ -343,32 +392,6 @@ test "results part drops the authserv-id" {
     );
     try std.testing.expect(resultsPart("mail.example.org") == null);
     try std.testing.expect(resultsPart("mail.example.org;   ") == null);
-}
-
-// --- X-11: `foldBase64` always returns owned memory ---------------------------
-test "foldBase64 returns owned memory on both the folding and the short path" {
-    const a = std.testing.allocator;
-
-    // The short path: no folding needed, but the result must still be owned.
-    const short = "c2hvcnQ=";
-    const folded_short = try foldBase64(a, short);
-    defer a.free(folded_short);
-    try std.testing.expectEqualStrings(short, folded_short);
-    try std.testing.expect(folded_short.ptr != short.ptr);
-
-    // Exactly at the 76-byte boundary: still no fold, still owned.
-    const at_limit = "A" ** 76;
-    const folded_limit = try foldBase64(a, at_limit);
-    defer a.free(folded_limit);
-    try std.testing.expectEqualStrings(at_limit, folded_limit);
-
-    // The folding path, at the length an RSA-2048 signature actually reaches.
-    const sig_b64 = "A" ** 344;
-    const folded_sig = try foldBase64(a, sig_b64);
-    defer a.free(folded_sig);
-    try std.testing.expect(std.mem.indexOf(u8, folded_sig, "\r\n\t") != null);
-    // Four folds over 344 bytes, each inserting CRLF+TAB, and no data lost.
-    try std.testing.expectEqual(sig_b64.len + 4 * 3, folded_sig.len);
 }
 
 // --- AAR trust rule (RFC 8617 §5.1.1) ------------------------------------------
@@ -638,4 +661,137 @@ test "an empty chain is not broken, it is absent" {
     // continue" with "cannot continue" would stop this daemon sealing unsigned mail
     // at all, which is the common case.
     try std.testing.expect(!arc.chainAlreadyBroken(&.{}));
+}
+
+// --- RFC 5322 folding of the emitted set --------------------------------------
+//
+// The set went out as single long lines until the Folder was wired in: a
+// 344-character RSA-2048 signature on `b=` alone broke the 78 SHOULD several
+// times over, and RSA-4096 reached the 998 MUST. These pin the layout and the
+// property that makes it safe: the seal's input is built from the folded AAR
+// and AMS, so signed and transmitted bytes are the same bytes.
+
+/// A connection carrying one own A-R header and a body, ready for `buildSet`.
+fn sealingConn(fd: posix.fd_t, ar_value: []const u8) !connection_mod.Connection {
+    var conn = try connWith(fd, &.{});
+    errdefer conn.deinit();
+    try conn.headers.append(std.testing.allocator, .{
+        .name = try std.testing.allocator.dupe(u8, "From"),
+        .value = try std.testing.allocator.dupe(u8, "sender@example.org"),
+    });
+    try conn.headers.append(std.testing.allocator, .{
+        .name = try std.testing.allocator.dupe(u8, "Authentication-Results"),
+        .value = try std.testing.allocator.dupe(u8, ar_value),
+    });
+    try conn.appendBody("folding probe body\r\n");
+    return conn;
+}
+
+fn testParams(key: *const crypto.SigningKey) SetParams {
+    return .{
+        .instance = 1,
+        .cv = .none,
+        .domain = "relay.test",
+        .selector = "arc1",
+        .signed_headers = "from",
+        .authserv_id = our_id,
+        .local_auth_methods = &.{ "spf", "dkim" },
+        .sign_key = key,
+        .prior_sets = &.{},
+        .timestamp = 1786000000,
+    };
+}
+
+/// The longest emitted line with the field's name and separator counted, per
+/// `emitArcSet`'s contract.
+fn longestWithName(name: []const u8, value: []const u8) usize {
+    var longest: usize = 0;
+    var it = std.mem.splitScalar(u8, value, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const len = trimmed.len + if (first) name.len + 2 else 0;
+        longest = @max(longest, len);
+        first = false;
+    }
+    return longest;
+}
+
+test "the emitted ARC set stays inside the RFC 5322 line limits" {
+    var key = crypto.loadRsaKeyFile("test/keys/arc.key", crypto.RFC8301_MIN_RSA_BITS, .permit_any) catch
+        return error.SkipZigTest;
+    defer key.deinit();
+
+    const fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(fds[0]);
+    var conn = try sealingConn(
+        fds[1],
+        "mail.relay.test; spf=pass smtp.mailfrom=a-rather-long-domain-name.example.org; " ++
+            "dkim=pass header.d=a-rather-long-domain-name.example.org header.s=a-selector-2026",
+    );
+    defer conn.deinit();
+
+    var step: ?[]const u8 = null;
+    var set = try buildSet(&conn, testParams(&key), &step);
+    defer set.deinit();
+
+    // A first-line burst can end a few characters past 78: a token is never
+    // split, so the Folder's one-token lookbehind lets the line that fills run
+    // to the token's end. Bounded by the longest tag, never near the MUST.
+    try std.testing.expect(longestWithName("ARC-Authentication-Results", set.aar) <= header_fold.SOFT_LIMIT);
+    try std.testing.expect(longestWithName("ARC-Message-Signature", set.ams) <= header_fold.SOFT_LIMIT + 16);
+    try std.testing.expect(longestWithName("ARC-Seal", set.seal) <= header_fold.SOFT_LIMIT + 16);
+    try std.testing.expect(longestWithName("ARC-Authentication-Results", set.aar) <= header_fold.HARD_LIMIT);
+    try std.testing.expect(longestWithName("ARC-Message-Signature", set.ams) <= header_fold.HARD_LIMIT);
+    try std.testing.expect(longestWithName("ARC-Seal", set.seal) <= header_fold.HARD_LIMIT);
+
+    // Each value folded at least once, or the limit assertions above proved
+    // nothing for a set this size.
+    try std.testing.expect(std.mem.indexOf(u8, set.aar, "\r\n\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set.ams, "\r\n\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set.seal, "\r\n\t") != null);
+}
+
+test "the seal covers the folded AAR and AMS exactly as emitted" {
+    const allocator = std.testing.allocator;
+    var key = crypto.loadRsaKeyFile("test/keys/arc.key", crypto.RFC8301_MIN_RSA_BITS, .permit_any) catch
+        return error.SkipZigTest;
+    defer key.deinit();
+
+    const fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(fds[0]);
+    var conn = try sealingConn(
+        fds[1],
+        "mail.relay.test; spf=pass smtp.mailfrom=a-rather-long-domain-name.example.org",
+    );
+    defer conn.deinit();
+
+    var step: ?[]const u8 = null;
+    var set = try buildSet(&conn, testParams(&key), &step);
+    defer set.deinit();
+
+    // Rebuild the seal's input from the emitted values and verify the emitted
+    // b= against it. If the seal were computed over anything but these bytes --
+    // an unfolded or differently-folded form -- this could not pass.
+    const canon_mod = securemilter_crypto.canon;
+    var input: std.ArrayListUnmanaged(u8) = .{};
+    defer input.deinit(allocator);
+    try appendCanonHdr(allocator, &input, "ARC-Authentication-Results", set.aar);
+    try appendCanonHdr(allocator, &input, "ARC-Message-Signature", set.ams);
+
+    // The AS template is the emitted value with the signature cut back off;
+    // b= opened last, so the template ends exactly where base64 begins.
+    const b_open = std.mem.lastIndexOf(u8, set.seal, "b=").?;
+    const template = set.seal[0 .. b_open + 2];
+    const as_full = try std.fmt.allocPrint(allocator, "ARC-Seal: {s}", .{template});
+    defer allocator.free(as_full);
+    const canon_as = try canon_mod.canonicalizeHeader(allocator, .relaxed, as_full);
+    defer allocator.free(canon_as);
+    try input.appendSlice(allocator, canon_as);
+
+    const sig_b64 = set.seal[b_open + 2 ..];
+    const sig_raw = try crypto.base64Decode(allocator, sig_b64);
+    defer allocator.free(sig_raw);
+
+    try std.testing.expect(try crypto.rsaVerify(key.rsa_pkey.?, input.items, sig_raw));
 }

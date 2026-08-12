@@ -36,7 +36,6 @@ const sealbuild = @import("sealbuild.zig");
 const buildSigningHeaders = sealbuild.buildSigningHeaders;
 const buildSealInput = sealbuild.buildSealInput;
 const buildAarContent = sealbuild.buildAarContent;
-const foldBase64 = sealbuild.foldBase64;
 
 /// Context shared by the verify and seal paths: everything both need to validate a
 /// chain, stamp the result, and publish the event.
