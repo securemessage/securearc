@@ -40,7 +40,12 @@ securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
 chmod 0600 /usr/local/etc/securearc/arc.key
 chown mailnull:mailnull /usr/local/etc/securearc/arc.key
 
-# Write config
+# Write config. This example is for a host that both validates inbound
+# chains and seals outbound ones for the same mail flow (a relay or
+# forwarding hop) -- one listener in `Mode = both` covers it; see
+# "Postfix Integration" below for the verify-only case (most single-server
+# operators that don't relay mail elsewhere) and for when to use two
+# separate listeners instead (DMARC enforcement with the ARC override).
 cat > /usr/local/etc/securearc/securearc.conf << 'EOF'
 [global]
 AuthservID      = mail.example.com
@@ -48,13 +53,9 @@ User            = mailnull
 PidFile         = /var/run/securearc/securearc.pid
 DnsNameserver   = 127.0.0.1
 
-[listener:verify-inbound]
+[listener:relay]
 Socket          = inet:8895@127.0.0.1
-Mode            = verify
-
-[listener:seal-relay]
-Socket          = inet:8896@127.0.0.1
-Mode            = seal
+Mode            = both
 SealDomain      = example.com
 SealSelector    = arc2026
 SealKeyFile     = /usr/local/etc/securearc/arc.key
@@ -115,7 +116,11 @@ securearc -c /usr/local/etc/securearc/securearc.conf
 
 ## Postfix Integration
 
-SecureARC must be **last** in the inbound milter chain:
+Where SecureARC belongs in the chain depends on whether SecureDMARC is
+enforcing policy and consuming ARC's result:
+
+**SecureDMARC in its default stamp-only mode**: SecureARC runs last, since
+nothing downstream needs to see its result:
 
 ```ini
 smtpd_milters = inet:127.0.0.1:8890,
@@ -128,12 +133,82 @@ milter_default_action = accept
 
 Order: **SPF (8890) → DKIM (8891) → DMARC (8894) → ARC (8895)**
 
-For relay/forwarding sealing (separate listener):
+**SecureDMARC enforcing, with the ARC trusted-forwarder override enabled**
+(`Enforcement` + `TrustedSealersFile` in securedmarc.conf), SecureARC's
+*verify* step must run **before** SecureDMARC instead, so a validated
+`arc=` result exists when SecureDMARC decides whether to reject:
 
 ```ini
-# In master.cf transport or relay service
--o smtp_milters=inet:127.0.0.1:8896
+smtpd_milters = inet:127.0.0.1:8890,
+                inet:127.0.0.1:8891,
+                inet:127.0.0.1:8895,
+                inet:127.0.0.1:8894
+milter_connect_macros = j {daemon_name} v {client_addr}
+milter_default_action = accept
 ```
+
+Order: **SPF (8890) → DKIM (8891) → ARC (8895, verify) → DMARC (8894, enforce)**
+
+See [securedmarc's README](https://pacyworld.dev/securemessage/securedmarc#dmarc-enforcement)
+for the enforcement/override configuration itself.
+
+### Do you need to seal anything?
+
+Everything above covers *validating* inbound chains. Sealing (extending the
+chain with a new set of your own) is only useful if this host relays or
+forwards mail on to some other domain after evaluating it. If every message
+this host authenticates is delivered to a local mailbox and goes no further,
+skip sealing: run a `verify`-only listener (as in the examples above, with no
+`SealDomain`/`SealSelector`/`SealKeyFile`) and stop there.
+
+### If you do seal: prefer one `Mode = both` listener over two
+
+If this host both validates and, on the same mail flow, seals a new set (a
+relay or forwarding hop), use a single listener in `Mode = both` rather than
+separate `verify` and `seal` listeners:
+
+```ini
+[listener:relay]
+Socket       = inet:8895@127.0.0.1
+Mode         = both
+SealDomain   = example.com
+SealSelector = arc2026
+SealKeyFile  = /usr/local/etc/securearc/arc.key
+```
+
+`Mode = both` validates the chain once and seals the new set from that same
+validation, in a single pass. Two separate listeners validate the chain
+**twice**, at two different moments in time: a DNS change or key rotation
+between the two can produce a `verify` listener stamping `arc=pass` while
+the `seal` listener, moments later, writes `cv=fail` into the new set for
+the same message: a self-contradictory attestation from the same ADMD.
+`Mode = both` makes that structurally impossible, and needs one listener
+instead of two. Since `smtpd_milters` runs once per inbound SMTP
+transaction regardless of what happens to the message afterwards, one
+`Mode = both` listener wired into `smtpd_milters` is enough to seal outbound
+copies of accepted mail; no second listener needed on the outbound path.
+
+**Exception:** if SecureDMARC is enforcing with the trusted-forwarder
+override (above), you cannot use `Mode = both` here: DMARC has to run
+*between* the verify and seal steps, so they need to stay on separate
+listeners positioned on either side of it:
+
+```ini
+[listener:verify-inbound]
+Socket = inet:8895@127.0.0.1
+Mode   = verify
+
+[listener:seal-outbound]
+Socket       = inet:8896@127.0.0.1
+Mode         = seal
+SealDomain   = example.com
+SealSelector = arc2026
+SealKeyFile  = /usr/local/etc/securearc/arc.key
+```
+
+Wire `verify-inbound` into `smtpd_milters` before SecureDMARC, and
+`seal-outbound` into whichever Postfix service actually relays or forwards
+the message onward, after SecureDMARC has run.
 
 ## CLI Tools
 
