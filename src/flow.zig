@@ -462,9 +462,10 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     return @intFromEnum(responses.Code.accept);
 }
 
-/// Emit the three headers of one ARC set as a unit.
+/// Emit the three headers of one ARC set as a unit, prepended at the top of
+/// the header block (trace fields, RFC 8601 §4.1 semantics).
 ///
-/// A milter `addHeader` packet cannot be recalled once it is on the wire, so a
+/// A milter header packet cannot be recalled once it is on the wire, so a
 /// partial set — AAR alone, or AAR and AMS with no ARC-Seal — must never reach it.
 /// RFC 8617 requires all three per instance; the next hop reads a partial set as a
 /// malformed chain and records a permanent `cv=fail` (§5.1.2), destroying a chain
@@ -510,29 +511,31 @@ pub fn emitArcSet(
     const seal_wire = try header_fold.toWire(allocator, seal_hdr);
     defer allocator.free(seal_wire);
 
-    const p_aar = try responses.addHeader(allocator, "ARC-Authentication-Results", aar_wire, leading_space);
+    const p_aar = try responses.insertHeader(allocator, 0, "ARC-Authentication-Results", aar_wire, leading_space);
     defer allocator.free(p_aar);
-    const p_ams = try responses.addHeader(allocator, "ARC-Message-Signature", ams_wire, leading_space);
+    const p_ams = try responses.insertHeader(allocator, 0, "ARC-Message-Signature", ams_wire, leading_space);
     defer allocator.free(p_ams);
-    const p_seal = try responses.addHeader(allocator, "ARC-Seal", seal_wire, leading_space);
+    const p_seal = try responses.insertHeader(allocator, 0, "ARC-Seal", seal_wire, leading_space);
     defer allocator.free(p_seal);
 
     // Nothing fallible between here and the final write.
     //
-    // Written seal-first because `addHeader` appends: it builds SMFIR_ADDHEADER,
-    // which adds to the end of the header block, so writing seal, then AMS, then
-    // AAR delivers the message reading AS, AMS, AAR downward (audit A-8).
+    // SMFIR_INSHEADER at index 0, written AAR-first: each insert lands above the
+    // previous, so the delivered block reads AS, AMS, AAR downward, matching
+    // OpenARC and the RFC 8617 corpus. These are trace fields, and the audit
+    // settled that prepending is a requirement (RFC 8601 §4.1) — an appended
+    // ARC set sits at the bottom of the header block, adjacent to the body,
+    // where it is both off-convention and visibly "in the body area" to anyone
+    // reading the source.
     //
-    // AS, AMS, AAR downward is what OpenARC emits and what every sealed example
-    // message in RFC 8617's test corpus shows. Neither is a requirement — §5 says
-    // "relative ordering of different trace header fields ... is unimportant" and
-    // receivers MUST cope with any order — so this is convention, not conformance.
-    // The order that IS mandated is the one fed to the seal's hash, AAR then AMS
-    // then AS per §5.1.1, and that lives in `sealbuild.buildSealInput`, untouched
-    // here. Conflating the two is what made A-8 prescribe the wrong fix.
-    try codec.writePacket(fd, p_seal);
-    try codec.writePacket(fd, p_ams);
+    // AS, AMS, AAR downward is convention, not conformance — §5 calls relative
+    // trace-field order "unimportant". The order that IS mandated is the one fed
+    // to the seal's hash, AAR then AMS then AS per §5.1.1, and that lives in
+    // `sealbuild.buildSealInput`, untouched here. Conflating the two is what
+    // made A-8 prescribe the wrong fix.
     try codec.writePacket(fd, p_aar);
+    try codec.writePacket(fd, p_ams);
+    try codec.writePacket(fd, p_seal);
 }
 
 /// Defer the message after an internal failure while sealing (audit X-8).
@@ -627,18 +630,21 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
 
         if (res) |_| {
             saw_success = true;
-            // All three present, seal first on the wire, so the delivered top-down
-            // order reads AS, AMS, AAR, matching OpenARC and RFC 8617's example
-            // messages (audit A-8). Not a conformance property -- §5 calls relative
-            // trace-field order "unimportant" -- so this pins a convention.
+            // All three present, each an SMFIR_INSHEADER at index 0, written
+            // AAR first so the delivered block reads AS, AMS, AAR downward,
+            // matching OpenARC and RFC 8617's example messages (audit A-8).
+            // Convention, not conformance -- §5 calls relative trace-field
+            // order "unimportant" -- but prepending itself is the RFC 8601
+            // §4.1 trace-field requirement.
             const aar_at = std.mem.indexOf(u8, buf[0..n], "ARC-Authentication-Results") orelse
                 return error.TestUnexpectedResult;
             const ams_at = std.mem.indexOf(u8, buf[0..n], "ARC-Message-Signature") orelse
                 return error.TestUnexpectedResult;
             const seal_at = std.mem.indexOf(u8, buf[0..n], "ARC-Seal") orelse
                 return error.TestUnexpectedResult;
-            try std.testing.expect(seal_at < ams_at);
-            try std.testing.expect(ams_at < aar_at);
+            try std.testing.expect(aar_at < ams_at);
+            try std.testing.expect(ams_at < seal_at);
+            try std.testing.expectEqual(@as(u8, 'i'), buf[4]);
         } else |_| {
             saw_failure = true;
             // The message must be untouched: a failure here must never leave one or
