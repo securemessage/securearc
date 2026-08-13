@@ -17,8 +17,8 @@
             .hash = "securemilter_lib-0.5.3-IbMuLNAFBwCZwCpXQBmZ2-Bx3vx3GUqgKNjDZ1paWoGq",
         },
         .securemilter_crypto = .{
-            .url = "https://pacyworld.dev/securemessage/securemilter-crypto/archive/v0.2.0.tar.gz",
-            .hash = "securemilter_crypto-0.2.0-R5f4teC4AQDi_T_GQlhZBgbefsXXBUrgVhe7i0pANT-4",
+            .url = "https://pacyworld.dev/securemessage/securemilter-crypto/archive/v0.2.1.tar.gz",
+            .hash = "securemilter_crypto-0.2.1-R5f4tY--AQD6pZz1ZXfRpnsMIzZTxt6Hi7Vk6OEm12Fk",
         },
     },
 }
