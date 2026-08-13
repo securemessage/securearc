@@ -9,6 +9,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const config_mod = securemilter.config;
 const listener_mod = securemilter.listener;
+const log = securemilter.log;
 const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const dns_mod = securemilter.dns;
@@ -107,7 +108,36 @@ pub const ArcConfig = struct {
     max_evaluation_ms: i64,
     on_dns_error: OnDnsError,
 };
+/// Known configuration keys; anything else refuses startup. A key no table
+/// knows is a typo, and a known global key inside a listener section is
+/// silently inert — both reached production as real operator mistakes.
+const known_global_keys: []const []const u8 = &(config_mod.base_global_keys ++ [_][]const u8{
+    "AuthservID",       "WorkerThreads", "MaxConnections",   "PidFile",
+    "User",             "UMask",         "Foreground",       "DnsNameserver",
+    "DnsTimeout",       "DnsRetries",    "DnsCacheSize",     "DnsNegativeTTL",
+    "ZmqEndpoint",      "ZmqTopic",      "StripAuthResults", "Mode",
+    "SignedHeaders",    "SealDomain",    "SealSelector",     "SealKeyFile",
+    "LocalAuthMethods", "MaxKeyRecords", "MinimumKeyBits",   "On-DNSError",
+});
+const known_listener_keys = [_][]const u8{ "Socket", "Mode", "SealDomain", "SealSelector", "SealKeyFile" };
+
 pub fn parseArcConfig(allocator: Allocator, cfg: *const config_mod.Config) !ArcConfig {
+    if (config_mod.validateKeys(cfg, known_global_keys, &known_listener_keys)) |offense| {
+        // stderr as well as the log: this fires before the logger is
+        // initialized, and an operator message that only reaches an unopened
+        // syslog socket is silent by another name.
+        switch (offense.kind) {
+            .unknown => {
+                log.err("config: [{s}] unrecognized key \"{s}\" (typo?); refusing to start", .{ offense.section, offense.key });
+                std.debug.print("config: [{s}] unrecognized key \"{s}\" (typo?); refusing to start\n", .{ offense.section, offense.key });
+            },
+            .misplaced => {
+                log.err("config: [{s}] key \"{s}\" is a global key with no effect here; move it to [global]. Refusing to start", .{ offense.section, offense.key });
+                std.debug.print("config: [{s}] key \"{s}\" is a global key with no effect here; move it to [global]. Refusing to start\n", .{ offense.section, offense.key });
+            },
+        }
+        return error.InvalidConfiguration;
+    }
     const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
 
     const authserv_id = global.get("AuthservID") orelse "localhost";
@@ -778,6 +808,7 @@ test "On-DNSError defaults to tempfail and is read from the config" {
 }
 
 // Reject a listener-level policy instead of silently using the global default.
+// The validator catches the misplacement first, with the same outcome.
 test "On-DNSError in a listener section is refused rather than ignored" {
     const ini_text =
         \\[global]
@@ -793,7 +824,7 @@ test "On-DNSError in a listener section is refused rather than ignored" {
     defer cfg.deinit();
 
     try std.testing.expectError(
-        error.OnDnsErrorNotPerListener,
+        error.InvalidConfiguration,
         parseArcConfig(std.testing.allocator, &cfg),
     );
 }
