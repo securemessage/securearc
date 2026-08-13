@@ -373,6 +373,19 @@ Any other value is a configuration error and
 .Nm
 refuses to start.
 .Pp
+.Dq both
+validates the chain and then extends it in a single pass: one chain
+evaluation feeds both the
+.Li arc=
+stamp and the new set's
+.Li cv= ,
+so the two can never disagree, and the stamp is included in the set's
+ARC-Authentication-Results (a split verify+seal deployment pays two
+validations and its AAR completeness depends on MTA header delivery between
+the listeners).
+This is the recommended mode for a relay hop that both checks and extends
+chains.
+.Pp
 Each listener is independent.
 Check the
 .Ql listener[N] mode=...

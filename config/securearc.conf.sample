@@ -184,6 +184,12 @@ LocalAuthMethods = spf, dkim, dmarc
 # mode=..." lines logged at startup match what you intended, particularly
 # when a verify section and a seal section both appear below.
 #
+# "both" validates the inbound chain and then seals in the same pass: one
+# validation feeds the arc= stamp and the new set's cv= (they can never
+# disagree), and the stamp is included in the set's AAR. For a relay hop
+# that both checks and extends chains, prefer one Mode=both listener over a
+# verify listener plus a seal listener.
+#
 # SealDomain, SealSelector and SealKeyFile are read from a listener section but
 # apply daemon-wide: there is one seal key, so per-listener sealing identities
 # are not supported.

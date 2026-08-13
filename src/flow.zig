@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const securemilter = @import("securemilter");
 const connection_mod = securemilter.connection;
 const auth_stamp = securemilter.auth_stamp;
+const auth_results = securemilter.auth_results;
 const header_fold = securemilter.header_fold;
 const escape = securemilter.escape;
 const codec = securemilter.milter.codec;
@@ -398,19 +399,6 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
     };
     defer conn.allocator.free(sets);
 
-    // RFC 8617 §5.1.3: "Once broken, the chain cannot be continued." A seal already
-    // on the message saying cv=fail means an earlier hop recorded the break, so
-    // there is nothing to extend and no set to add (audit A-19). Distinct from a
-    // chain that fails validation *here* — that one is sealed cv=fail below, which
-    // is how the break gets recorded in the first place.
-    if (arc.chainAlreadyBroken(sets)) {
-        log.info("not sealing: the chain is already marked cv=fail and cannot be continued", .{});
-        return @intFromEnum(responses.Code.@"continue");
-    }
-
-    const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
-    if (new_instance > arc.MAX_INSTANCES) return @intFromEnum(responses.Code.@"continue");
-
     // `chainOutcome` decides and logs; the two non-sealing answers are acted on here,
     // because this function owns every write to the message.
     const cv: arc.ChainValidation = switch (chainOutcome(conn, ctx, sets, arc_headers.items)) {
@@ -423,6 +411,33 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
             return @intFromEnum(responses.Code.@"continue");
         },
     };
+
+    return sealWithCv(conn, ctx, sets, cv);
+}
+
+/// Build and emit the next set for a chain whose `cv=` is already decided.
+///
+/// Shared by `doSeal` (which computes cv by validating) and `doBoth` (which
+/// already holds the validation it stamped). Owns every write, so the X-8
+/// rule — nothing on the wire until the complete set exists — holds in both.
+fn sealWithCv(
+    conn: *connection_mod.Connection,
+    ctx: SealCtx,
+    sets: []const arc.ArcSet,
+    cv: arc.ChainValidation,
+) u8 {
+    // RFC 8617 §5.1.3: "Once broken, the chain cannot be continued." A seal already
+    // on the message saying cv=fail means an earlier hop recorded the break, so
+    // there is nothing to extend and no set to add (audit A-19). Distinct from a
+    // chain that fails validation *here* — that one is sealed cv=fail, which is
+    // how the break gets recorded in the first place.
+    if (arc.chainAlreadyBroken(sets)) {
+        log.info("not sealing: the chain is already marked cv=fail and cannot be continued", .{});
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
+    const new_instance: u8 = if (sets.len > 0) sets[sets.len - 1].instance + 1 else 1;
+    if (new_instance > arc.MAX_INSTANCES) return @intFromEnum(responses.Code.@"continue");
 
     // Nothing here writes to the message until every header of the set exists. A
     // partial set is worse than no set at all: the next hop reads it as a broken
@@ -460,6 +475,122 @@ pub fn doSeal(conn: *connection_mod.Connection, maybe_ctx: ?SealCtx) u8 {
 
     publishEvent(ctx.msg.publisher, conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
+}
+
+/// Stamp the arc= verdict and keep a local copy in the connection's header
+/// list, so a seal built later in the same pass carries this hop's own result
+/// in its AAR. In the split deployment the seal listener receives that stamp
+/// from the MTA, which applied the verify listener's header between the two;
+/// in one pass nothing re-reads the wire, so the list must be told.
+fn stampAndKeep(
+    conn: *connection_mod.Connection,
+    authserv_id: []const u8,
+    result_str: []const u8,
+    reason: ?[]const u8,
+) !void {
+    const value = try auth_results.build(conn.allocator, authserv_id, &.{.{
+        .method = "arc",
+        .result = result_str,
+        .reason = reason,
+        .properties = &.{},
+    }});
+    errdefer conn.allocator.free(value);
+
+    try auth_stamp.stampValue(conn.allocator, conn.fd, value, conn.negotiated_protocol.header_leading_space);
+
+    // The list owns its copies (freeHeaders releases both), so the name is
+    // duped too — a literal would be freed as if it were heap.
+    const name_dup = try conn.allocator.dupe(u8, "Authentication-Results");
+    errdefer conn.allocator.free(name_dup);
+    try conn.headers.append(conn.allocator, .{
+        .name = name_dup,
+        .value = value,
+        // had_space mirrors the on-message form: the separator is present
+        // whether we sent it (negotiated LEADSPC) or the MTA added it.
+        .had_space = true,
+    });
+}
+
+/// Combined verify+seal in one pass (design-combined-modes.md): validate the
+/// chain once, stamp the arc= verdict, then extend the chain with a cv= taken
+/// from THAT validation. Two listeners doing this as separate connections
+/// validate the chain twice and can disagree between the two moments — a
+/// stamped arc=pass beside a sealed cv=fail written by one ADMD. One pass
+/// makes the stamp and the seal structurally consistent.
+pub fn doBoth(conn: *connection_mod.Connection, msg_ctx: MsgCtx, maybe_seal: ?SealCtx) u8 {
+    // Not configured to seal: this mode degenerates to verify.
+    const seal_ctx = maybe_seal orelse return doVerify(conn, msg_ctx);
+
+    // The guards below mirror doVerify's, with the same reasoning; the seal
+    // half then applies doSeal's rules to the outcome.
+
+    if (conn.contentTruncated()) {
+        addArHeaderSimple(conn, msg_ctx.authserv_id, "arc", "temperror", "message too large to validate") catch |err|
+            return auth_stamp.deferCode(err, "arc");
+        publishEvent(msg_ctx.publisher, conn.allocator, "verify", "temperror", 0);
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
+    var arc_headers: std.ArrayListUnmanaged(arc.Header) = .{};
+    defer arc_headers.deinit(conn.allocator);
+    for (conn.headers.items) |hdr| {
+        arc_headers.append(conn.allocator, .{ .name = hdr.name, .value = hdr.value, .had_space = hdr.had_space }) catch continue;
+    }
+
+    // A chain that does not parse is a broken chain, not an absent one (RFC
+    // 8617 §5.1.2) — and it cannot be extended either, so this stamps fail and
+    // seals nothing, the union of the two modes' parse-failure rules.
+    const sets = arc.parseArcSets(conn.allocator, arc_headers.items) catch |err| {
+        if (err == error.OutOfMemory) return @intFromEnum(responses.Code.tempfail);
+        const reason = arc.describeChainError(err);
+        addArHeaderSimple(conn, msg_ctx.authserv_id, "arc", "fail", reason) catch |e|
+            return auth_stamp.deferCode(e, "arc");
+        publishEvent(msg_ctx.publisher, conn.allocator, "verify", "fail", 0);
+        return @intFromEnum(responses.Code.@"continue");
+    };
+    defer conn.allocator.free(sets);
+
+    // No chain: we are the first hop. Stamp none, seal cv=none (§5.1.1).
+    if (sets.len == 0) {
+        stampAndKeep(conn, msg_ctx.authserv_id, "none", null) catch |err|
+            return auth_stamp.deferCode(err, "arc");
+        publishEvent(msg_ctx.publisher, conn.allocator, "verify", "none", 0);
+        return sealWithCv(conn, seal_ctx, sets, .none);
+    }
+
+    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
+    const result = msg_ctx.validate(conn.allocator, sets, arc_headers.items, body_data);
+
+    switch (result.evaluation) {
+        .complete => {
+            stampAndKeep(conn, msg_ctx.authserv_id, result.status.toString(), result.failure_reason) catch |err|
+                return auth_stamp.deferCode(err, "arc");
+            publishEvent(msg_ctx.publisher, conn.allocator, "verify", result.status.toString(), result.highest_instance);
+            return sealWithCv(conn, seal_ctx, sets, result.status);
+        },
+        // Our fault, so the sender retries rather than have it recorded
+        // against their chain (audit A-12a) — and no set is built.
+        .internal_error => {
+            log.err("internal error validating ARC chain: {s}", .{result.failure_reason orelse "unknown"});
+            return @intFromEnum(responses.Code.tempfail);
+        },
+        // The stamp says temperror (honest, revisable); whether we then seal
+        // is the operator's On-DNSError policy, exactly as a seal-only hop.
+        .dns_temp_error, .deadline_exceeded => {
+            if (result.evaluation == .deadline_exceeded) {
+                log.warn("ARC chain evaluation deadline exceeded at i={d}", .{result.highest_instance});
+            }
+            stampAndKeep(conn, msg_ctx.authserv_id, "temperror", result.failure_reason) catch |err|
+                return auth_stamp.deferCode(err, "arc");
+            publishEvent(msg_ctx.publisher, conn.allocator, "verify", "temperror", result.highest_instance);
+            switch (dnsTempOutcome(seal_ctx.on_dns_error, result)) {
+                .seal => |status| return sealWithCv(conn, seal_ctx, sets, status),
+                .stop => |code| return code,
+                // Already stamped above; the seal half declines.
+                .stamp_temperror => return @intFromEnum(responses.Code.@"continue"),
+            }
+        },
+    }
 }
 
 /// Emit the three headers of one ARC set as a unit, prepended at the top of

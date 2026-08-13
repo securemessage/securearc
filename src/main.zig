@@ -47,6 +47,7 @@ const MsgCtx = flow.MsgCtx;
 const SealCtx = flow.SealCtx;
 const doVerify = flow.doVerify;
 const doSeal = flow.doSeal;
+const doBoth = flow.doBoth;
 
 const buildSigningHeaders = sealbuild.buildSigningHeaders;
 const buildSealInput = sealbuild.buildSealInput;
@@ -442,10 +443,9 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const result = switch (mode) {
         .verify_only => doVerify(conn, ctx),
         .seal_only => doSeal(conn, sealCtx(ctx, cfg)),
-        .both => blk: {
-            _ = doVerify(conn, ctx);
-            break :blk doSeal(conn, sealCtx(ctx, cfg));
-        },
+        // One pass, one validation: the stamp and the seal's cv= come from the
+        // same chain evaluation, and the stamp lands in the AAR (flow.doBoth).
+        .both => doBoth(conn, ctx, sealCtx(ctx, cfg)),
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
