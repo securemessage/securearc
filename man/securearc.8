@@ -254,7 +254,7 @@ or
 .Cm ARC-Seal
 makes this hop write
 .Cm cv=fail ,
-and RFC 8617 \[sc]5.1.2 makes that permanent for the life of the message: every
+and RFC 8617 \[sc]5.2.1 makes that permanent for the life of the message: every
 later hop reads it and none may revise it.
 A transient publishing state would become a permanent chain break.
 .Pp
@@ -283,7 +283,7 @@ Default:
 .Dq tempfail .
 An unrecognised value is refused at startup.
 .Pp
-RFC 8617 Section 5.1.2 makes
+RFC 8617 Section 5.2.1 makes
 .Cm cv=fail
 permanent for the life of a message: no later hop may revise it.
 A transient nameserver failure is therefore the one condition where the

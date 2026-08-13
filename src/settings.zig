@@ -48,7 +48,7 @@ pub fn modeLabel(m: Mode) []const u8 {
 }
 
 /// What to do when DNS fails during sealing (audit A-12).
-/// RFC 8617 §5.1.2 makes `cv=fail` permanent, so sealing a DNS failure into
+/// RFC 8617 §5.2.1 makes `cv=fail` permanent, so sealing a DNS failure into
 /// the chain is irreversible harm to a third party. Default chosen by least
 /// total impact (same rationale as OpenDKIM's `On-DNSError`).
 pub const OnDnsError = enum {

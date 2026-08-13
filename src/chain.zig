@@ -28,7 +28,7 @@ fn amsHeaderName(hdr: arc.Header) []const u8 {
 }
 
 /// Whether validation produced a real verdict (audit A-12).
-/// `cv=fail` is permanent per RFC 8617 §5.1.2; only report when genuinely determined.
+/// `cv=fail` is permanent per RFC 8617 §5.2.1; only report when genuinely determined.
 pub const Evaluation = enum {
     /// Every signature was checked; `status` is a real verdict.
     complete,
@@ -381,7 +381,7 @@ fn buildAmsSigningInput(
     // Remove the b= value: replace "b=<sig>" with "b=". Allocation failure used
     // to fall through to the header WITH its signature still in it, which does
     // not fail -- it hashes different bytes, so a good signature reads as bad and
-    // the chain is sealed cv=fail, which RFC 8617 §5.1.2 makes permanent for the
+    // the chain is sealed cv=fail, which RFC 8617 §5.2.1 makes permanent for the
     // life of the message. Same class as X-10.
     const stripped = try sig_header.emptyBValue(allocator, ams_full);
     defer allocator.free(stripped);
@@ -854,7 +854,7 @@ test "X-21: an expired deadline stops the walk before any DNS, and is not a verd
 test "validateChain reports unknown/dns_temp_error when the key lookup fails transiently" {
     // A single well-formed set whose AMS key can never be fetched: the resolver
     // points at a port nothing listens on, with no retries and a short timeout.
-    // A transient DNS failure must not become cv=fail, which RFC 8617 §5.1.2
+    // A transient DNS failure must not become cv=fail, which RFC 8617 §5.2.1
     // makes permanent for the life of the message (audit A-12).
     const sets = [_]arc.ArcSet{.{
         .instance = 1,

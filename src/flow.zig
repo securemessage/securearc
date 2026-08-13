@@ -133,7 +133,7 @@ pub fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // into the message, so an unevaluable chain is `arc=temperror`: honest,
     // revisable by the next hop, and not configurable (audit A-12). Only a
     // sealer has a policy decision to make, because only a sealer records
-    // something RFC 8617 §5.1.2 forbids anyone downstream from revising.
+    // something RFC 8617 §5.2.1 forbids anyone downstream from revising.
     switch (result.evaluation) {
         .complete => {},
         .dns_temp_error => {
@@ -231,7 +231,7 @@ fn chainOutcome(
 
     // `vr.status` is only used as the cv= value on `.complete` evaluation (audit
     // A-12): a transient DNS failure must not seal a permanent cv=fail, since RFC
-    // 8617 §5.1.2 makes that verdict indistinguishable to later hops from a forged
+    // 8617 §5.2.1 makes that verdict indistinguishable to later hops from a forged
     // signature for the life of the message.
     const vr = ctx.msg.validate(conn.allocator, sets, all_headers, body_data);
     switch (vr.evaluation) {
@@ -599,7 +599,7 @@ pub fn doBoth(conn: *connection_mod.Connection, msg_ctx: MsgCtx, maybe_seal: ?Se
 /// A milter header packet cannot be recalled once it is on the wire, so a
 /// partial set — AAR alone, or AAR and AMS with no ARC-Seal — must never reach it.
 /// RFC 8617 requires all three per instance; the next hop reads a partial set as a
-/// malformed chain and records a permanent `cv=fail` (§5.1.2), destroying a chain
+/// malformed chain and records a permanent `cv=fail` (§5.2.1), destroying a chain
 /// that may have been perfectly valid (audit X-8). Every payload is therefore built
 /// before the first byte is written, so an allocation failure always leaves the
 /// message untouched; a socket that dies mid-set fails the whole transaction anyway,

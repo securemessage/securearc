@@ -131,7 +131,7 @@ LocalAuthMethods = spf, dkim, dmarc
 # one lookup and fail on the next.
 #
 # That matters more here than it does for DKIM. A failed AMS or seal makes this
-# hop write cv=fail, and RFC 8617 5.1.2 makes cv=fail permanent: every later hop
+# hop write cv=fail, and RFC 8617 5.2.1 makes cv=fail permanent: every later hop
 # reads it and no one may revise it. A transient publishing state would become a
 # permanent chain break.
 #
@@ -153,7 +153,7 @@ LocalAuthMethods = spf, dkim, dmarc
 # What a sealing listener does when a previous hop's key cannot be fetched
 # because DNS failed transiently — SERVFAIL, a timeout, an unreachable resolver.
 #
-# RFC 8617 5.1.2 makes cv=fail permanent for the life of the message: no later
+# RFC 8617 5.2.1 makes cv=fail permanent for the life of the message: no later
 # hop may revise it. So this is the one condition where the cheapest response
 # for this host is the most destructive one overall, because the cost lands on
 # the sender and every downstream receiver instead of here.
