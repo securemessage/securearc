@@ -1,6 +1,6 @@
 .{
     .name = .securearc,
-    .version = "0.6.6",
+    .version = "0.6.7",
     .fingerprint = 0x59d0b174ecb5d3bb,
     .minimum_zig_version = "0.15.0",
     .paths = .{
