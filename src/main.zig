@@ -432,10 +432,15 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     // then write its own under another (audit A-14).
     const cfg = snapshot();
 
-    // Drop forged arc= claims before validating or sealing.
-    _ = header_scrub.stripAuthResults(conn, cfg.authserv_id, cfg.stripPolicy());
-
     const mode = modeFor(conn.listener_index);
+
+    // Strip forged A-R headers only on listeners that add verification results.
+    // A seal-only listener shares a Postfix pipeline with the verify listener,
+    // whose A-R headers (claiming this authserv-id) are already present when
+    // the seal listener runs; stripping them removes legitimate results and
+    // leaves the ARC-Authentication-Results incomplete.
+    if (mode != .seal_only)
+        _ = header_scrub.stripAuthResults(conn, cfg.authserv_id, cfg.stripPolicy());
     const ctx = msgCtx(cfg);
 
     // `sealCtx` is only reached on a mode that seals, so a verify-only listener
