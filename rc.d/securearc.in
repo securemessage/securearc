@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# PROVIDE: securearc
+# REQUIRE: LOGIN dns
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="securearc"
+rcvar="${name}_enable"
+desc="SecureARC milter daemon (RFC 8617 ARC chain validation and sealing)"
+
+load_rc_config $name
+
+: ${securearc_enable:="NO"}
+: ${securearc_config:="%%PREFIX%%/etc/securearc/securearc.conf"}
+: ${securearc_pidfile:="/var/run/securearc/securearc.pid"}
+
+pidfile="${securearc_pidfile}"
+command="%%PREFIX%%/bin/securearc"
+command_args="-c ${securearc_config}"
+
+run_rc_command "$1"
