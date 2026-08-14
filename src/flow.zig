@@ -19,7 +19,6 @@ const auth_stamp = securemilter.auth_stamp;
 const auth_results = securemilter.auth_results;
 const header_fold = securemilter.header_fold;
 const escape = securemilter.escape;
-const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const dns_mod = securemilter.dns;
 const zmq = securemilter.zmq;
@@ -465,13 +464,11 @@ fn sealWithCv(
 
     // The whole set exists now, so it can go out as a unit.
     emitArcSet(
-        conn.allocator,
-        conn.fd,
-        conn.negotiated_protocol.header_leading_space,
+        conn,
         set.aar,
         set.ams,
         set.seal,
-    ) catch return sealInternalError("writing the ARC set");
+    ) catch return sealInternalError("queueing the ARC set");
 
     publishEvent(ctx.msg.publisher, conn.allocator, "seal", cv.toString(), new_instance);
     return @intFromEnum(responses.Code.accept);
@@ -496,7 +493,7 @@ fn stampAndKeep(
     }});
     errdefer conn.allocator.free(value);
 
-    try auth_stamp.stampValue(conn.allocator, conn.fd, value, conn.negotiated_protocol.header_leading_space);
+    try auth_stamp.stampValue(conn, value);
 
     // The list owns its copies (freeHeaders releases both), so the name is
     // duped too — a literal would be freed as if it were heap.
@@ -601,22 +598,29 @@ pub fn doBoth(conn: *connection_mod.Connection, msg_ctx: MsgCtx, maybe_seal: ?Se
 /// RFC 8617 requires all three per instance; the next hop reads a partial set as a
 /// malformed chain and records a permanent `cv=fail` (§5.2.1), destroying a chain
 /// that may have been perfectly valid (audit X-8). Every payload is therefore built
-/// before the first byte is written, so an allocation failure always leaves the
-/// message untouched; a socket that dies mid-set fails the whole transaction anyway,
-/// and the milter protocol offers nothing stronger, since three headers cannot be
-/// sent as one packet.
+/// before the first is queued, so an allocation failure always leaves the message
+/// untouched.
 ///
-/// Takes the allocator and fd rather than the `Connection` it came from: those
-/// are all it uses, and the property that matters here — nothing on the wire
-/// unless everything is on the wire — is then testable against a pipe.
+/// THE SET IS NOW ATOMIC ON THE WIRE AS WELL, which it was not when this
+/// contract was written. The three packets are queued on the connection and the
+/// worker flushes them together with the final action, in one write; a socket
+/// that cannot take all of it retains the tail and resumes. The old note here
+/// said "the milter protocol offers nothing stronger, since three headers
+/// cannot be sent as one packet" -- true of the protocol, but the packets can
+/// and now do share one segment.
+///
+/// Takes the connection: the allocator, the negotiated leading-space flag and
+/// the output queue all come off it, and the property that matters here --
+/// nothing queued unless everything is queued -- is still testable against a
+/// pipe.
 pub fn emitArcSet(
-    allocator: Allocator,
-    fd: posix.fd_t,
-    leading_space: bool,
+    conn: *connection_mod.Connection,
     aar: []const u8,
     ams: []const u8,
     seal_hdr: []const u8,
 ) !void {
+    const allocator = conn.allocator;
+    const leading_space = conn.negotiated_protocol.header_leading_space;
     // These three are hashed, so the transmitted field has to be the octet string
     // that was canonicalized: the AMS covers itself with an empty `b=`, and the AS
     // covers AAR, AMS and AS. `sealbuild` builds all of them as `"Name: " ++ value`
@@ -649,7 +653,7 @@ pub fn emitArcSet(
     const p_seal = try responses.insertHeader(allocator, 0, "ARC-Seal", seal_wire, leading_space);
     defer allocator.free(p_seal);
 
-    // Nothing fallible between here and the final write.
+    // Nothing fallible between here and the queueing of the set.
     //
     // SMFIR_INSHEADER at index 0, written AAR-first: each insert lands above the
     // previous, so the delivered block reads AS, AMS, AAR downward, matching
@@ -664,9 +668,10 @@ pub fn emitArcSet(
     // to the seal's hash, AAR then AMS then AS per §5.1.1, and that lives in
     // `sealbuild.buildSealInput`, untouched here. Conflating the two is what
     // made A-8 prescribe the wrong fix.
-    try codec.writePacket(fd, p_aar);
-    try codec.writePacket(fd, p_ams);
-    try codec.writePacket(fd, p_seal);
+    // One indivisible unit: `sendPackets` reserves the whole set before
+    // queueing any of it, so an allocation failure here cannot leave AAR and
+    // AMS queued with no ARC-Seal behind them.
+    try conn.sendPackets(&.{ p_aar, p_ams, p_seal });
 }
 
 /// Defer the message after an internal failure while sealing (audit X-8).
@@ -693,14 +698,14 @@ pub fn addArHeaderSimple(
     result_str: []const u8,
     reason: ?[]const u8,
 ) !void {
-    try auth_stamp.stamp(conn.allocator, conn.fd, authserv_id, &.{
+    try auth_stamp.stamp(conn, authserv_id, &.{
         .{
             .method = method,
             .result = result_str,
             .reason = reason,
             .properties = &.{},
         },
-    }, conn.negotiated_protocol.header_leading_space);
+    });
 }
 
 /// Publish a seal or verify event.
@@ -735,24 +740,30 @@ test "emitArcSet writes the whole set or nothing, at every failure point" {
     var fail_index: usize = 0;
     var saw_success = false;
     var saw_failure = false;
-    while (fail_index < 16) : (fail_index += 1) {
+    while (fail_index < 18) : (fail_index += 1) {
         const fds = try posix.pipe2(.{ .NONBLOCK = true });
         defer posix.close(fds[0]);
-        defer posix.close(fds[1]);
 
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
         );
+        // The connection owns the write end and the output queue, so the queue's
+        // own allocations are among those being failed -- which is the point:
+        // a set that cannot be queued in full must not be queued in part.
+        var conn = connection_mod.Connection.init(failing.allocator(), fds[1], 0, .{});
+        defer conn.deinit();
+        conn.negotiated_protocol.header_leading_space = true;
+
         const res = emitArcSet(
-            failing.allocator(),
-            fds[1],
-            true,
+            &conn,
             "i=1; mail.test; spf=pass",
             "i=1; a=rsa-sha256; b=AAAA",
             "i=1; cv=none; a=rsa-sha256; b=BBBB",
         );
 
+        // Queued, not written: flush before looking at the pipe.
+        _ = conn.flushOut() catch {};
         var buf: [1024]u8 = undefined;
         const n = posix.read(fds[0], &buf) catch |err| switch (err) {
             error.WouldBlock => 0,

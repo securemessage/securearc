@@ -13,7 +13,6 @@ const bootstrap_mod = securemilter.bootstrap;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
 const escape = securemilter.escape;
-const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
