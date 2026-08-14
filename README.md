@@ -8,10 +8,10 @@ SecureARC validates ARC chains on inbound mail and seals messages with new ARC s
 
 ## Features
 
-- **ARC chain validation** — verify ARC-Message-Signature (AMS) and ARC-Seal (AS)
-- **ARC sealing** — construct new ARC set (AAR + AMS + AS) for forwarded messages
+- **ARC chain validation** -- verify ARC-Message-Signature (AMS) and ARC-Seal (AS)
+- **ARC sealing** -- construct new ARC set (AAR + AMS + AS) for forwarded messages
 - **RSA-SHA256 and Ed25519-SHA256** algorithm support
-- **Multi-mode** — separate verify/seal/both modes per listener
+- **Multi-mode** -- separate verify/seal/both modes per listener
 - **Thread-per-core architecture** with kqueue I/O multiplexing
 - **DNS resolution** with per-worker TTL caching and proactive health monitoring
 - **Multi-listener** support (TCP and Unix domain sockets)
@@ -106,7 +106,7 @@ securearc -c /usr/local/etc/securearc/securearc.conf
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `Socket` | — | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
+| `Socket` | -- | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
 | `Mode` | `verify` | `seal`, `verify`, or `both`. Inherits `[global] Mode` if unset there too |
 | `SealDomain` | *(none)* | Domain for ARC sealing (required for seal mode) |
 | `SealSelector` | *(none)* | DNS selector for seal key (required for seal mode) |
@@ -220,7 +220,7 @@ Verify ARC DNS key record matches local private key:
 securearc-testkey -s arc2026 -d example.com -k /usr/local/etc/securearc/arc.key
 ```
 
-> **Note**: Use `securedkim-genkey` to generate ARC keys — ARC uses the same `selector._domainkey.domain` DNS format as DKIM.
+> **Note**: Use `securedkim-genkey` to generate ARC keys -- ARC uses the same `selector._domainkey.domain` DNS format as DKIM.
 
 ### securearc-check
 
@@ -242,21 +242,21 @@ securearc-seal -d example.com -s arc2026 -k /usr/local/etc/securearc/arc.key \
 
 ## Signals
 
-- **SIGHUP** — Reload configuration. The reloadable settings are adopted as one unit, so a message is always handled entirely under a single configuration. Covers the seal key, `AuthservID`, `SealDomain`, `SealSelector`, `SignedHeaders`, `LocalAuthMethods`, `StripAuthResults`, `MinimumKeyBits`, `On-DNSError` and the resolver settings. A failed reload leaves the previous configuration in place and logs why.
-- **SIGTERM** — Graceful shutdown (30s drain timeout)
+- **SIGHUP** -- Reload configuration. The reloadable settings are adopted as one unit, so a message is always handled entirely under a single configuration. Covers the seal key, `AuthservID`, `SealDomain`, `SealSelector`, `SignedHeaders`, `LocalAuthMethods`, `StripAuthResults`, `MinimumKeyBits`, `On-DNSError` and the resolver settings. A failed reload leaves the previous configuration in place and logs why.
+- **SIGTERM** -- Graceful shutdown (30s drain timeout)
 
 Listen addresses, per-listener `Mode`, the `Max*` caps, the ZMQ endpoint and the process
-settings are read at startup only and need a restart — see `securearc(8)` SIGNALS for
+settings are read at startup only and need a restart -- see `securearc(8)` SIGNALS for
 the full list and the reason in each case.
 
 ## Part of the SecureMilter Suite
 
-- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) — Shared infrastructure library
-- [securemilter-crypto](https://pacyworld.dev/securemessage/securemilter-crypto) — Cryptographic primitives
-- [SecureSPF](https://pacyworld.dev/securemessage/securespf) — SPF verification
-- [SecureDKIM](https://pacyworld.dev/securemessage/securedkim) — DKIM signing and verification
-- [SecureDMARC](https://pacyworld.dev/securemessage/securedmarc) — DMARC policy evaluation
-- **SecureARC** — ARC chain validation and sealing (this project)
+- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) -- Shared infrastructure library
+- [securemilter-crypto](https://pacyworld.dev/securemessage/securemilter-crypto) -- Cryptographic primitives
+- [SecureSPF](https://pacyworld.dev/securemessage/securespf) -- SPF verification
+- [SecureDKIM](https://pacyworld.dev/securemessage/securedkim) -- DKIM signing and verification
+- [SecureDMARC](https://pacyworld.dev/securemessage/securedmarc) -- DMARC policy evaluation
+- **SecureARC** -- ARC chain validation and sealing (this project)
 
 ## Requirements
 
