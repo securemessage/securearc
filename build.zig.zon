@@ -1,6 +1,6 @@
 .{
     .name = .securearc,
-    .version = "0.6.7",
+    .version = "0.6.8",
     .fingerprint = 0x59d0b174ecb5d3bb,
     .minimum_zig_version = "0.15.0",
     .paths = .{
@@ -13,8 +13,8 @@
     },
     .dependencies = .{
         .securemilter = .{
-            .url = "https://pacyworld.dev/securemessage/securemilter-lib/archive/v0.5.7.tar.gz",
-            .hash = "securemilter_lib-0.5.7-IbMuLDFDBwARObjKmzjja8sDCDOu0McOaCv5zwxL7j1-",
+            .url = "https://pacyworld.dev/securemessage/securemilter-lib/archive/v0.5.8.tar.gz",
+            .hash = "securemilter_lib-0.5.8-IbMuLPPMBwBFF_ZkUCv-NM8JZjfkW3co0AVx6KnH7nbi",
         },
         .securemilter_crypto = .{
             .url = "https://pacyworld.dev/securemessage/securemilter-crypto/archive/v0.2.1.tar.gz",
