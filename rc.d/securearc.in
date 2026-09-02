@@ -20,4 +20,6 @@ pidfile="${securearc_pidfile}"
 command="%%PREFIX%%/bin/securearc"
 command_args="-c ${securearc_config}"
 
+extra_commands="reload"
+
 run_rc_command "$1"
